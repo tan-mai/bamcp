@@ -1,4 +1,4 @@
-# BAMCP — Binance Analysis MCP
+# BAMCP — BTC Analysis MCP
 
 MCP server tự pull dữ liệu kline đa khung từ Binance và phục vụ phân tích Wyckoff/VSA/GANN từ bất kỳ thiết bị nào có Claude. Không cần cron job riêng.
 
