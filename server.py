@@ -100,9 +100,6 @@ SETTINGS_FILE = DATA_ROOT / PATHS.get("settings_file", "settings.json")
 
 STORE = settings.SettingsStore(SETTINGS_FILE, TZ)
 
-# Sinh luc khoi dong khi chua co mat khau nao. In ra log de mo trang admin lan dau.
-SETUP_TOKEN = ""
-
 
 def _seed_settings() -> None:
     """Chuyen gia tri env/config vao settings.json neu file con trong.
@@ -1070,8 +1067,11 @@ def _setup_ok(payload: dict[str, Any]) -> bool:
     """Truoc khi co mat khau, moi thao tac ghi phai kem setup token."""
     if STORE.has_auth():
         return True        # da qua Basic auth o middleware
-    token = str(payload.get("setup_token") or "")
-    return bool(SETUP_TOKEN) and secrets.compare_digest(token, SETUP_TOKEN)
+    # strip(): copy tu khung log rat de dinh khoang trang hoac xuong dong o cuoi,
+    # ma compare_digest so khop tung byte nen lech ngay.
+    token = str(payload.get("setup_token") or "").strip()
+    expected = STORE.setup_token()
+    return bool(expected) and secrets.compare_digest(token, expected)
 
 
 def _optional(payload: dict[str, Any], field: str) -> str | None:
@@ -1301,13 +1301,12 @@ if __name__ == "__main__":
         print("CANH BAO: auth dang TAT, server khong xac thuc.", file=sys.stderr)
     elif not STORE.has_auth():
         # Chua co mat khau: khong the chet vi nhu vay khong con duong nao dat mat khau.
-        # Thay vao do mo trang admin va in token mot lan de vao dat.
-        SETUP_TOKEN = secrets.token_urlsafe(32)
+        # Thay vao do mo trang admin va in token de vao dat.
         print("\n" + "=" * 68, file=sys.stderr)
         print("BAMCP CHUA DUOC CAI DAT - chua co mat khau nao.", file=sys.stderr)
         print(f"  Mo:   https://<domain>{ADMIN_PATH}", file=sys.stderr)
-        print(f"  BAMCP SETUP TOKEN: {SETUP_TOKEN}", file=sys.stderr)
-        print("  Token nay doi moi lan khoi dong lai, va het tac dung", file=sys.stderr)
+        print(f"  BAMCP SETUP TOKEN: {STORE.setup_token()}", file=sys.stderr)
+        print("  Token giu nguyen qua cac lan khoi dong lai, va bi xoa", file=sys.stderr)
         print("  ngay khi ban dat xong mat khau.", file=sys.stderr)
         print("=" * 68 + "\n", file=sys.stderr)
 

@@ -91,7 +91,25 @@ class SettingsStore:
             raise ValueError("mat khau phai tu 8 ky tu tro len")
         data = self.load()
         data["auth"] = {"username": username, **_hash_password(password)}
+        data.pop("setup_token", None)      # het viec, khong giu lai lam gi
         self._write(data)
+
+    def setup_token(self) -> str:
+        """Token dung de dat mat khau lan dau. Rong khi da co mat khau.
+
+        Sinh MOT LAN roi luu xuong file, nen no giu nguyen qua moi lan khoi dong
+        lai container. Neu sinh moi moi lan boot thi dong token trong log cu chet
+        ngay khi container restart - nguoi dung dan token dung ma van bi tu choi.
+        """
+        if self.has_auth():
+            return ""
+        data = self.load()
+        token = str(data.get("setup_token") or "")
+        if not token:
+            token = secrets.token_urlsafe(32)
+            data["setup_token"] = token
+            self._write(data)
+        return token
 
     def verify(self, header_value: bytes, username: bytes, password: bytes) -> bool:
         """So khop credential Basic auth voi hash da luu.
