@@ -17,6 +17,11 @@ services:
     container_name: bamcp
     restart: unless-stopped
 
+    # Bat buoc voi tag :latest. Khong co dong nay thi Docker thay da co
+    # bamcp:latest trong may la dung luon ban cu, du tren registry da moi -
+    # recreate container van chay code cu ma khong bao gi.
+    pull_policy: always
+
     environment:
       # Khong phai secret - Traefik chuyen tiep nguyen Host header, thieu domain
       # o day la server tra 421 cho moi request.
