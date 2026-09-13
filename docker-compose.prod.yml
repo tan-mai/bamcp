@@ -1,0 +1,62 @@
+# Compose danh cho deploy tu URL tren panel (Hostinger Docker Manager).
+#
+# Khac ban docker-compose.yml o ba diem:
+#   - Khong build, keo thang image da co tren ghcr
+#   - Khong co bien ${...} bat buoc, vi panel khong co file .env
+#   - KHONG CHUA SECRET NAO. File nay nam trong repo public.
+#
+# TRUOC KHI DEPLOY phai sua hai dong duoc danh dau <<< DOI, lay gia tri tu mot
+# container khac dang chay qua Traefik tren VPS.
+#
+# Deploy: dan URL raw cua file nay vao o URL trong Docker Manager
+#   https://raw.githubusercontent.com/tan-mai/bamcp/main/docker-compose.prod.yml
+
+services:
+  bamcp:
+    image: ghcr.io/tan-mai/bamcp:latest
+    container_name: bamcp
+    restart: unless-stopped
+
+    environment:
+      # Khong phai secret - Traefik chuyen tiep nguyen Host header, thieu domain
+      # o day la server tra 421 cho moi request.
+      BAMCP_ALLOWED_HOSTS: "bamcp.online,bamcp.online:*"
+      BAMCP_DATA_ROOT: /data
+      TZ: Asia/Ho_Chi_Minh
+      # Khong dat BAMCP_USERNAME / BAMCP_PASSWORD o day.
+      # De trong thi server in ra "BAMCP SETUP TOKEN" trong log luc khoi dong;
+      # dung token do de dat mat khau lan dau trong trang /admin.
+      # Credential san giao dich cung dat trong trang do, khong qua file nay.
+
+    volumes:
+      # Named volume, KHONG phai bind mount. Docker chep quyen so huu tu image
+      # sang volume moi nen uid 10001 ghi duoc ma khong can chown tren host.
+      - bamcp_data:/data
+
+    # Khong publish port. Traefik goi thang vao container qua mang Docker.
+
+    networks:
+      - proxy            # <<< DOI: ten mang Traefik dang dung tren VPS
+
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.bamcp.rule=Host(`bamcp.online`)"
+      - "traefik.http.routers.bamcp.entrypoints=websecure"
+      - "traefik.http.routers.bamcp.tls.certresolver=letsencrypt"   # <<< DOI: ten certresolver
+      # Traefik khong tu doan duoc container mo cong nao
+      - "traefik.http.services.bamcp.loadbalancer.server.port=8848"
+
+    stop_grace_period: 15s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  bamcp_data:
+
+networks:
+  proxy:               # <<< DOI: phai trung ten o muc networks ben tren
+    external: true     # mang do Traefik tao san, compose khong tao moi

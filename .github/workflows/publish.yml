@@ -13,6 +13,7 @@ on:
       - ".dockerignore"
       - ".env.example"
       - "docker-compose.yml"
+      - "docker-compose.prod.yml"
       - "bamcp.service"
   workflow_dispatch:          # nut "Run workflow" trong tab Actions
 

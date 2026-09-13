@@ -11,4 +11,5 @@ data/
 Caddyfile
 bamcp.service
 docker-compose.yml
+docker-compose.prod.yml
 .github
