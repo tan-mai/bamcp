@@ -1,4 +1,4 @@
-# BAMCP - Binance Analysis MCP
+# BAMCP - BTC Analysis MCP
 # Doi duong dan o day khi deploy. Khong sua server.py.
 # Bien moi truong thang config: BAMCP_HOST, BAMCP_PORT, BAMCP_ALLOWED_HOSTS,
 # BAMCP_DATA_ROOT, BAMCP_USERNAME, BAMCP_PASSWORD, BAMCP_SYMBOL, BAMCP_MARKET, TZ,
@@ -97,6 +97,12 @@ rules:
   max_stop_points: 300
   min_take_profit_points: 500
 
+  # Han muc rong hon cho lenh swing. Lenh chi duoc huong bo nay khi TP that su
+  # dat swing_min_take_profit_points - dan nhan "swing" khong lach duoc.
+  swing_min_take_profit_points: 2000
+  swing_max_margin_per_trade: 0      # 0 = khong gioi han volume
+  swing_max_stop_points: 1500
+
 # Quy trinh phan tich ma Claude doc luc bat tay. Sua o day, `docker compose restart`,
 # roi tat/bat lai connector trong chat de Claude doc ban moi. Khong can build lai image.
 instructions: |
@@ -120,3 +126,25 @@ instructions: |
   dang mo, get_fills cho lenh da khop, get_account_pnl cho PnL that (da tru phi va
   funding), reconcile_journal de doi chieu nhat ky voi san. Khi khoi 'exchange' trong
   get_today_status co du lieu thi tin so do, khong tin so tu khai trong nhat ky.
+
+  HAI LOAI LENH - phan biet truoc khi ban ve size:
+
+  SWING - co hoi an bien lon. Chi goi la swing khi HOI DU:
+    - Cau truc khung lon (W/D) va H4 cung huong, khong nguoc nhau
+    - Gia dang o vung bien cua range tren khung lon (close_position_pct duoi 25
+      hoac tren 75), khong phai giua range
+    - Co swing high/low ro rang lam moc cho SL va TP
+    - TP kha thi >= nguong swing_min_take_profit_points, do bang khoang cach
+      thuc den swing gan nhat hoac bien range - KHONG phai uoc chung
+    Dat duoc ca bon thi moi de xuat trade_type="swing". Thieu mot cai thi noi
+    thang la khong du dieu kien, dung ha tieu chuan cho vua.
+
+  SCALP - moi truong hop con lai. Setup o H1/M15, TP nho, va PHAI theo han muc
+    max_margin_per_trade. Day la mac dinh.
+
+  Truoc khi ban chot size, goi check_trade de cham thu: no cho biet lenh duoc
+  xep loai gi, han muc nao ap dung, pham rule gi - ma khong ghi vao nhat ky.
+  Khai swing nhung TP khong dat nguong thi he thong tu ha xuong scalp va ghi lai.
+
+  Khi nguoi dung hoi "co co hoi swing khong", tra loi bang bon tieu chi tren
+  kem so lieu that tu get_context, khong tra loi chung chung.

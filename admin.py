@@ -153,6 +153,25 @@ __SETUP_BANNER__
     <label for="min_take_profit_points">TP tối thiểu (điểm)</label>
     <input type="text" inputmode="decimal" id="min_take_profit_points" value="__R_MINTP__">
 
+    <div class="hist" style="margin-top:18px">
+      <h3>Lệnh swing — hạn mức riêng</h3>
+    </div>
+    <div class="row">
+      <div>
+        <label for="swing_min_take_profit_points">Ngưỡng TP để tính là swing</label>
+        <input type="text" inputmode="decimal" id="swing_min_take_profit_points" value="__R_SWTP__">
+        <div class="hint">TP dưới mức này thì lệnh bị xếp về scalp.</div>
+      </div>
+      <div>
+        <label for="swing_max_margin_per_trade">Margin tối đa swing (USD)</label>
+        <input type="text" inputmode="decimal" id="swing_max_margin_per_trade" value="__R_SWMARGIN__">
+        <div class="hint"><strong>0 = không giới hạn.</strong></div>
+      </div>
+    </div>
+    <label for="swing_max_stop_points">SL tối đa swing (điểm)</label>
+    <input type="text" inputmode="decimal" id="swing_max_stop_points" value="__R_SWSL__">
+    <div class="hint">Dán nhãn "swing" không lách được hạn mức: lệnh chỉ được hưởng bộ này khi TP thực sự đạt ngưỡng trên, nếu không nó tự động bị hạ về hạn mức scalp và việc đó được ghi lại.</div>
+
     <label for="rules_reason">Lý do đổi</label>
     <input type="text" id="rules_reason" placeholder="bắt buộc khi có thay đổi — vd: siết lại sau tuần lỗ">
     <div class="hint">Mọi thay đổi đều vào sổ lịch sử kèm lý do và mốc thời gian, dù đổi ở đây hay qua Claude. Đổi trong ngày đang giao dịch sẽ hiện lại trong <code>get_today_status</code>.</div>
@@ -173,7 +192,9 @@ __SETUP_BANNER__
 
 <script>
 const RULE_KEYS = ["max_trades_per_day","max_margin_per_trade","daily_stop_loss",
-                   "max_stop_points","min_take_profit_points"];
+                   "max_stop_points","min_take_profit_points",
+                   "swing_min_take_profit_points","swing_max_margin_per_trade",
+                   "swing_max_stop_points"];
 const $ = (id) => document.getElementById(id);
 const msg = $("msg");
 
@@ -325,6 +346,9 @@ def render(state: dict[str, Any], *, settings_path: str, save_path: str,
         "__R_STOP__": _num(rules.get("daily_stop_loss")),
         "__R_MAXSL__": _num(rules.get("max_stop_points")),
         "__R_MINTP__": _num(rules.get("min_take_profit_points")),
+        "__R_SWTP__": _num(rules.get("swing_min_take_profit_points")),
+        "__R_SWMARGIN__": _num(rules.get("swing_max_margin_per_trade")),
+        "__R_SWSL__": _num(rules.get("swing_max_stop_points")),
         "__RULES_HISTORY__": _history_block(rules_history),
     }
 

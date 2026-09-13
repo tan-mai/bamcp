@@ -168,6 +168,10 @@ _RULE_BOUNDS: dict[str, tuple[float | None, float | None]] = {
     "daily_stop_loss": (None, 0),      # phai <= 0
     "max_stop_points": (0, None),
     "min_take_profit_points": (0, None),
+    # Han muc swing. swing_max_margin_per_trade = 0 nghia la khong gioi han.
+    "swing_min_take_profit_points": (0, None),
+    "swing_max_margin_per_trade": (0, None),
+    "swing_max_stop_points": (0, None),
 }
 
 
@@ -544,6 +548,86 @@ async def _fetcher_loop() -> None:
             print(f"BAMCP fetcher loi: {FETCH_STATE['last_error']}", file=sys.stderr)
 
 
+TRADE_TYPES = ("scalp", "swing")
+
+
+def _evaluate_trade(*, side: str, entry: float, stop: float, target: float,
+                    margin_usd: float, trade_type: str,
+                    trades: list[dict[str, Any]], rules: dict[str, Any],
+                    realized: float) -> dict[str, Any]:
+    """Cham mot lenh theo bo rule dang hieu luc. Khong ghi gi.
+
+    Hai bo han muc: scalp (chat) va swing (rong). Nhung KHONG duoc tu dan nhan
+    swing de lach - lenh chi duoc huong han muc swing khi TP thuc su dat nguong
+    swing_min_take_profit_points. Neu khong, no bi ha xuong scalp va ghi lai
+    dieu do. Cai nhan la he qua cua con so, khong phai y muon.
+    """
+    side = side.strip().lower()
+    if side not in ("long", "short"):
+        raise ValueError("side phai la long hoac short")
+    trade_type = (trade_type or "scalp").strip().lower()
+    if trade_type not in TRADE_TYPES:
+        raise ValueError(f"trade_type phai la {' hoac '.join(TRADE_TYPES)}")
+
+    stop_points = round(abs(float(entry) - float(stop)), 2)
+    target_points = round(abs(float(target) - float(entry)), 2)
+    swing_threshold = float(rules["swing_min_take_profit_points"])
+
+    violations: list[str] = []
+    demoted = False
+
+    if trade_type == "swing" and target_points < swing_threshold:
+        demoted = True
+        trade_type = "scalp"
+        violations.append(
+            f"khai swing nhung TP {target_points} < swing_min_take_profit_points "
+            f"({swing_threshold:g}) - ap dung han muc scalp")
+
+    if trade_type == "swing":
+        max_margin = float(rules["swing_max_margin_per_trade"])
+        max_stop = float(rules["swing_max_stop_points"])
+        min_tp = swing_threshold
+        prefix = "swing_"
+    else:
+        max_margin = float(rules["max_margin_per_trade"])
+        max_stop = float(rules["max_stop_points"])
+        min_tp = float(rules["min_take_profit_points"])
+        prefix = ""
+
+    # Dung ngay quan trong hon moi rule khac -> dat len dau
+    if realized <= float(rules["daily_stop_loss"]):
+        violations.append(
+            f"da cham daily_stop_loss: PnL hom nay {realized} <= {rules['daily_stop_loss']}")
+    if len(trades) >= int(rules["max_trades_per_day"]):
+        violations.append(f"vuot max_trades_per_day ({rules['max_trades_per_day']})")
+    if stop_points > max_stop:
+        violations.append(f"SL {stop_points} > {prefix}max_stop_points ({max_stop:g})")
+    if target_points < min_tp:
+        violations.append(f"TP {target_points} < {prefix}min_take_profit_points ({min_tp:g})")
+    # max_margin = 0 nghia la khong gioi han (chi dung cho swing)
+    if max_margin > 0 and float(margin_usd) > max_margin:
+        violations.append(f"margin {margin_usd} > {prefix}max_margin_per_trade ({max_margin:g})")
+
+    return {
+        "side": side,
+        "trade_type": trade_type,
+        "demoted_to_scalp": demoted,
+        "entry": float(entry),
+        "stop": float(stop),
+        "target": float(target),
+        "stop_points": stop_points,
+        "target_points": target_points,
+        "rr": round(target_points / stop_points, 2) if stop_points else None,
+        "margin_usd": float(margin_usd),
+        "limits_applied": {
+            "max_margin_per_trade": max_margin or "khong gioi han",
+            "max_stop_points": max_stop,
+            "min_take_profit_points": min_tp,
+        },
+        "rule_violations": violations,
+    }
+
+
 # ---------------------------------------------------------------- server
 
 # Quy trinh phan tich nam trong config.yaml (key `instructions`) de sua duoc ma
@@ -796,53 +880,47 @@ def log_trade(
     stop: float,
     target: float,
     margin_usd: float,
+    trade_type: str = "scalp",
     setup: str = "",
     date: str = "",
 ) -> dict[str, Any]:
-    """Ghi mot lenh vua vao. Tra ve canh bao neu pham rule, nhung van ghi de nhat ky dung thuc te."""
-    day = date or _today()
-    side = side.strip().lower()
-    if side not in ("long", "short"):
-        raise ValueError("side phai la long hoac short")
+    """Ghi mot lenh vua vao. Tra ve canh bao neu pham rule, nhung van ghi de nhat ky dung thuc te.
 
+    trade_type: scalp (mac dinh, han muc chat) hoac swing (han muc rong hon).
+      Khai swing ma TP khong dat nguong swing_min_take_profit_points thi lenh
+      tu dong bi ha xuong han muc scalp - dan nhan khong lach duoc.
+    """
+    day = date or _today()
     path = JOURNAL_DIR / f"{day}.json"
     trades = _read_json(path, [])
-
-    stop_points = round(abs(float(entry) - float(stop)), 2)
-    target_points = round(abs(float(target) - float(entry)), 2)
     realized = round(sum(float(t["pnl"]) for t in trades if t.get("pnl") is not None), 2)
     rules = _load_rules()
 
-    violations = []
-    # Dung ngay quan trong hon moi rule khac -> dat len dau
-    if realized <= float(rules["daily_stop_loss"]):
-        violations.append(
-            f"da cham daily_stop_loss: PnL hom nay {realized} <= {rules['daily_stop_loss']}")
-    if len(trades) >= int(rules["max_trades_per_day"]):
-        violations.append(f"vuot max_trades_per_day ({rules['max_trades_per_day']})")
-    if stop_points > float(rules["max_stop_points"]):
-        violations.append(f"SL {stop_points} > max_stop_points ({rules['max_stop_points']})")
-    if target_points < float(rules["min_take_profit_points"]):
-        violations.append(f"TP {target_points} < min_take_profit_points ({rules['min_take_profit_points']})")
-    if float(margin_usd) > float(rules["max_margin_per_trade"]):
-        violations.append(f"margin {margin_usd} > max_margin_per_trade ({rules['max_margin_per_trade']})")
+    verdict = _evaluate_trade(
+        side=side, entry=entry, stop=stop, target=target, margin_usd=margin_usd,
+        trade_type=trade_type, trades=trades, rules=rules, realized=realized,
+    )
+    violations = verdict["rule_violations"]
 
     trade = {
         "id": len(trades) + 1,
-        "side": side,
-        "entry": float(entry),
-        "stop": float(stop),
-        "target": float(target),
-        "stop_points": stop_points,
-        "target_points": target_points,
-        "rr": round(target_points / stop_points, 2) if stop_points else None,
-        "margin_usd": float(margin_usd),
+        "side": verdict["side"],
+        "trade_type": verdict["trade_type"],
+        "entry": verdict["entry"],
+        "stop": verdict["stop"],
+        "target": verdict["target"],
+        "stop_points": verdict["stop_points"],
+        "target_points": verdict["target_points"],
+        "rr": verdict["rr"],
+        "margin_usd": verdict["margin_usd"],
         "setup": setup,
         "opened_at": _now_iso(),
         "pnl": None,
         # Chup lai rule dang hieu luc luc vao lenh. Doi rule ve sau khong sua duoc
         # nhat ky cu, nen doc lai van biet luc do minh dang choi theo luat nao.
         "rules_at_entry": rules,
+        "limits_applied": verdict["limits_applied"],
+        "demoted_to_scalp": verdict["demoted_to_scalp"],
         "rule_violations": violations,
     }
     trades.append(trade)
@@ -852,6 +930,31 @@ def log_trade(
         "trade": trade,
         "rule_violations": violations,
         "rules_changed_today": _changed_today(_rules_history(), day),
+    }
+
+
+@mcp.tool()
+def check_trade(side: str, entry: float, stop: float, target: float,
+                margin_usd: float, trade_type: str = "scalp",
+                date: str = "") -> dict[str, Any]:
+    """Cham thu mot lenh theo rule ma KHONG ghi vao nhat ky.
+
+    Dung truoc khi bam lenh: xem no duoc xep scalp hay swing, han muc nao ap
+    dung, co pham rule gi khong. Muon ghi that thi goi log_trade voi cung tham so.
+    """
+    day = date or _today()
+    trades = _read_json(JOURNAL_DIR / f"{day}.json", [])
+    realized = round(sum(float(t["pnl"]) for t in trades if t.get("pnl") is not None), 2)
+
+    verdict = _evaluate_trade(
+        side=side, entry=entry, stop=stop, target=target, margin_usd=margin_usd,
+        trade_type=trade_type, trades=trades, rules=_load_rules(), realized=realized,
+    )
+    return {
+        "date": day,
+        "would_pass": not verdict["rule_violations"],
+        "logged": False,
+        **verdict,
     }
 
 
