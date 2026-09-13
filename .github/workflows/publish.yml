@@ -5,15 +5,16 @@ name: Build va push image len ghcr.io
 on:
   push:
     branches: [main]
-    paths:
-      - "server.py"
-      - "exchanges.py"
-      - "probe.py"
-      - "config.yaml"
-      - "requirements.txt"
-      - "Dockerfile"
-      - ".github/workflows/publish.yml"
-  workflow_dispatch:
+    # Liet ke thu BO QUA, khong liet ke thu theo doi: them module .py moi la no
+    # tu dong duoc tinh, khong phai nho sua file nay.
+    paths-ignore:
+      - "**.md"
+      - ".gitignore"
+      - ".dockerignore"
+      - ".env.example"
+      - "docker-compose.yml"
+      - "bamcp.service"
+  workflow_dispatch:          # nut "Run workflow" trong tab Actions
 
 jobs:
   publish:
