@@ -1,0 +1,8 @@
+# Runtime deps. Pin theo major de build lai khong vo bat ngo.
+mcp>=2.2,<3
+starlette>=0.37,<1        # import truc tiep (JSONResponse, middleware)
+httpx2>=2.5,<3            # HTTP client goi Binance (mcp 2.x dung httpx2, khong phai httpx)
+uvicorn[standard]>=0.30,<1  # them uvloop + httptools, nhanh hon uvicorn tran
+pyyaml>=6.0,<7
+python-dotenv>=1.0,<2     # nap .env khi chay local; Docker dung env cua compose
+tzdata>=2024.1            # zoneinfo can du lieu tz; image slim khong chac co san

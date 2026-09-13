@@ -1,0 +1,122 @@
+# BAMCP - Binance Analysis MCP
+# Doi duong dan o day khi deploy. Khong sua server.py.
+# Bien moi truong thang config: BAMCP_HOST, BAMCP_PORT, BAMCP_ALLOWED_HOSTS,
+# BAMCP_DATA_ROOT, BAMCP_USERNAME, BAMCP_PASSWORD, BAMCP_SYMBOL, BAMCP_MARKET, TZ,
+# BAMCP_ACCOUNT_ENABLED (true/false - tat nhanh phan doc tai khoan khi test).
+
+server:
+  host: "0.0.0.0"            # 0.0.0.0 khi chay trong container; 127.0.0.1 khi chay truc tiep sau Caddy
+  port: 8848
+  mcp_path: "/mcp"           # URL connector se la https://<domain><mcp_path>
+  health_path: "/healthz"    # public, khong can auth (Docker HEALTHCHECK + proxy)
+  admin_path: "/admin"       # trang dat username/password va credential san
+  log_level: "info"
+  behind_proxy: true         # tin X-Forwarded-* khi chay sau Caddy/nginx
+
+  auth:                      # HTTP Basic authentication
+    enabled: true
+    username: "bamcp"        # co the de o day, KHONG nen de password o day
+    password: ""             # de RONG -> doc tu bien moi truong BAMCP_PASSWORD
+    realm: "BAMCP"
+
+  allowed_hosts:             # Host header hop le. BAT BUOC them domain that khi chay sau proxy.
+                             # Dang "host:*" cho phep moi port. De rong = tat kiem tra (khong khuyen khich).
+    - "127.0.0.1:*"
+    - "localhost:*"
+    - "btc.example.com"
+    - "btc.example.com:*"
+
+timezone: "Asia/Ho_Chi_Minh"
+
+paths:
+  # Windows dev:  ./data          (tuong doi so voi config.yaml)
+  # Docker:       /data           (mount volume vao day)
+  data_root: "./data"
+  klines_dir: "klines"       # tuong doi so voi data_root
+  bias_dir: "bias"
+  journal_dir: "journal"
+  kline_filename: "{timeframe}.json"   # vd: 4h.json
+  rules_file: "rules.json"      # tuong doi so voi data_root; sinh tu `rules:` ben duoi o lan doi dau
+  settings_file: "settings.json" # username/password va credential san, do trang admin ghi
+
+fetcher:
+  enabled: true
+  symbol: "BTCUSDT"
+  market: "futures"          # futures = perpetual swap (dung cai nay neu ban trade perp)
+                             # spot     = san giao ngay. Volume hai ben KHAC NHAU.
+  base_url_futures: "https://fapi.binance.com/fapi/v1/klines"
+  base_url_spot: "https://api.binance.com/api/v3/klines"
+  interval_seconds: 900      # 15 phut
+  fetch_limit: 500           # so nen moi lan pull (Binance toi da 1000)
+  max_history: 1000          # so nen giu lai trong file sau khi merge
+  request_timeout: 20
+  retry: 3
+  run_on_start: true
+
+klines:
+  # File kline duoc tu nhan dang: mang Binance tho [[openTime,o,h,l,c,v,closeTime,...]]
+  # hoac object [{"openTime":..,"open":..,...}]. Fetcher luon ghi dang mang Binance tho.
+  # Neu file JSON boc trong 1 key (vd {"data": [...]}), dien ten key vao day
+  wrapper_key: ""
+  timeframes: ["1w", "1d", "4h", "1h", "15m"]
+  default_limit: 120
+  max_limit: 1000
+  context_lookback: 60       # so nen dung de tinh range / volume trung binh
+  swing_strength: 2          # fractal: dinh/day phai cao/thap hon N nen moi ben
+
+
+# Doc du lieu tai khoan that tu san. Tat = chi co nhat ky tu khai.
+# KEY VA SECRET KHONG BAO GIO DE O DAY - chung di qua bien moi truong:
+#   BAMCP_EXCHANGE_KEY, BAMCP_EXCHANGE_SECRET, BAMCP_EXCHANGE_PASSPHRASE (rieng OKX)
+# Tao key voi DUY NHAT quyen doc: tat quyen trade, tat quyen rut tien, bat IP whitelist.
+account:
+  enabled: true
+  exchange: "okx"        # binance | bybit | okx
+  symbol: ""                 # bo trong = mac dinh cua tung san:
+                             #   binance BTCUSDT | bybit BTCUSDT | okx BTC-USDT-SWAP
+  recv_window: 5000          # ms, do lech dong ho cho phep
+  request_timeout: 20
+  pnl_tolerance: 0.5         # lech PnL duoi muc nay thi reconcile_journal coi la khop
+
+  binance:
+    base_url: "https://fapi.binance.com"
+  bybit:
+    base_url: "https://api.bybit.com"
+    category: "linear"       # linear = USDT perp
+  okx:
+    base_url: "https://www.okx.com"
+    inst_type: "SWAP"
+
+# Gia tri KHOI TAO. Lan dau update_rules duoc goi, ban sao ghi sang data/rules.json
+# va tu do file do la nguon su that. Sua o day chi anh huong khi rules.json chua co,
+# hoac khi ban them mot rule moi chua ton tai trong file.
+rules:
+  max_trades_per_day: 3
+  max_margin_per_trade: 20
+  daily_stop_loss: -20
+  max_stop_points: 300
+  min_take_profit_points: 500
+
+# Quy trinh phan tich ma Claude doc luc bat tay. Sua o day, `docker compose restart`,
+# roi tat/bat lai connector trong chat de Claude doc ban moi. Khong can build lai image.
+instructions: |
+  Du lieu BTC da khung tu Binance. Moi con so phai lay tu cac tool nay,
+  khong duoc uoc luong hay nho lai.
+
+  Quy trinh: get_context(W/D/H4) -> save_bias -> get_context(H1/M15) tim entry
+  -> get_today_status truoc khi vao lenh.
+
+  QUAN TRONG - nen da dong: khoi 'vsa' duoc tinh tren nen DA DONG. Khoi 'current_bar'
+  la nen dang chay, chi dung de biet gia hien tai, TUYET DOI khong dung volume/spread
+  cua no de ket luan VSA. get_klines mac dinh cung chi tra nen da dong.
+
+  Neu freshness.stale = true thi du lieu da tre, goi refresh_data truoc khi phan tich.
+
+  Quy dinh giao dich doc bang get_rules, doi bang update_rules (bat buoc co ly do).
+  Neu get_today_status bao rules_changed_today khong rong thi noi ro dieu do ra
+  truoc khi ban tiep chuyen vao lenh.
+
+  Neu account.enabled = true thi con doc duoc tai khoan that: get_positions cho vi the
+  dang mo, get_fills cho lenh da khop, get_account_pnl cho PnL that (da tru phi va
+  funding), reconcile_journal de doi chieu nhat ky voi san. Khi khoi 'exchange' trong
+  get_today_status co du lieu thi tin so do, khong tin so tu khai trong nhat ky.

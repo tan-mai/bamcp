@@ -1,0 +1,14 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+data/
+.env
+*.md
+Caddyfile
+bamcp.service
+docker-compose.yml
+.github

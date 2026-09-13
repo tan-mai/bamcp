@@ -1,0 +1,16 @@
+[Unit]
+Description=BAMCP - Binance Analysis MCP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bamcp
+WorkingDirectory=/opt/bamcp
+Environment=BAMCP_CONFIG=/opt/bamcp/config.yaml
+ExecStart=/opt/bamcp/.venv/bin/python /opt/bamcp/server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

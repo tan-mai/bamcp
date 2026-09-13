@@ -1,0 +1,61 @@
+services:
+  bamcp:
+    # Panel cua Hostinger chi pull image, khong build. Image do GitHub Actions day len.
+    # Giu dong build de ai co shell van "docker compose up --build" duoc.
+    build: .
+    image: ghcr.io/CHANGE_ME/bamcp:latest
+    container_name: bamcp
+    restart: unless-stopped
+
+    environment:
+      # Bat buoc - lay tu file .env, khong bao gio nam trong image
+      BAMCP_USERNAME: ${BAMCP_USERNAME:?can dat trong .env}
+      BAMCP_PASSWORD: ${BAMCP_PASSWORD:?can dat trong .env}
+      # Domain that. Traefik chuyen tiep nguyen Host header, thieu domain o day = 421
+      BAMCP_ALLOWED_HOSTS: ${BAMCP_ALLOWED_HOSTS:-127.0.0.1:*,localhost:*}
+      BAMCP_DATA_ROOT: /data
+      BAMCP_SYMBOL: ${BAMCP_SYMBOL:-BTCUSDT}
+      BAMCP_MARKET: ${BAMCP_MARKET:-futures}
+      TZ: ${TZ:-Asia/Ho_Chi_Minh}
+      # Doc tai khoan san - de trong neu account.enabled = false
+      BAMCP_ACCOUNT_ENABLED: ${BAMCP_ACCOUNT_ENABLED:-}
+      BAMCP_EXCHANGE: ${BAMCP_EXCHANGE:-}
+      BAMCP_EXCHANGE_KEY: ${BAMCP_EXCHANGE_KEY:-}
+      BAMCP_EXCHANGE_SECRET: ${BAMCP_EXCHANGE_SECRET:-}
+      BAMCP_EXCHANGE_PASSPHRASE: ${BAMCP_EXCHANGE_PASSPHRASE:-}
+    volumes:
+      # Named volume, KHONG phai bind mount. Docker chep quyen so huu tu image sang
+      # volume moi, nen uid 10001 ghi duoc ma khong can chown tren host.
+      - bamcp_data:/data
+
+    # KHONG publish port khi chay sau Traefik. Traefik goi thang vao container
+    # qua mang Docker, cong 8848 chi can mo ben trong mang do.
+    # Mo tam dong duoi neu can curl truc tiep de do loi, xong nho dong lai.
+    # ports:
+    #   - "8848:8848"
+
+    networks:
+      - traefik          # doi thanh ten mang Traefik that tren VPS
+
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.bamcp.rule=Host(`btc.example.com`)"
+      - "traefik.http.routers.bamcp.entrypoints=websecure"
+      - "traefik.http.routers.bamcp.tls.certresolver=letsencrypt"
+      # Traefik phai biet goi vao cong nao ben trong container
+      - "traefik.http.services.bamcp.loadbalancer.server.port=8848"
+
+    stop_grace_period: 15s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  bamcp_data:
+
+networks:
+  traefik:
+    external: true       # mang do Traefik tao san, compose khong tao moi
