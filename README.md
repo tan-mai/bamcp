@@ -186,6 +186,23 @@ Xong bước này, `.env` và biến môi trường không còn vai trò gì n�
 
 Mật khẩu và credential sàn cố ý **không** cho Claude sửa — chúng là thứ bảo vệ chính Claude, không nên nằm trong tầm với của nó.
 
+### Biến môi trường: chỉ cần bốn dòng
+
+Credential sàn **không cần** đi qua biến môi trường. Đặt chúng trong trang admin sau khi container chạy — an toàn hơn, vì key không nằm trong ô config của panel.
+
+Bốn biến bắt buộc:
+
+```
+BAMCP_USERNAME=<tên bạn chọn>
+BAMCP_PASSWORD=<chuỗi ngẫu nhiên, tối thiểu 8 ký tự>
+BAMCP_ALLOWED_HOSTS=btc.domain.com,btc.domain.com:*
+TZ=Asia/Ho_Chi_Minh
+```
+
+Bốn biến `BAMCP_EXCHANGE*` chỉ là đường nạp sẵn cho tiện. Bỏ trống thì container khởi động với phần đọc sàn **tắt** — log không có dòng `BAMCP account`, các tool `get_positions` / `get_fills` báo lỗi rõ ràng cho tới khi bạn cấu hình.
+
+Sau đó vào `/admin`, mục **Tài khoản sàn**: chọn sàn, dán key/secret/passphrase, tích *Đọc dữ liệu tài khoản thật*, bấm **Kiểm tra kết nối sàn**, rồi Lưu. Có hiệu lực ngay, không cần khởi động lại — kể cả khi đổi hẳn sang sàn khác.
+
 ### Thứ tự ưu tiên
 
 ```
@@ -308,16 +325,16 @@ Repo vẫn để private được — GHCR tách riêng hai thứ. Image không 
 
 ### 4. Biến môi trường
 
+Chỉ bốn dòng:
+
 | Biến | Giá trị |
 |---|---|
-| `BAMCP_USERNAME` | `bamcp` |
-| `BAMCP_PASSWORD` | chuỗi mạnh, không dùng lại `test123` |
+| `BAMCP_USERNAME` | tên đăng nhập bạn chọn |
+| `BAMCP_PASSWORD` | chuỗi ngẫu nhiên, tối thiểu 8 ký tự |
 | `BAMCP_ALLOWED_HOSTS` | `btc.domain.com,btc.domain.com:*` |
-| `BAMCP_EXCHANGE` | `okx` |
-| `BAMCP_EXCHANGE_KEY` | key OKX read-only |
-| `BAMCP_EXCHANGE_SECRET` | secret |
-| `BAMCP_EXCHANGE_PASSPHRASE` | passphrase đặt lúc tạo key |
 | `TZ` | `Asia/Ho_Chi_Minh` |
+
+**Credential sàn không đặt ở đây.** Sau khi container chạy, vào `/admin` để dán key — key không nằm trong ô config của panel, và đổi sàn về sau không phải sửa container.
 
 `BAMCP_ALLOWED_HOSTS` là chỗ dễ sập nhất: Traefik chuyển tiếp nguyên Host header, thiếu domain thật trong danh sách là server trả **421** cho mọi request.
 
