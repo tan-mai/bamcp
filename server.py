@@ -833,15 +833,21 @@ async def get_today_status(date: str = "") -> dict[str, Any]:
         try:
             data = await _account_day(day)
             positions = await _open_positions()
+            counts = data["position_counts"]
             exchange_block = {
                 "exchange": data["exchange"],
+                # Mot vi the = mot lenh, du TP tung phan hay SL cat lam nhieu manh
+                "positions_opened_today": counts["opened_today"],
+                "positions_closed_today": counts["closed_today"],
+                "positions_carried_in": counts["carried_in"],
                 "orders": len(data["order_ids"]),
                 "fills": len(data["fills"]),
                 "open_positions": positions["open_positions"],
                 **data["totals"],
             }
             # San la nguon su that. Lenh quen log van tinh vao quota.
-            trades_counted = max(len(trades), len(data["order_ids"]))
+            # Vi the mang tu hom truoc sang khong tinh - da tinh vao quota hom do roi.
+            trades_counted = max(len(trades), counts["opened_today"])
             pnl_counted = data["totals"]["net"]
             source = "exchange"
         except Exception as exc:
@@ -1031,6 +1037,100 @@ def _summarize(settlements: list[dict[str, Any]]) -> dict[str, float]:
     return totals
 
 
+_SIZE_EPS = 1e-8
+
+
+def _group_fills_into_positions(fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Gop fill thanh VI THE. Mot vi the = mot lan mo -> dong, ke ca khi TP tung
+    phan hay bi SL cat lam nhieu manh.
+
+    Vi sao phai dung lai: ca ba san deu khong tra ve position id trong lich su
+    fill. TP tung phan sinh ra nhieu order_id khac nhau nhung van la MOT lenh
+    theo cach hieu cua nguoi giao dich - dem theo order_id se thoi phong so lenh
+    trong ngay va lam quota het som gia.
+
+    Cach nhan biet: fill co realized_pnl khac 0 la fill DONG bot vi the; bang 0
+    la fill MO hoac them vao. Cong don khoi luong co dau, ve 0 la dong vi the.
+
+    Fill dau ngay ma da co realized_pnl nghia la vi the duoc mo tu HOM TRUOC -
+    danh dau carried_in, va no khong tinh vao quota hom nay.
+    """
+    ordered = sorted(fills, key=lambda f: int(f.get("ts") or 0))
+    groups: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    size = 0.0
+
+    def _open(carried: bool) -> dict[str, Any]:
+        return {"position_id": f"P{len(groups) + 1}", "carried_in": carried,
+                "closed": False, "fills": []}
+
+    def _close(group: dict[str, Any]) -> None:
+        group["closed"] = True
+        groups.append(group)
+
+    for index, fill in enumerate(ordered):
+        reducing = abs(float(fill.get("realized_pnl") or 0.0)) > 0
+        qty = float(fill.get("qty") or 0.0)
+        delta = qty if str(fill.get("side", "")).lower() == "buy" else -qty
+
+        if current is None:
+            current = _open(carried=reducing)
+            size = 0.0
+
+        fill["position_id"] = current["position_id"]
+        current["fills"].append(fill)
+        previous = size
+        size += delta
+
+        if current["carried_in"]:
+            # Khong biet vi the mang sang lon bao nhieu nen size khong dang tin.
+            # Dong nhom khi het chuoi fill dong, tuc fill ke tiep la fill mo.
+            nxt = ordered[index + 1] if index + 1 < len(ordered) else None
+            if nxt is None or abs(float(nxt.get("realized_pnl") or 0.0)) == 0:
+                _close(current)
+                current = None
+                size = 0.0
+        elif abs(size) < _SIZE_EPS:
+            _close(current)
+            current = None
+            size = 0.0
+        elif previous != 0 and (previous > 0) != (size > 0):
+            # Dao chieu trong mot fill: dong vi the cu, mo vi the moi ngay
+            _close(current)
+            current = _open(carried=False)
+            fill["position_id"] = current["position_id"]
+            current["fills"].append(fill)
+
+    if current is not None:          # con mo den cuoi ngay
+        groups.append(current)
+
+    for group in groups:
+        rows = group["fills"]
+        opening = [f for f in rows if abs(float(f.get("realized_pnl") or 0.0)) == 0]
+        group["side"] = ("long" if str(opening[0].get("side", "")).lower() == "buy"
+                         else "short") if opening else (
+            "short" if str(rows[0].get("side", "")).lower() == "sell" else "long")
+        group["fill_count"] = len(rows)
+        group["order_ids"] = sorted({f["order_id"] for f in rows if f.get("order_id")})
+        group["opened_at"] = rows[0].get("time") or ""
+        group["closed_at"] = rows[-1].get("time") or "" if group["closed"] else ""
+        group["realized_pnl"] = round(
+            sum(float(f.get("realized_pnl") or 0.0) for f in rows), 4)
+        group["fee"] = round(sum(float(f.get("fee") or 0.0) for f in rows), 4)
+    return groups
+
+
+def _position_counts(groups: list[dict[str, Any]]) -> dict[str, int]:
+    """Chi vi the MO trong ngay moi tinh vao quota. Vi the mang tu hom truoc sang
+    da tinh vao quota cua hom do roi - tinh lai la phat nguoi dung hai lan."""
+    return {
+        "opened_today": sum(1 for g in groups if not g["carried_in"]),
+        "closed_today": sum(1 for g in groups if g["closed"]),
+        "carried_in": sum(1 for g in groups if g["carried_in"]),
+        "still_open": sum(1 for g in groups if not g["closed"]),
+    }
+
+
 async def _account_day(day: str) -> dict[str, Any]:
     """Fills + settlement cua mot ngay, da chuan hoa. Dung chung cho nhieu tool."""
     start_ms, end_ms = _day_window_ms(day)
@@ -1042,12 +1142,18 @@ async def _account_day(day: str) -> dict[str, Any]:
         row["time"] = _stamp(row["ts"])
     for row in settlements:
         row["time"] = _stamp(row["ts"])
+
+    # Gom fill thanh vi the TRUOC khi dem. TP tung phan va SL deu la order rieng
+    # nhung van thuoc mot vi the - dem theo order_id se thoi phong so lenh.
+    positions = _group_fills_into_positions(fills)
     return {
         "date": day,
         "exchange": adapter.name,
         "symbol": adapter.symbol,
         "fills": fills,
         "order_ids": sorted({f["order_id"] for f in fills if f.get("order_id")}),
+        "positions": positions,
+        "position_counts": _position_counts(positions),
         "settlements": settlements,
         "totals": _summarize(settlements),
     }
@@ -1080,15 +1186,32 @@ async def get_positions() -> dict[str, Any]:
 
 @mcp.tool()
 async def get_fills(date: str = "") -> dict[str, Any]:
-    """Lenh da khop trong ngay, lay thang tu san. date bo trong = hom nay."""
+    """Lenh da khop trong ngay, lay thang tu san, GOM THEO VI THE.
+
+    Mot vi the co the gom nhieu fill: mo, TP tung phan, SL. Chung cung
+    position_id. Dem so lenh trong ngay phai dem vi the, khong dem fill hay order.
+    """
     data = await _account_day(date or _today())
+    counts = data["position_counts"]
     return {
         "date": data["date"],
         "exchange": data["exchange"],
         "symbol": data["symbol"],
+        "positions_opened_today": counts["opened_today"],
+        "positions_carried_in": counts["carried_in"],
+        "positions_still_open": counts["still_open"],
         "fill_count": len(data["fills"]),
         "order_count": len(data["order_ids"]),
-        "fills": data["fills"],
+        "note": ("Mot vi the = mot lenh. carried_in = mo tu hom truoc, "
+                 "khong tinh vao quota hom nay."),
+        "positions": [
+            {k: v for k, v in group.items() if k != "fills"} | {
+                "fills": [{"time": f["time"], "side": f["side"], "price": f["price"],
+                           "qty": f["qty"], "fee": f["fee"],
+                           "realized_pnl": f["realized_pnl"]} for f in group["fills"]]
+            }
+            for group in data["positions"]
+        ],
     }
 
 
@@ -1125,14 +1248,17 @@ async def reconcile_journal(date: str = "") -> dict[str, Any]:
     exchange_net = data["totals"]["net"]
 
     findings = []
-    if len(data["order_ids"]) > len(trades):
+    # Doi chieu theo VI THE, khong theo order: TP tung phan sinh nhieu order
+    # nhung nguoi dung chi coi do la mot lenh, va nhat ky cung ghi mot dong.
+    opened = data["position_counts"]["opened_today"]
+    if opened > len(trades):
         findings.append(
-            f"san ghi nhan {len(data['order_ids'])} lenh nhung nhat ky chi co "
+            f"san ghi nhan {opened} vi the mo trong ngay nhung nhat ky chi co "
             f"{len(trades)} - co lenh chua log")
-    elif len(trades) > len(data["order_ids"]):
+    elif len(trades) > opened:
         findings.append(
-            f"nhat ky co {len(trades)} lenh nhung san chi thay "
-            f"{len(data['order_ids'])} - co lenh log nhung khong khop")
+            f"nhat ky co {len(trades)} lenh nhung san chi thay {opened} vi the "
+            "mo trong ngay - co lenh log nhung khong khop")
 
     gap = round(journal_pnl - exchange_net, 2)
     if abs(gap) >= float(ACCOUNT.get("pnl_tolerance", 0.5)):
@@ -1152,6 +1278,8 @@ async def reconcile_journal(date: str = "") -> dict[str, Any]:
         "findings": findings,
         "journal": {"trades": len(trades), "realized_pnl": journal_pnl},
         "exchange_data": {
+            "positions_opened_today": data["position_counts"]["opened_today"],
+            "positions_carried_in": data["position_counts"]["carried_in"],
             "orders": len(data["order_ids"]),
             "fills": len(data["fills"]),
             **data["totals"],

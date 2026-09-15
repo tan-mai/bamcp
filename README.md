@@ -127,6 +127,27 @@ Server **từ chối khởi động** nếu bật `account.enabled` mà thiếu 
 
 Nếu mất kết nối tới sàn, `get_today_status` **không lỗi** — nó quay về dùng số trong nhật ký và đặt `exchange.error` để bạn biết con số đang kém tin cậy. Rào chắn kỷ luật không được phép sập vì mạng chập chờn.
 
+### Một vị thế = một lệnh
+
+TP từng phần và SL là những **order riêng** trên sàn, nhưng theo cách hiểu của người giao dịch chúng vẫn thuộc **một lệnh**. Đếm theo `order_id` sẽ thổi phồng số lệnh trong ngày và làm quota hết sớm giả.
+
+Cả ba sàn đều không trả về position id trong lịch sử fill, nên server dựng lại: cộng dồn khối lượng có dấu, về 0 là đóng vị thế. Fill có `realized_pnl` khác 0 là fill đóng bớt, bằng 0 là fill mở hoặc thêm vào.
+
+Ví dụ thật — bốn fill trong một ngày:
+
+```
+00:39  sell 7.27   pnl −11.03  ┐ P1  mở từ hôm trước
+15:13  sell 2.30   pnl  −3.78  ┘     (carried_in)
+15:43  buy  11.25  pnl      0  ┐ P2  mở và đóng trong ngày
+16:24  sell 11.25  pnl −13.62  ┘
+```
+
+Trước đây tính là **4 lệnh**. Giờ là **2 vị thế**, và chỉ **1** tính vào quota hôm nay — vị thế mang từ hôm trước sang đã tính vào quota của hôm đó rồi, tính lại là phạt bạn hai lần.
+
+`get_fills` trả về danh sách vị thế, mỗi vị thế có `position_id`, `carried_in`, `closed`, tổng `realized_pnl` và các fill thành phần. `get_today_status` và `reconcile_journal` đều đếm theo vị thế.
+
+Các trường hợp đã kiểm: TP từng phần (mở 10, chốt 3+3+4 → 1 vị thế), scale in (5+5 rồi đóng 10 → 1), hai vị thế độc lập → 2, vị thế còn mở cuối ngày → 1 với `still_open`.
+
 ### `reconcile_journal`
 
 Chạy cuối ngày, hoặc bất cứ lúc nào nghi mình quên log. Nó chỉ ra ba loại lệch:
