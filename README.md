@@ -1,6 +1,6 @@
 # BAMCP — BTC Analysis MCP
 
-MCP server tự pull dữ liệu kline đa khung từ Binance và phục vụ phân tích Wyckoff/VSA/GANN từ bất kỳ thiết bị nào có Claude. Không cần cron job riêng.
+MCP server tự pull dữ liệu kline đa khung, nhiều cặp giao dịch, từ Binance — phục vụ phân tích Wyckoff/VSA/GANN từ bất kỳ thiết bị nào có Claude. Không cần cron job riêng.
 
 Về mặt vận hành nó là một web API server bình thường: Starlette + uvicorn, Basic auth, healthcheck, chạy trong Docker sau reverse proxy. Điểm khác duy nhất là nó nói thêm được giao thức MCP ở đường `/mcp`.
 
@@ -12,15 +12,16 @@ Tuỳ chọn đọc tài khoản thật từ Binance, Bybit hoặc OKX bằng AP
 
 | Tool | Việc |
 |---|---|
-| `list_timeframes` | Khung nào có file, lần pull gần nhất, lỗi nếu có |
+| `list_timeframes` | Các cặp đang theo dõi, khung nào đã có dữ liệu, lần pull gần nhất |
 | `refresh_data` | Ép pull ngay từ Binance, không chờ chu kỳ |
 | `get_klines` | Nến OHLCV thô, mặc định chỉ trả nến đã đóng |
-| `get_context` | Range, vị trí giá trong range, spread/volume cho VSA, swing gần nhất, độ tươi dữ liệu |
-| `get_bias` | Đọc bias đã lưu |
-| `save_bias` | Lưu bias sau bước W/D/H4 |
+| `get_context` | Range, vị trí giá trong range, spread/volume cho VSA, swing gần nhất, độ tươi dữ liệu — theo cặp |
+| `get_bias` | Đọc bias đã lưu của một cặp |
+| `save_bias` | Lưu bias cho một cặp sau bước W/D/H4 |
 | `get_rules` | Đọc quy định đang hiệu lực + lịch sử thay đổi |
 | `update_rules` | Đổi quy định, bắt buộc kèm lý do, hiệu lực ngay |
 | `get_today_status` | Quota lệnh + PnL, rule đổi hôm nay, check trước khi vào lệnh |
+| `check_trade` | Chấm thử một lệnh theo rule mà không ghi nhật ký |
 | `log_trade` | Ghi lệnh, cảnh báo nếu phạm rule |
 | `close_trade` | Đóng lệnh, cập nhật PnL thực |
 | `get_positions` | Vị thế đang mở **thật trên sàn** |
@@ -39,6 +40,55 @@ Không có tool đặt lệnh. Cố ý.
 - `freshness` — tuổi của nến đóng gần nhất. `stale: true` nghĩa là trễ hơn 2 nến, pipeline có vấn đề, đừng tin kết quả phân tích.
 
 `get_klines` theo cùng kỷ luật đó: mặc định chỉ trả nến đã đóng, mỗi cây gắn cờ `is_closed`. Muốn thấy nến đang chạy phải gọi `include_forming=true`, và nó về với `is_closed: false`.
+
+## Nhiều cặp giao dịch
+
+Hệ thống theo dõi nhiều cặp, không chỉ BTC. Thêm và quản lý trong trang admin, mục **Cặp giao dịch**.
+
+Khi thêm một cặp, server hỏi Binance xem cặp đó có thật không rồi mới nhận — không có danh sách cứng, nên cặp nào Binance có là dùng được. Thêm xong nó kéo dữ liệu ban đầu ngay, không phải chờ hết chu kỳ 15 phút.
+
+Từ đó cặp mới được pull tự động ở cả 5 khung như BTC, cùng một vòng lặp nền.
+
+### Cấu trúc dữ liệu
+
+```
+data/
+├── klines/
+│   ├── BTCUSDT/   1w.json  1d.json  4h.json  1h.json  15m.json
+│   ├── ETHUSDT/   1w.json  ...
+│   └── SOLUSDT/   ...
+├── bias/
+│   ├── BTCUSDT/   2026-09-15.json
+│   └── ETHUSDT/   2026-09-15.json
+├── journal/       2026-09-15.json     ← dùng chung mọi cặp
+├── rules.json                          ← dùng chung mọi cặp
+└── settings.json
+```
+
+Dữ liệu từ bản một-cặp được **tự động chuyển** sang bố cục này lúc khởi động, không mất gì.
+
+### Cái gì riêng, cái gì chung
+
+| | Phạm vi |
+|---|---|
+| Nến, bias | **Riêng từng cặp** |
+| Quota lệnh/ngày, dừng ngày, hạn mức margin | **Chung tất cả các cặp** |
+| Nhật ký lệnh | Chung |
+| Đọc tài khoản sàn | Một cặp duy nhất — cặp khai trong mục *Tài khoản sàn* |
+
+Quy định dùng chung là cố ý: nếu mỗi cặp một bộ quota thì thêm 5 cặp là nhân ngân sách rủi ro lên 5 lần, mà tài khoản thì vẫn chỉ có một.
+
+### Dùng trong chat
+
+Mọi tool phân tích đều nhận `symbol`, bỏ trống là lấy cặp mặc định:
+
+> *"Phân tích ETHUSDT theo Wyckoff từ khung tuần xuống H4"*
+
+> *"So sánh cấu trúc BTC và ETH hiện tại"*
+
+> *"Lưu bias short cho ETHUSDT, pha B"*
+
+Phương pháp không đổi theo cặp — vẫn Wyckoff/VSA/GANN, vẫn từ khung lớn xuống nhỏ, vẫn chỉ đọc VSA trên nến đã đóng.
 
 ## Quy định giao dịch
 

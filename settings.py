@@ -179,6 +179,72 @@ class SettingsStore:
         }
         self._write(data)
 
+    # ------------------------------------------------------------ cap giao dich
+
+    def symbols(self, seed: str = "") -> list[dict[str, Any]]:
+        """Danh sach cap dang theo doi. Lan dau lay tu config de khong mat BTC."""
+        rows = self.load().get("symbols")
+        if not isinstance(rows, list) or not rows:
+            if not seed:
+                return []
+            rows = [{"symbol": seed.upper(), "enabled": True, "added_at": ""}]
+            data = self.load()
+            data["symbols"] = rows
+            self._write(data)
+        return [
+            {"symbol": str(r.get("symbol", "")).upper(),
+             "enabled": bool(r.get("enabled", True)),
+             "added_at": str(r.get("added_at", ""))}
+            for r in rows if r.get("symbol")
+        ]
+
+    def enabled_symbols(self, seed: str = "") -> list[str]:
+        return [r["symbol"] for r in self.symbols(seed) if r["enabled"]]
+
+    def has_symbol(self, symbol: str) -> bool:
+        return symbol.upper() in {r["symbol"] for r in self.symbols()}
+
+    def add_symbol(self, symbol: str) -> None:
+        symbol = symbol.strip().upper()
+        if not symbol:
+            raise ValueError("cap giao dich khong duoc de trong")
+        if not symbol.isalnum():
+            raise ValueError(f"ten cap khong hop le: {symbol}")
+        if self.has_symbol(symbol):
+            raise ValueError(f"{symbol} da co trong danh sach")
+        data = self.load()
+        rows = list(data.get("symbols") or [])
+        rows.append({"symbol": symbol, "enabled": True,
+                     "added_at": datetime.now(self.tz).isoformat(timespec="seconds")})
+        data["symbols"] = rows
+        self._write(data)
+
+    def set_symbol_enabled(self, symbol: str, enabled: bool) -> None:
+        symbol = symbol.strip().upper()
+        data = self.load()
+        rows = list(data.get("symbols") or [])
+        for row in rows:
+            if str(row.get("symbol", "")).upper() == symbol:
+                row["enabled"] = bool(enabled)
+                data["symbols"] = rows
+                self._write(data)
+                return
+        raise ValueError(f"khong tim thay {symbol}")
+
+    def remove_symbol(self, symbol: str) -> None:
+        """Bo khoi danh sach theo doi. KHONG xoa file du lieu da pull ve -
+        them lai cap do sau nay thi lich su van con nguyen."""
+        symbol = symbol.strip().upper()
+        data = self.load()
+        rows = [r for r in (data.get("symbols") or [])
+                if str(r.get("symbol", "")).upper() != symbol]
+        if len(rows) == len(data.get("symbols") or []):
+            raise ValueError(f"khong tim thay {symbol}")
+        if not rows:
+            raise ValueError("phai giu lai it nhat mot cap")
+        data["symbols"] = rows
+        self._write(data)
+
     # ------------------------------------------------------------ hien thi
 
     def masked(self) -> dict[str, Any]:

@@ -132,6 +132,65 @@ def _account_enabled() -> bool:
     return bool(STORE.exchange()["enabled"])
 
 
+# ---------------------------------------------------------------- symbols
+
+DEFAULT_SYMBOL = str(FETCH.get("symbol") or "BTCUSDT").upper()
+
+
+def _symbols() -> list[str]:
+    """Cac cap dang bat. Luon co it nhat mot cap."""
+    return STORE.enabled_symbols(DEFAULT_SYMBOL) or [DEFAULT_SYMBOL]
+
+
+def _resolve_symbol(symbol: str = "") -> str:
+    """Bo trong = cap dau tien dang bat. Giu duoc cach goi cu khong co symbol."""
+    if not symbol:
+        active = _symbols()
+        return active[0] if active else DEFAULT_SYMBOL
+    symbol = symbol.strip().upper()
+    known = {r["symbol"] for r in STORE.symbols(DEFAULT_SYMBOL)}
+    if symbol not in known:
+        raise ValueError(
+            f"chua theo doi cap {symbol}. Them no trong trang admin truoc, "
+            f"hoac chon mot trong: {sorted(known)}")
+    return symbol
+
+
+def _kline_dir(symbol: str) -> Path:
+    return KLINES_DIR / symbol.upper()
+
+
+def _bias_dir(symbol: str) -> Path:
+    return BIAS_DIR / symbol.upper()
+
+
+def _migrate_flat_layout() -> None:
+    """Chuyen bo cuc cu (mot cap) sang bo cuc moi (nhieu cap).
+
+    Ban cu dat file thang trong klines/ va bias/. Bo cuc moi tach theo cap:
+    klines/<SYMBOL>/4h.json. Chay mot lan, im lang neu khong co gi de chuyen.
+    """
+    moved = 0
+    target = _kline_dir(DEFAULT_SYMBOL)
+    for tf in KL["timeframes"]:
+        old = KLINES_DIR / PATHS["kline_filename"].format(timeframe=tf)
+        if old.is_file():
+            target.mkdir(parents=True, exist_ok=True)
+            old.replace(target / old.name)
+            moved += 1
+
+    bias_target = _bias_dir(DEFAULT_SYMBOL)
+    for old in BIAS_DIR.glob("*.json") if BIAS_DIR.exists() else []:
+        if old.is_file():
+            bias_target.mkdir(parents=True, exist_ok=True)
+            old.replace(bias_target / old.name)
+            moved += 1
+
+    if moved:
+        print(f"BAMCP: da chuyen {moved} file sang bo cuc theo cap "
+              f"({DEFAULT_SYMBOL})", file=sys.stderr)
+
+
 # ---------------------------------------------------------------- helpers
 
 def _today() -> str:
@@ -319,11 +378,14 @@ def _normalize_bars(raw: Any) -> list[dict[str, float]]:
     return bars
 
 
-def _load_bars(timeframe: str) -> list[dict[str, float]]:
+def _load_bars(symbol: str, timeframe: str) -> list[dict[str, float]]:
+    sym = _resolve_symbol(symbol)
     tf = _validate_timeframe(timeframe)
-    path = _kline_path(tf)
+    path = _kline_path(symbol, tf)
     if not path.exists():
-        raise FileNotFoundError(f"Khong tim thay file kline: {path}")
+        raise FileNotFoundError(
+            f"Chua co du lieu {symbol} khung {tf}. Doi mot chu ky pull, "
+            f"hoac goi refresh_data({symbol!r}).")
     return _normalize_bars(_read_json(path, []))
 
 
@@ -378,14 +440,14 @@ def _pct(value: float, low: float, high: float) -> float | None:
     return round((value - low) / span * 100, 2)
 
 
-def _build_context(timeframe: str) -> dict[str, Any]:
-    all_bars = _load_bars(timeframe)
+def _build_context(symbol: str, timeframe: str) -> dict[str, Any]:
+    all_bars = _load_bars(symbol, timeframe)
     if not all_bars:
-        return {"timeframe": timeframe, "error": "khong co du lieu"}
+        return {"symbol": symbol, "timeframe": timeframe, "error": "khong co du lieu"}
 
     bars, forming = _split_closed(all_bars, timeframe)
     if not bars:
-        return {"timeframe": timeframe, "error": "chua co nen nao dong"}
+        return {"symbol": symbol, "timeframe": timeframe, "error": "chua co nen nao dong"}
 
     lookback = min(int(KL["context_lookback"]), len(bars))
     window = bars[-lookback:]
@@ -422,6 +484,7 @@ def _build_context(timeframe: str) -> dict[str, Any]:
     last_spread = last["high"] - last["low"]
 
     return {
+        "symbol": symbol,
         "timeframe": timeframe,
         "bars_available": len(all_bars),
         "closed_bars": len(bars),
@@ -467,8 +530,8 @@ def _binance_url() -> str:
     return FETCH[key]
 
 
-def _kline_path(timeframe: str) -> Path:
-    return KLINES_DIR / PATHS["kline_filename"].format(timeframe=timeframe)
+def _kline_path(symbol: str, timeframe: str) -> Path:
+    return _kline_dir(symbol) / PATHS["kline_filename"].format(timeframe=timeframe)
 
 
 def _merge_bars(old: list[Any], new: list[Any], cap: int) -> list[Any]:
@@ -480,9 +543,10 @@ def _merge_bars(old: list[Any], new: list[Any], cap: int) -> list[Any]:
     return ordered[-cap:] if cap else ordered
 
 
-async def _fetch_one(client: httpx.AsyncClient, timeframe: str) -> dict[str, Any]:
+async def _fetch_one(client: httpx.AsyncClient, symbol: str,
+                     timeframe: str) -> dict[str, Any]:
     params = {
-        "symbol": FETCH["symbol"],
+        "symbol": symbol,
         "interval": timeframe,
         "limit": int(FETCH["fetch_limit"]),
     }
@@ -497,7 +561,7 @@ async def _fetch_one(client: httpx.AsyncClient, timeframe: str) -> dict[str, Any
             if not isinstance(rows, list) or not rows:
                 raise ValueError("Binance tra ve du lieu rong")
 
-            path = _kline_path(timeframe)
+            path = _kline_path(symbol, timeframe)
             existing = _read_json(path, [])
             if not isinstance(existing, list):
                 existing = []
@@ -512,16 +576,59 @@ async def _fetch_one(client: httpx.AsyncClient, timeframe: str) -> dict[str, Any
     return {"ok": False, "error": str(last_exc), "at": _now_iso()}
 
 
-async def fetch_all(timeframes: list[str] | None = None) -> dict[str, Any]:
-    """Mot lan pull duy nhat tai mot thoi diem, du goi tu MCP tool, HTTP API hay vong lap nen."""
-    targets = [tf.lower() for tf in (timeframes or KL["timeframes"])]
+async def probe_symbol(symbol: str) -> None:
+    """Hoi Binance xem cap nay co that khong. Nem ValueError neu khong.
+
+    Dung luc them cap trong trang admin: thay vi giu mot danh sach cung se lac
+    hau, hoi thang san. Cap nao Binance co la dung duoc.
+    """
+    symbol = symbol.strip().upper()
+    params = {"symbol": symbol, "interval": "1h", "limit": 1}
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(_binance_url(), params=params,
+                                    timeout=float(FETCH.get("request_timeout", 20)))
+        except Exception as exc:
+            raise ValueError(f"khong goi duoc Binance ({type(exc).__name__})") from None
+    if resp.status_code >= 400:
+        raise ValueError(
+            f"Binance khong co cap {symbol} tren thi truong "
+            f"{FETCH.get('market', 'futures')} (HTTP {resp.status_code})")
+    rows = resp.json()
+    if not isinstance(rows, list) or not rows:
+        raise ValueError(f"Binance tra ve du lieu rong cho {symbol}")
+
+
+async def fetch_all(symbols: list[str] | None = None,
+                    timeframes: list[str] | None = None) -> dict[str, Any]:
+    """Mot lan pull duy nhat tai mot thoi diem, du goi tu MCP tool hay vong lap nen.
+
+    Chay song song nhung co gioi han: them nhieu cap ma ban het cung luc thi de
+    dinh rate limit cua Binance.
+    """
+    target_symbols = [s.upper() for s in (symbols or _symbols())]
+    target_tfs = [tf.lower() for tf in (timeframes or KL["timeframes"])]
+    gate = asyncio.Semaphore(int(FETCH.get("max_concurrent_requests", 8)))
+
+    async def one(client, symbol, tf):
+        async with gate:
+            return (symbol, tf, await _fetch_one(client, symbol, tf))
+
     async with FETCH_LOCK:
         async with httpx.AsyncClient() as client:
-            pairs = await asyncio.gather(*[_fetch_one(client, tf) for tf in targets])
-    results = dict(zip(targets, pairs))
+            done = await asyncio.gather(*[
+                one(client, s, tf) for s in target_symbols for tf in target_tfs
+            ])
+
+    results: dict[str, dict[str, Any]] = {s: {} for s in target_symbols}
+    failed: list[str] = []
+    for symbol, tf, outcome in done:
+        results[symbol][tf] = outcome
+        if not outcome.get("ok"):
+            failed.append(f"{symbol}/{tf}")
+
     FETCH_STATE["last_run"] = _now_iso()
     FETCH_STATE["results"] = results
-    failed = [tf for tf, r in results.items() if not r.get("ok")]
     FETCH_STATE["last_error"] = f"loi o: {', '.join(failed)}" if failed else None
     return results
 
@@ -646,37 +753,53 @@ mcp = MCPServer(
 
 @mcp.tool()
 def list_timeframes() -> dict[str, Any]:
-    """Liet ke cac khung thoi gian co san va trang thai file du lieu."""
-    out = []
-    for tf in KL["timeframes"]:
-        path = KLINES_DIR / PATHS["kline_filename"].format(timeframe=tf)
-        entry = {"timeframe": tf, "file": str(path), "exists": path.exists()}
-        if path.exists():
-            entry["updated_at"] = datetime.fromtimestamp(
-                path.stat().st_mtime, TZ).strftime("%Y-%m-%d %H:%M:%S")
-        out.append(entry)
+    """Liet ke cac cap dang theo doi va trang thai du lieu tung khung.
+
+    Goi cai nay truoc khi phan tich mot cap la chua tung nhac toi, de biet no
+    da co du lieu chua.
+    """
+    rows = []
+    for entry in STORE.symbols(DEFAULT_SYMBOL):
+        frames = []
+        for tf in KL["timeframes"]:
+            path = _kline_path(entry["symbol"], tf)
+            item = {"timeframe": tf, "exists": path.exists()}
+            if path.exists():
+                item["updated_at"] = datetime.fromtimestamp(
+                    path.stat().st_mtime, TZ).strftime("%Y-%m-%d %H:%M:%S")
+            frames.append(item)
+        rows.append({
+            "symbol": entry["symbol"],
+            "enabled": entry["enabled"],
+            "ready": all(f["exists"] for f in frames),
+            "timeframes": frames,
+        })
     return {
         "data_root": str(DATA_ROOT),
-        "symbol": FETCH.get("symbol"),
         "market": FETCH.get("market"),
+        "default_symbol": _resolve_symbol(),
+        "symbols_tracked": len(rows),
         "fetcher_enabled": bool(FETCH.get("enabled")),
+        "interval_seconds": FETCH.get("interval_seconds"),
         "last_fetch": FETCH_STATE["last_run"],
         "last_fetch_error": FETCH_STATE["last_error"],
-        "timeframes": out,
+        "symbols": rows,
     }
 
-
 @mcp.tool()
-def get_klines(timeframe: str, limit: int = 0, include_forming: bool = False) -> dict[str, Any]:
+def get_klines(timeframe: str, symbol: str = "", limit: int = 0,
+               include_forming: bool = False) -> dict[str, Any]:
     """Lay nen OHLCV tho cua mot khung thoi gian.
 
     timeframe: mot trong cac khung khai bao o config (vd 1w, 1d, 4h, 1h, 15m).
+    symbol: bo trong = cap mac dinh (cap dau tien dang bat).
     limit: so nen gan nhat, 0 = dung default_limit trong config.
     include_forming: mac dinh False, chi tra nen DA DONG. Bat True thi nen dang chay
       duoc them o cuoi voi is_closed=false - chi de biet gia hien tai, khong doc VSA tu no.
     """
+    sym = _resolve_symbol(symbol)
     tf = _validate_timeframe(timeframe)
-    closed, forming = _split_closed(_load_bars(tf), tf)
+    closed, forming = _split_closed(_load_bars(sym, tf), tf)
 
     n = int(limit) if limit else int(KL["default_limit"])
     n = max(1, min(n, int(KL["max_limit"])))
@@ -690,6 +813,7 @@ def get_klines(timeframe: str, limit: int = 0, include_forming: bool = False) ->
                      **{k: forming[k] for k in keys}})
 
     return {
+        "symbol": sym,
         "timeframe": tf,
         "count": len(rows),
         "closed_bars": len(rows) - (1 if attached else 0),
@@ -700,48 +824,58 @@ def get_klines(timeframe: str, limit: int = 0, include_forming: bool = False) ->
 
 
 @mcp.tool()
-async def refresh_data(timeframes: list[str] | None = None) -> dict[str, Any]:
+async def refresh_data(symbol: str = "", timeframes: list[str] | None = None) -> dict[str, Any]:
     """Keo du lieu moi nhat tu Binance ngay lap tuc, khong cho den chu ky tiep theo.
 
+    symbol: bo trong = TAT CA cac cap dang bat. Dien ten de chi keo mot cap.
     Dung khi can gia moi nhat truoc luc tim entry.
     """
+    symbols = [_resolve_symbol(symbol)] if symbol else _symbols()
     targets = timeframes or KL["timeframes"]
     for tf in targets:
         _validate_timeframe(tf)
-    return {"refreshed_at": _now_iso(), "results": await fetch_all(targets)}
+    return {
+        "refreshed_at": _now_iso(),
+        "symbols": symbols,
+        "results": await fetch_all(symbols, targets),
+    }
 
 
 @mcp.tool()
-def get_context(timeframes: list[str] | None = None) -> dict[str, Any]:
+def get_context(symbol: str = "", timeframes: list[str] | None = None) -> dict[str, Any]:
     """Tom tat da khung: bien range, vi tri gia trong range, spread/volume cho VSA, swing gan nhat.
 
+    symbol: bo trong = cap mac dinh. Moi lan goi chi phan tich MOT cap.
     timeframes: bo trong = lay tat ca khung trong config.
     """
+    sym = _resolve_symbol(symbol)
     targets = timeframes or KL["timeframes"]
     result = {}
     for tf in targets:
         try:
-            result[tf.lower()] = _build_context(tf.lower())
+            result[tf.lower()] = _build_context(sym, tf.lower())
         except Exception as exc:
             result[tf.lower()] = {"error": str(exc)}
-    return {"generated_at": _now_iso(), "contexts": result}
+    return {"symbol": sym, "generated_at": _now_iso(), "contexts": result}
 
 
 @mcp.tool()
-def get_bias(date: str = "") -> dict[str, Any]:
-    """Doc bias da luu. date bo trong = hom nay (theo timezone trong config)."""
+def get_bias(symbol: str = "", date: str = "") -> dict[str, Any]:
+    """Doc bias da luu cho MOT cap. date bo trong = hom nay, symbol bo trong = cap mac dinh."""
+    sym = _resolve_symbol(symbol)
     day = date or _today()
-    data = _read_json(BIAS_DIR / f"{day}.json", None)
+    data = _read_json(_bias_dir(sym) / f"{day}.json", None)
     if data is None:
-        return {"date": day, "found": False,
-                "message": "Chua co bias cho ngay nay. Chay buoc D/H4 roi save_bias."}
-    return {"date": day, "found": True, **data}
+        return {"symbol": sym, "date": day, "found": False,
+                "message": f"Chua co bias cho {sym} ngay nay. Chay buoc D/H4 roi save_bias."}
+    return {"symbol": sym, "date": day, "found": True, **data}
 
 
 @mcp.tool()
 def save_bias(
     direction: str,
     summary: str,
+    symbol: str = "",
     phase: str = "",
     key_levels: dict[str, float] | None = None,
     action_zone: str = "",
@@ -754,13 +888,15 @@ def save_bias(
     phase: pha Wyckoff dang o (A/B/C/D/E)
     key_levels: vd {"creek": 111000, "ice": 105000}
     action_zone: vung gia cho setup o khung nho
+    symbol: bo trong = cap mac dinh. Moi cap co bias rieng.
     """
     day = date or _today()
+    sym = _resolve_symbol(symbol)
     direction = direction.strip().lower()
     if direction not in ("long", "short", "neutral"):
         raise ValueError("direction phai la long, short hoac neutral")
 
-    path = BIAS_DIR / f"{day}.json"
+    path = _bias_dir(sym) / f"{day}.json"
     previous = _read_json(path, None)
     history = previous.pop("history", []) if isinstance(previous, dict) else []
     if previous:
@@ -777,7 +913,8 @@ def save_bias(
         "history": history[-10:],
     }
     _write_json(path, payload)
-    return {"saved": True, "date": day, "file": str(path), "revisions": len(history)}
+    return {"saved": True, "symbol": sym, "date": day, "file": str(path),
+            "revisions": len(history)}
 
 
 @mcp.tool()
@@ -1292,6 +1429,7 @@ async def reconcile_journal(date: str = "") -> dict[str, Any]:
 ADMIN_PATH = SRV.get("admin_path", "/admin")
 ADMIN_SAVE_PATH = ADMIN_PATH.rstrip("/") + "/save"
 ADMIN_TEST_PATH = ADMIN_PATH.rstrip("/") + "/test"
+ADMIN_SYMBOL_PATH = ADMIN_PATH.rstrip("/") + "/symbols"
 
 
 def _setup_ok(payload: dict[str, Any]) -> bool:
@@ -1317,14 +1455,23 @@ def _optional(payload: dict[str, Any], field: str) -> str | None:
 @mcp.custom_route(ADMIN_PATH, methods=["GET"])
 async def http_admin(request):
     from starlette.responses import HTMLResponse
+    tracked = STORE.symbols(DEFAULT_SYMBOL)
+    ready = {
+        row["symbol"]: all(_kline_path(row["symbol"], tf).exists()
+                           for tf in KL["timeframes"])
+        for row in tracked
+    }
     page = admin.render(
         STORE.masked(),
         settings_path=str(SETTINGS_FILE),
         save_path=ADMIN_SAVE_PATH,
         test_path=ADMIN_TEST_PATH,
+        symbol_path=ADMIN_SYMBOL_PATH,
         exchange_names=settings.EXCHANGE_NAMES,
         rules=_load_rules(),
         rules_history=_rules_history(),
+        symbols=tracked,
+        symbol_ready=ready,
     )
     return HTMLResponse(page, headers={"Cache-Control": "no-store"})
 
@@ -1394,6 +1541,54 @@ async def http_admin_save(request):
         "reload": bool(password),
         "state": STORE.masked(),
     })
+
+
+
+
+@mcp.custom_route(ADMIN_SYMBOL_PATH, methods=["POST"])
+async def http_admin_symbols(request):
+    """Them / bat tat / bo mot cap giao dich.
+
+    Them thi hoi Binance truoc xem cap co that khong - khong giu danh sach cung
+    vi no se lac hau, va bao loi ngay con hon de nguoi dung cho mai khong thay
+    du lieu ve.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "body khong phai JSON"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "body phai la object"}, status_code=400)
+    if not _setup_ok(payload):
+        return JSONResponse({"error": "Setup token sai"}, status_code=403)
+
+    action = str(payload.get("action") or "").strip().lower()
+    symbol = str(payload.get("symbol") or "").strip().upper()
+
+    try:
+        if action == "add":
+            if STORE.has_symbol(symbol):
+                raise ValueError(f"{symbol} da co trong danh sach")
+            await probe_symbol(symbol)          # kiem chung voi Binance truoc
+            STORE.add_symbol(symbol)
+            # Keo ngay de nguoi dung khong phai cho het mot chu ky 15 phut
+            await fetch_all([symbol], KL["timeframes"])
+            message = f"Da them {symbol} va keo du lieu ban dau."
+        elif action in ("enable", "disable"):
+            STORE.set_symbol_enabled(symbol, action == "enable")
+            message = f"Da {'bat' if action == 'enable' else 'tat'} {symbol}."
+        elif action == "remove":
+            STORE.remove_symbol(symbol)
+            message = f"Da bo {symbol} khoi danh sach. File du lieu van giu nguyen."
+        else:
+            raise ValueError("action phai la add, enable, disable hoac remove")
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=400)
+
+    return JSONResponse({"ok": True, "message": message,
+                         "symbols": STORE.symbols(DEFAULT_SYMBOL)})
 
 
 @mcp.custom_route(ADMIN_TEST_PATH, methods=["POST"])
@@ -1501,7 +1696,7 @@ def build_app():
             store=STORE,
             realm=AUTH_REALM,
             public_paths=(SRV["health_path"],),
-            setup_paths=(ADMIN_PATH, ADMIN_SAVE_PATH, ADMIN_TEST_PATH),
+            setup_paths=(ADMIN_PATH, ADMIN_SAVE_PATH, ADMIN_TEST_PATH, ADMIN_SYMBOL_PATH),
         )
 
     inner = app.router.lifespan_context
@@ -1525,6 +1720,7 @@ def build_app():
 if __name__ == "__main__":
     for directory in (KLINES_DIR, BIAS_DIR, JOURNAL_DIR):
         directory.mkdir(parents=True, exist_ok=True)
+    _migrate_flat_layout()
 
     _seed_settings()
 

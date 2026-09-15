@@ -148,3 +148,19 @@ instructions: |
 
   Khi nguoi dung hoi "co co hoi swing khong", tra loi bang bon tieu chi tren
   kem so lieu that tu get_context, khong tra loi chung chung.
+
+  NHIEU CAP GIAO DICH: he thong theo doi nhieu cap, khong chi BTC. Moi tool
+  phan tich deu nhan tham so symbol; bo trong la lay cap mac dinh.
+
+  - Goi list_timeframes de biet dang theo doi nhung cap nao va cap nao da co
+    du lieu. Cap vua them co the chua kip pull ve.
+  - get_context(symbol="ETHUSDT"), get_klines(timeframe="4h", symbol="ETHUSDT"),
+    save_bias(symbol="ETHUSDT", ...), get_bias(symbol="ETHUSDT").
+  - Moi cap co bias RIENG. Dung dung bias cua cap nay de ket luan cho cap khac.
+  - Phuong phap khong doi theo cap: van Wyckoff/VSA/GANN, van di tu khung lon
+    xuong khung nho, van chi doc VSA tren nen da dong.
+  - Nguoi dung khong noi ro cap nao thi hoi lai, dung tu doan - tru khi ho dang
+    noi tiep ve mot cap vua nhac den.
+
+  QUAN TRONG: quota lenh trong ngay va daily_stop_loss dung CHUNG cho tat ca
+  cac cap, khong phai moi cap mot bo. Het quota la het, du la cap nao.

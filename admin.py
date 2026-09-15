@@ -64,6 +64,14 @@ PAGE = """<!doctype html>
   .hist ul { list-style:none; margin:0; padding:0; }
   .hist li { font-size:12px; color:var(--muted); padding:3px 0; }
   .hist b { color:var(--ink); font-weight:600; }
+  table.syms { width:100%; border-collapse:collapse; }
+  table.syms td { padding:7px 0; border-bottom:1px solid var(--line); font-size:14px; }
+  table.syms tr:last-child td { border-bottom:none; }
+  table.syms td.sym { font-weight:600; font-family:ui-monospace,Consolas,monospace; }
+  table.syms td.st { color:var(--muted); font-size:12px; }
+  table.syms td.act { text-align:right; white-space:nowrap; }
+  table.syms button { padding:4px 10px; font-size:12px; margin-left:6px; }
+  .off td.sym, .off td.st { opacity:.45; }
 </style>
 </head>
 <body><div class="wrap">
@@ -125,6 +133,25 @@ __SETUP_BANNER__
            placeholder="__PASS_PLACEHOLDER__">
 
     <div class="hint">Key phải là <strong>read-only</strong>: tắt quyền trade, tắt quyền rút tiền, bật IP whitelist. Ba ô trên để trống nghĩa là giữ nguyên giá trị đang lưu.</div>
+  </div>
+
+  <div class="card">
+    <h2>Cặp giao dịch</h2>
+    <div class="hint" style="margin-bottom:14px">Mỗi cặp được pull tự động ở cả 5 khung (W, D, H4, H1, M15) theo cùng chu kỳ, và có bias riêng. Quy định giao dịch thì dùng chung cho tất cả các cặp.</div>
+
+    <table class="syms"><tbody>__SYMBOL_ROWS__</tbody></table>
+
+    <div class="row" style="margin-top:14px">
+      <div style="flex:2">
+        <label for="new_symbol">Thêm cặp mới</label>
+        <input type="text" id="new_symbol" placeholder="ETHUSDT, ADAUSDT, SOLUSDT..."
+               autocomplete="off" style="text-transform:uppercase">
+      </div>
+      <div style="flex:1;display:flex;align-items:flex-end">
+        <button type="button" id="add_symbol" style="width:100%">Thêm</button>
+      </div>
+    </div>
+    <div class="hint">Server hỏi Binance xem cặp có thật không trước khi thêm, rồi kéo dữ liệu ban đầu ngay — không phải chờ hết chu kỳ 15 phút.</div>
   </div>
 
   <div class="card">
@@ -240,7 +267,31 @@ async function send(url, payload) {
   return {ok: res.ok, out};
 }
 
-$("f").addEventListener("submit", async (e) => {
+async function symbolAction(action, symbol) {
+  const payload = {action: action, symbol: symbol};
+  const token = $("setup_token");
+  if (token) payload.setup_token = token.value;
+  say(action === "add" ? "Đang kiểm tra cặp với Binance..." : "Đang xử lý...", true);
+  const {ok, out} = await send("__SYMBOL_PATH__", payload);
+  if (!ok) { say(out.error || "Không thực hiện được.", false); return; }
+  say(out.message || "Xong.", true);
+  setTimeout(() => location.reload(), 1000);
+}
+
+$("add_symbol").addEventListener("click", () => {
+  const value = $("new_symbol").value.trim().toUpperCase();
+  if (!value) { say("Nhập tên cặp trước.", false); return; }
+  symbolAction("add", value);
+});
+
+$("new_symbol").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); $("add_symbol").click(); }
+});
+
+document.querySelectorAll("button[data-sym]").forEach((b) => {
+  b.addEventListener("click", () => symbolAction(b.dataset.act, b.dataset.sym));
+});
+
   e.preventDefault();
   const pw = $("password").value, pw2 = $("password2").value;
   if (pw && pw !== pw2) { say("Hai ô mật khẩu không khớp.", false); return; }
@@ -305,9 +356,38 @@ def _num(value: Any) -> str:
     return str(int(number)) if number == int(number) else str(number)
 
 
+def _symbol_rows(symbols: list[dict[str, Any]], ready: dict[str, bool]) -> str:
+    """Bang cac cap dang theo doi. Chi con mot cap thi an nut Bo - server cung
+    tu choi, nhung an di thi nguoi dung khong phai thu moi biet."""
+    if not symbols:
+        return '<tr><td class="st">Chưa có cặp nào.</td></tr>'
+    rows = []
+    for item in symbols:
+        sym = html.escape(item["symbol"])
+        on = item["enabled"]
+        has_data = ready.get(item["symbol"], False)
+        status = ("đang theo dõi" if on else "đã tắt")
+        if on and not has_data:
+            status = "đang chờ dữ liệu về"
+        toggle = "disable" if on else "enable"
+        toggle_label = "Tắt" if on else "Bật"
+        remove = ("" if len(symbols) <= 1 else
+                  f'<button type="button" data-sym="{sym}" data-act="remove">Bỏ</button>')
+        rows.append(
+            f'<tr class="{"" if on else "off"}">'
+            f'<td class="sym">{sym}</td>'
+            f'<td class="st">{status}</td>'
+            f'<td class="act">'
+            f'<button type="button" data-sym="{sym}" data-act="{toggle}">{toggle_label}</button>'
+            f'{remove}</td></tr>'
+        )
+    return "".join(rows)
+
+
 def render(state: dict[str, Any], *, settings_path: str, save_path: str,
-           test_path: str, exchange_names: tuple[str, ...],
-           rules: dict[str, Any], rules_history: list[dict[str, Any]]) -> str:
+           test_path: str, symbol_path: str, exchange_names: tuple[str, ...],
+           rules: dict[str, Any], rules_history: list[dict[str, Any]],
+           symbols: list[dict[str, Any]], symbol_ready: dict[str, bool]) -> str:
     """Dung HTML tu trang thai da duoc che giau. Khong nhan secret that."""
     configured = bool(state.get("auth_configured"))
     current = state.get("exchange_name") or ""
@@ -349,6 +429,8 @@ def render(state: dict[str, Any], *, settings_path: str, save_path: str,
         "__R_SWTP__": _num(rules.get("swing_min_take_profit_points")),
         "__R_SWMARGIN__": _num(rules.get("swing_max_margin_per_trade")),
         "__R_SWSL__": _num(rules.get("swing_max_stop_points")),
+        "__SYMBOL_PATH__": html.escape(symbol_path),
+        "__SYMBOL_ROWS__": _symbol_rows(symbols, symbol_ready),
         "__RULES_HISTORY__": _history_block(rules_history),
     }
 
