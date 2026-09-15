@@ -292,6 +292,7 @@ document.querySelectorAll("button[data-sym]").forEach((b) => {
   b.addEventListener("click", () => symbolAction(b.dataset.act, b.dataset.sym));
 });
 
+$("f").addEventListener("submit", async (e) => {
   e.preventDefault();
   const pw = $("password").value, pw2 = $("password2").value;
   if (pw && pw !== pw2) { say("Hai ô mật khẩu không khớp.", false); return; }
