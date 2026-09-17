@@ -90,17 +90,36 @@ account:
 # Gia tri KHOI TAO. Lan dau update_rules duoc goi, ban sao ghi sang data/rules.json
 # va tu do file do la nguon su that. Sua o day chi anh huong khi rules.json chua co,
 # hoac khi ban them mot rule moi chua ton tai trong file.
+# Quy dinh giao dich. Day chi la HAT GIONG: lan dau chay, cac so nay duoc ghi
+# xuong data/rules.json; tu do tro di rules.json la nguon that, sua o day khong
+# con tac dung. Doi rule bang trang /admin hoac tool update_rules.
+#
+# Rule chia lam hai pham vi:
+#
+#   CHUNG - mot bo duy nhat cho ca tai khoan. Vi tai khoan chi co mot, nen ngan
+#   sach rui ro cung chi co mot: het quota la het, du lenh nam o cap nao.
+#
+#   RIENG TUNG CAP - moi cap giu nguong cua no. May rule nay do bang DIEM GIA,
+#   ma diem cua moi cap la mot thu khac nhau: 300 diem tren BTC la mot nhip nho,
+#   300 diem tren ADA la ca mot chu ky. Dung chung mot con so thi hoac qua chat
+#   cho cap nay hoac qua long cho cap kia.
+#
+# Cac so ben duoi vua la rule chung, vua la MAC DINH cho phan rieng: cap nao
+# chua dat rieng thi ke thua dung nhung so nay.
 rules:
+  # --- CHUNG cho moi cap ---
   max_trades_per_day: 3
   max_margin_per_trade: 20
-  daily_stop_loss: -20
+  daily_stop_loss: -20               # gop PnL cua tat ca cac cap
+  swing_max_margin_per_trade: 0      # 0 = khong gioi han volume
+
+  # --- RIENG tung cap (so o day la mac dinh khi cap chua dat rieng) ---
   max_stop_points: 300
   min_take_profit_points: 500
 
-  # Han muc rong hon cho lenh swing. Lenh chi duoc huong bo nay khi TP that su
-  # dat swing_min_take_profit_points - dan nhan "swing" khong lach duoc.
+  # Nguong swing. Lenh chi duoc huong han muc swing khi TP that su dat
+  # swing_min_take_profit_points - dan nhan "swing" khong lach duoc.
   swing_min_take_profit_points: 2000
-  swing_max_margin_per_trade: 0      # 0 = khong gioi han volume
   swing_max_stop_points: 1500
 
 # Quy trinh phan tich ma Claude doc luc bat tay. Sua o day, `docker compose restart`,
@@ -162,5 +181,21 @@ instructions: |
   - Nguoi dung khong noi ro cap nao thi hoi lai, dung tu doan - tru khi ho dang
     noi tiep ve mot cap vua nhac den.
 
-  QUAN TRONG: quota lenh trong ngay va daily_stop_loss dung CHUNG cho tat ca
-  cac cap, khong phai moi cap mot bo. Het quota la het, du la cap nao.
+  RULE CO HAI PHAM VI - nho phan biet, vi nham cho la doc nham nguong:
+
+  CHUNG cho ca tai khoan: max_trades_per_day, max_margin_per_trade,
+  daily_stop_loss, swing_max_margin_per_trade. Het quota la het, du la cap nao.
+  Doi may rule nay thi goi update_rules KHONG kem symbol.
+
+  RIENG tung cap: max_stop_points, min_take_profit_points,
+  swing_min_take_profit_points, swing_max_stop_points. May cai nay do bang diem
+  gia, ma 300 diem tren BTC voi 300 diem tren ADA khong noi len cung mot dieu.
+  Doi may rule nay thi BAT BUOC kem symbol; goi khong kem symbol se bi tu choi.
+
+  Vi vay luon truyen symbol cho get_rules, check_trade, log_trade va
+  get_today_status. Bo trong la lay cap mac dinh - va ban se cham lenh cua cap
+  nay bang nguong cua cap khac ma khong hay biet.
+
+  get_rules(symbol="ETHUSDT") tra ve bo so da giai cho ETH (rule chung + phan
+  ETH dat rieng, hoac mac dinh neu ETH chua dat rieng). Khoi 'symbol_overrides'
+  cho biet cap nao dang dat rieng nhung rule gi.

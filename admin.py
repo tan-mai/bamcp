@@ -7,6 +7,7 @@ va 4 ky tu cuoi cua API key. O nhap de trong = giu nguyen gia tri dang luu.
 from __future__ import annotations
 
 import html
+import json
 from typing import Any
 
 PAGE = """<!doctype html>
@@ -155,7 +156,8 @@ __SETUP_BANNER__
   </div>
 
   <div class="card">
-    <h2>Quy định giao dịch</h2>
+    <h2>Quy định chung — áp cho mọi cặp</h2>
+    <div class="hint" style="margin-bottom:14px">Tài khoản chỉ có một, nên ngân sách rủi ro cũng chỉ có một. Hết quota là hết, dù lệnh nằm ở cặp nào.</div>
     <div class="row">
       <div>
         <label for="max_trades_per_day">Số lệnh tối đa / ngày</label>
@@ -170,24 +172,7 @@ __SETUP_BANNER__
       <div>
         <label for="daily_stop_loss">Dừng ngày khi PnL đạt (USD)</label>
         <input type="text" inputmode="decimal" id="daily_stop_loss" value="__R_STOP__">
-        <div class="hint">Phải là số âm hoặc 0.</div>
-      </div>
-      <div>
-        <label for="max_stop_points">SL tối đa (điểm)</label>
-        <input type="text" inputmode="decimal" id="max_stop_points" value="__R_MAXSL__">
-      </div>
-    </div>
-    <label for="min_take_profit_points">TP tối thiểu (điểm)</label>
-    <input type="text" inputmode="decimal" id="min_take_profit_points" value="__R_MINTP__">
-
-    <div class="hist" style="margin-top:18px">
-      <h3>Lệnh swing — hạn mức riêng</h3>
-    </div>
-    <div class="row">
-      <div>
-        <label for="swing_min_take_profit_points">Ngưỡng TP để tính là swing</label>
-        <input type="text" inputmode="decimal" id="swing_min_take_profit_points" value="__R_SWTP__">
-        <div class="hint">TP dưới mức này thì lệnh bị xếp về scalp.</div>
+        <div class="hint">Phải là số âm hoặc 0. Tính gộp PnL của tất cả các cặp.</div>
       </div>
       <div>
         <label for="swing_max_margin_per_trade">Margin tối đa swing (USD)</label>
@@ -195,13 +180,46 @@ __SETUP_BANNER__
         <div class="hint"><strong>0 = không giới hạn.</strong></div>
       </div>
     </div>
-    <label for="swing_max_stop_points">SL tối đa swing (điểm)</label>
-    <input type="text" inputmode="decimal" id="swing_max_stop_points" value="__R_SWSL__">
-    <div class="hint">Dán nhãn "swing" không lách được hạn mức: lệnh chỉ được hưởng bộ này khi TP thực sự đạt ngưỡng trên, nếu không nó tự động bị hạ về hạn mức scalp và việc đó được ghi lại.</div>
+  </div>
 
+  <div class="card">
+    <h2>Quy định theo từng cặp</h2>
+    <div class="hint" style="margin-bottom:14px">Mấy rule này đo bằng <strong>điểm giá</strong>, mà điểm của mỗi cặp là một thứ khác nhau — 300 điểm trên BTC với 300 điểm trên ADA không nói lên cùng một điều. Vì vậy mỗi cặp giữ ngưỡng riêng.</div>
+
+    <label for="rule_symbol">Đang sửa cặp</label>
+    <select id="rule_symbol">__RULE_SYMBOL_OPTIONS__</select>
+    <div class="hint" id="sr_note"></div>
+
+    <div class="row" style="margin-top:14px">
+      <div>
+        <label for="sr_max_stop_points">SL tối đa (điểm)</label>
+        <input type="text" inputmode="decimal" id="sr_max_stop_points">
+      </div>
+      <div>
+        <label for="sr_min_take_profit_points">TP tối thiểu (điểm)</label>
+        <input type="text" inputmode="decimal" id="sr_min_take_profit_points">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="sr_swing_min_take_profit_points">Ngưỡng TP để tính là swing</label>
+        <input type="text" inputmode="decimal" id="sr_swing_min_take_profit_points">
+        <div class="hint">TP dưới mức này thì lệnh bị xếp về scalp.</div>
+      </div>
+      <div>
+        <label for="sr_swing_max_stop_points">SL tối đa swing (điểm)</label>
+        <input type="text" inputmode="decimal" id="sr_swing_max_stop_points">
+      </div>
+    </div>
+    <div class="hint">Dán nhãn "swing" không lách được hạn mức: lệnh chỉ được hưởng bộ hạn mức swing khi TP thực sự đạt ngưỡng của <em>chính cặp đó</em>, nếu không nó tự động bị hạ về scalp và việc đó được ghi lại.</div>
+    <div class="hint">Đổi được nhiều cặp trong một lần — chuyển cặp ở ô trên, sửa tiếp, rồi bấm Lưu một lần.</div>
+  </div>
+
+  <div class="card">
+    <h2>Lý do &amp; lịch sử</h2>
     <label for="rules_reason">Lý do đổi</label>
     <input type="text" id="rules_reason" placeholder="bắt buộc khi có thay đổi — vd: siết lại sau tuần lỗ">
-    <div class="hint">Mọi thay đổi đều vào sổ lịch sử kèm lý do và mốc thời gian, dù đổi ở đây hay qua Claude. Đổi trong ngày đang giao dịch sẽ hiện lại trong <code>get_today_status</code>.</div>
+    <div class="hint">Mọi thay đổi đều vào sổ lịch sử kèm lý do và mốc thời gian, dù đổi ở đây hay qua Claude, dù là rule chung hay rule của một cặp. Đổi trong ngày đang giao dịch sẽ hiện lại trong <code>get_today_status</code>.</div>
 
     __RULES_HISTORY__
   </div>
@@ -218,19 +236,54 @@ __SETUP_BANNER__
 <p class="meta">Cập nhật lần cuối: __UPDATED__</p>
 
 <script>
-const RULE_KEYS = ["max_trades_per_day","max_margin_per_trade","daily_stop_loss",
-                   "max_stop_points","min_take_profit_points",
-                   "swing_min_take_profit_points","swing_max_margin_per_trade",
-                   "swing_max_stop_points"];
+const GLOBAL_RULE_KEYS = __GLOBAL_RULE_KEYS__;
+const SYMBOL_RULE_KEYS = __SYMBOL_RULE_KEYS__;
+// Giá trị ĐÃ GIẢI của từng cặp: cặp chưa đặt riêng thì đây là giá trị mặc định
+// nó đang kế thừa. So sánh với bảng này để biết ô nào người dùng thực sự đổi.
+const SYMBOL_RULES = __SYMBOL_RULES_JSON__;
+const SYMBOL_OVERRIDES = __SYMBOL_OVERRIDES_JSON__;
 const $ = (id) => document.getElementById(id);
 const msg = $("msg");
+
+// Sửa cặp A, chuyển sang cặp B, sửa tiếp, rồi Lưu một lần -> phải giữ được cả hai.
+const symbolEdits = {};
+let activeSymbol = "";
 
 function say(text, ok) {
   msg.textContent = text;
   msg.className = ok ? "ok" : "err";
 }
 
+function fillSymbolRules(sym) {
+  activeSymbol = sym;
+  const base = SYMBOL_RULES[sym] || {};
+  const edits = symbolEdits[sym] || {};
+  for (const key of SYMBOL_RULE_KEYS) {
+    const el = $("sr_" + key);
+    if (el) el.value = (key in edits) ? edits[key] : (base[key] ?? "");
+  }
+  const own = SYMBOL_OVERRIDES[sym] || [];
+  $("sr_note").textContent = own.length
+    ? sym + " đang đặt riêng: " + own.join(", ")
+    : sym + " đang kế thừa toàn bộ giá trị mặc định.";
+}
+
+function captureSymbolRules() {
+  if (!activeSymbol) return;
+  const base = SYMBOL_RULES[activeSymbol] || {};
+  const edits = {};
+  for (const key of SYMBOL_RULE_KEYS) {
+    const el = $("sr_" + key);
+    if (!el) continue;
+    const value = el.value.trim();
+    if (value !== String(base[key] ?? "").trim()) edits[key] = value;
+  }
+  if (Object.keys(edits).length) symbolEdits[activeSymbol] = edits;
+  else delete symbolEdits[activeSymbol];
+}
+
 function body() {
+  captureSymbolRules();
   const data = {
     username: $("username").value,
     password: $("password").value,
@@ -242,10 +295,11 @@ function body() {
     api_secret: $("api_secret").value,
     api_passphrase: $("api_passphrase").value,
     rules: {},
+    symbol_rules: symbolEdits,
     rules_reason: $("rules_reason").value,
   };
   // Chi gui rule nao thuc su doi so voi luc tai trang, de khoi ghi lich su rong
-  for (const key of RULE_KEYS) {
+  for (const key of GLOBAL_RULE_KEYS) {
     const el = $(key);
     if (el && el.value.trim() !== el.defaultValue.trim()) {
       data.rules[key] = el.value.trim();
@@ -287,6 +341,15 @@ $("add_symbol").addEventListener("click", () => {
 $("new_symbol").addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); $("add_symbol").click(); }
 });
+
+const ruleSymbol = $("rule_symbol");
+if (ruleSymbol) {
+  ruleSymbol.addEventListener("change", () => {
+    captureSymbolRules();          // giu lai phan vua sua truoc khi doi cap
+    fillSymbolRules(ruleSymbol.value);
+  });
+  if (ruleSymbol.value) fillSymbolRules(ruleSymbol.value);
+}
 
 document.querySelectorAll("button[data-sym]").forEach((b) => {
   b.addEventListener("click", () => symbolAction(b.dataset.act, b.dataset.sym));
@@ -332,7 +395,11 @@ SETUP_FIELD = """<div class="card">
 
 
 def _history_block(history: list[dict[str, Any]]) -> str:
-    """Vai lan doi rule gan nhat. Hien ngay tren trang de viec doi rule khong am tham."""
+    """Vai lan doi rule gan nhat. Hien ngay tren trang de viec doi rule khong am tham.
+
+    Dong nao co ten cap thi gan nhan cap do - nhin lai phan biet duoc "siet ca
+    tai khoan" voi "chi siet mot cap".
+    """
     if not history:
         return ""
     items = []
@@ -343,7 +410,8 @@ def _history_block(history: list[dict[str, Any]]) -> str:
         )
         when = html.escape(str(entry.get("at", ""))[:16].replace("T", " "))
         why = html.escape(str(entry.get("reason", "")))
-        items.append(f"<li><b>{when}</b> — {parts}<br>{why}</li>")
+        scope = html.escape(str(entry.get("symbol") or "")) or "chung"
+        items.append(f"<li><b>{when}</b> <b>[{scope}]</b> — {parts}<br>{why}</li>")
     return ('<div class="hist"><h3>Thay đổi gần đây</h3><ul>'
             + "".join(items) + "</ul></div>")
 
@@ -385,13 +453,38 @@ def _symbol_rows(symbols: list[dict[str, Any]], ready: dict[str, bool]) -> str:
     return "".join(rows)
 
 
+def _js(value: Any) -> str:
+    """Nhung du lieu vao <script>. Chan "</script>" bang cach escape dau <."""
+    return json.dumps(value, ensure_ascii=False).replace("<", "\\u003c")
+
+
 def render(state: dict[str, Any], *, settings_path: str, save_path: str,
            test_path: str, symbol_path: str, exchange_names: tuple[str, ...],
            rules: dict[str, Any], rules_history: list[dict[str, Any]],
-           symbols: list[dict[str, Any]], symbol_ready: dict[str, bool]) -> str:
-    """Dung HTML tu trang thai da duoc che giau. Khong nhan secret that."""
+           symbols: list[dict[str, Any]], symbol_ready: dict[str, bool],
+           symbol_rules: dict[str, dict[str, Any]],
+           symbol_overrides: dict[str, list[str]],
+           global_rule_keys: tuple[str, ...],
+           symbol_rule_keys: tuple[str, ...]) -> str:
+    """Dung HTML tu trang thai da duoc che giau. Khong nhan secret that.
+
+    `rules` la rule chung + mac dinh; `symbol_rules` la gia tri da giai cho tung
+    cap. Hai bo di hai duong rieng vi chung duoc luu o hai cho khac nhau.
+    """
     configured = bool(state.get("auth_configured"))
     current = state.get("exchange_name") or ""
+
+    rule_symbols = [row["symbol"] for row in symbols if row["symbol"] in symbol_rules]
+    rule_symbol_options = "".join(
+        f'<option value="{html.escape(sym)}">{html.escape(sym)}</option>'
+        for sym in rule_symbols
+    ) or '<option value="">— chưa có cặp nào —</option>'
+    # Chuoi de so sanh trong JS phai cung dinh dang voi cai hien trong o nhap,
+    # nen dung chinh _num() chu khong de so tho.
+    symbol_rules_js = {
+        sym: {key: _num(symbol_rules[sym].get(key)) for key in symbol_rule_keys}
+        for sym in rule_symbols
+    }
 
     options = "".join(
         f'<option value="{html.escape(name)}"'
@@ -425,11 +518,13 @@ def render(state: dict[str, Any], *, settings_path: str, save_path: str,
         "__R_TRADES__": _num(rules.get("max_trades_per_day")),
         "__R_MARGIN__": _num(rules.get("max_margin_per_trade")),
         "__R_STOP__": _num(rules.get("daily_stop_loss")),
-        "__R_MAXSL__": _num(rules.get("max_stop_points")),
-        "__R_MINTP__": _num(rules.get("min_take_profit_points")),
-        "__R_SWTP__": _num(rules.get("swing_min_take_profit_points")),
         "__R_SWMARGIN__": _num(rules.get("swing_max_margin_per_trade")),
-        "__R_SWSL__": _num(rules.get("swing_max_stop_points")),
+        "__RULE_SYMBOL_OPTIONS__": rule_symbol_options,
+        "__GLOBAL_RULE_KEYS__": _js(list(global_rule_keys)),
+        "__SYMBOL_RULE_KEYS__": _js(list(symbol_rule_keys)),
+        "__SYMBOL_RULES_JSON__": _js(symbol_rules_js),
+        "__SYMBOL_OVERRIDES_JSON__": _js(
+            {sym: symbol_overrides.get(sym, []) for sym in rule_symbols}),
         "__SYMBOL_PATH__": html.escape(symbol_path),
         "__SYMBOL_ROWS__": _symbol_rows(symbols, symbol_ready),
         "__RULES_HISTORY__": _history_block(rules_history),

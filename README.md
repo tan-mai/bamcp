@@ -18,8 +18,8 @@ Tuỳ chọn đọc tài khoản thật từ Binance, Bybit hoặc OKX bằng AP
 | `get_context` | Range, vị trí giá trong range, spread/volume cho VSA, swing gần nhất, độ tươi dữ liệu — theo cặp |
 | `get_bias` | Đọc bias đã lưu của một cặp |
 | `save_bias` | Lưu bias cho một cặp sau bước W/D/H4 |
-| `get_rules` | Đọc quy định đang hiệu lực + lịch sử thay đổi |
-| `update_rules` | Đổi quy định, bắt buộc kèm lý do, hiệu lực ngay |
+| `get_rules` | Đọc quy định đang hiệu lực (kèm `symbol` để xem bộ số của một cặp) + lịch sử thay đổi |
+| `update_rules` | Đổi quy định, bắt buộc kèm lý do; rule theo cặp thì bắt buộc kèm `symbol` |
 | `get_today_status` | Quota lệnh + PnL, rule đổi hôm nay, check trước khi vào lệnh |
 | `check_trade` | Chấm thử một lệnh theo rule mà không ghi nhật ký |
 | `log_trade` | Ghi lệnh, cảnh báo nếu phạm rule |
@@ -61,7 +61,7 @@ data/
 │   ├── BTCUSDT/   2026-09-15.json
 │   └── ETHUSDT/   2026-09-15.json
 ├── journal/       2026-09-15.json     ← dùng chung mọi cặp
-├── rules.json                          ← dùng chung mọi cặp
+├── rules.json                          ← rule chung + phần đặt riêng của từng cặp
 └── settings.json
 ```
 
@@ -73,10 +73,13 @@ Dữ liệu từ bản một-cặp được **tự động chuyển** sang bố 
 |---|---|
 | Nến, bias | **Riêng từng cặp** |
 | Quota lệnh/ngày, dừng ngày, hạn mức margin | **Chung tất cả các cặp** |
+| SL tối đa, TP tối thiểu, ngưỡng swing | **Riêng từng cặp** |
 | Nhật ký lệnh | Chung |
 | Đọc tài khoản sàn | Một cặp duy nhất — cặp khai trong mục *Tài khoản sàn* |
 
-Quy định dùng chung là cố ý: nếu mỗi cặp một bộ quota thì thêm 5 cặp là nhân ngân sách rủi ro lên 5 lần, mà tài khoản thì vẫn chỉ có một.
+Ngân sách rủi ro dùng chung là cố ý: nếu mỗi cặp một bộ quota thì thêm 5 cặp là nhân ngân sách rủi ro lên 5 lần, mà tài khoản thì vẫn chỉ có một.
+
+Ngưỡng đo bằng **điểm giá** thì ngược lại, phải riêng: 300 điểm trên BTC là một nhịp nhỏ, 300 điểm trên ADA là cả một chu kỳ. Ép chung một con số thì hoặc quá chặt cho cặp này, hoặc quá lỏng cho cặp kia.
 
 ### Dùng trong chat
 
@@ -96,25 +99,43 @@ Chia làm hai loại, sửa bằng hai đường khác nhau.
 
 **Rule bằng số** — sống trong `data/rules.json`, đọc mới **mỗi lần gọi tool**, không cache. Đổi là có hiệu lực ngay, không restart.
 
+Rule chia làm hai phạm vi.
+
+**Chung cho cả tài khoản** — một bộ duy nhất, hết quota là hết dù lệnh nằm ở cặp nào:
+
 | Rule | Mặc định |
 |---|---|
 | `max_trades_per_day` | 3 |
 | `max_margin_per_trade` | 20 |
 | `daily_stop_loss` | -20 |
+| `swing_max_margin_per_trade` | 0 *(0 = không giới hạn)* |
+
+**Riêng từng cặp** — mỗi cặp giữ ngưỡng của nó; con số dưới đây là mặc định, cặp nào chưa đặt riêng thì kế thừa đúng những số này:
+
+| Rule | Mặc định |
+|---|---|
 | `max_stop_points` | 300 |
 | `min_take_profit_points` | 500 |
+| `swing_min_take_profit_points` | 2000 |
+| `swing_max_stop_points` | 1500 |
 
 Đổi ngay trong chat, từ bất kỳ thiết bị nào:
 
 > *"Từ hôm nay giảm xuống 2 lệnh một ngày, tôi đang vào lệnh quá tay."*
 
-Claude gọi `update_rules({"max_trades_per_day": 2}, reason="...")`. `reason` là tham số bắt buộc — không có lý do thì tool báo lỗi.
+> *"ADA điểm nhỏ quá, SL tối đa của riêng ADAUSDT để 15 điểm thôi."*
+
+Claude gọi `update_rules({"max_trades_per_day": 2}, reason="...")` cho rule chung, và `update_rules({"max_stop_points": 15}, reason="...", symbol="ADAUSDT")` cho rule riêng. `reason` là tham số bắt buộc ở cả hai — không có lý do thì tool báo lỗi.
+
+**Không nhầm phạm vi được.** Gửi một rule chung kèm `symbol` thì tool từ chối chứ không âm thầm ghi nó vào một cặp — nếu không, bạn tưởng mình siết quota cả tài khoản trong khi thật ra chỉ siết mỗi ADA. Chiều ngược lại, `get_rules(symbol="ETHUSDT")` trả về bộ số đã giải cho ETH, kèm khối `symbol_overrides` cho biết cặp nào đang đặt riêng những rule gì.
 
 Khối `rules:` trong `config.yaml` chỉ là **giá trị khởi tạo**. Lần đầu `update_rules` chạy, bản sao được ghi sang `data/rules.json` và từ đó file đó là nguồn sự thật. Sửa `config.yaml` về sau chỉ có tác dụng khi bạn thêm một rule hoàn toàn mới.
 
-Server chỉ chặn giá trị làm vỡ logic tính toán — `daily_stop_loss` phải `<= 0`, các rule còn lại phải `>= 0`, và tên rule phải có thật (gõ sai tên là báo lỗi chứ không âm thầm tạo rule mới). Ngoài ra nới hay siết bao nhiêu là quyền bạn.
+`rules.json` từ bản một-phạm-vi vẫn đọc được nguyên vẹn: nó chỉ có khối `values`, và mọi cặp kế thừa đúng những con số đang có — không cần bước chuyển đổi nào.
 
-**Mọi thay đổi đều để lại dấu.** `rules.json` giữ `history` đầy đủ: đổi gì, từ bao nhiêu sang bao nhiêu, lúc nào, vì sao. Và:
+Server chỉ chặn giá trị làm vỡ logic tính toán — `daily_stop_loss` phải `<= 0`, các rule còn lại phải `>= 0`, tên rule phải có thật (gõ sai tên là báo lỗi chứ không âm thầm tạo rule mới), và cặp phải đang được theo dõi (gõ sai tên cặp thì không tạo ra một bộ rule mồ côi). Ngoài ra nới hay siết bao nhiêu là quyền bạn.
+
+**Mọi thay đổi đều để lại dấu.** `rules.json` giữ `history` đầy đủ: đổi gì, từ bao nhiêu sang bao nhiêu, lúc nào, vì sao, và **cho cặp nào** — "siết cả tài khoản" với "siết mỗi ADA" là hai dòng khác nhau trong lịch sử. Và:
 
 - `get_today_status` trả `rules_changed_today` — rule bị đổi trong chính ngày đang giao dịch thì hiện ra ngay ở bước check trước khi vào lệnh.
 - `log_trade` ghi `rules_at_entry` vào từng lệnh — đọc lại nhật ký cũ vẫn biết lúc đó mình chơi theo luật nào.
@@ -293,13 +314,17 @@ Biến môi trường chỉ còn là **giá trị khởi tạo** cho lần chạ
 
 ### Quy định giao dịch
 
-Trang admin có luôn mục sửa 5 rule, và **đi qua đúng một cửa với Claude**: cùng hàm `_apply_rule_changes`, cùng validate, cùng ghi vào `rules.json`.
+Trang admin sửa được cả hai phạm vi, và **đi qua đúng một cửa với Claude**: cùng hàm `_apply_rule_changes`, cùng validate, cùng ghi vào `rules.json`.
 
-Nghĩa là **bắt buộc có lý do** dù bạn đổi ở đâu. Trang admin không phải cửa sau vòng qua cơ chế ghi dấu — nếu nó là cửa sau thì toàn bộ `rules_changed_today` và `rules_at_entry` mất giá trị.
+- Thẻ **Quy định chung** — 4 rule áp cho mọi cặp.
+- Thẻ **Quy định theo từng cặp** — chọn cặp trong ô *Đang sửa cặp* rồi nhập; dòng chú thích ngay dưới cho biết cặp đó đang đặt riêng những rule gì, hay đang kế thừa toàn bộ mặc định. Sửa nhiều cặp rồi bấm Lưu một lần cũng được: những gì bạn nhập cho từng cặp được giữ lại khi đổi lựa chọn.
+- Thẻ **Lý do & lịch sử** — một ô lý do dùng chung cho cả lần lưu, và 5 lần đổi gần nhất kèm phạm vi (`[chung]` hay `[ADAUSDT]`), giá trị cũ → mới, lý do.
 
-Trang còn hiện 5 lần đổi gần nhất ngay dưới ô nhập, kèm giá trị cũ → mới và lý do. Việc siết/nới rule luôn nằm trước mắt chứ không chôn trong file JSON.
+Nghĩa là **bắt buộc có lý do** dù bạn đổi ở đâu, phạm vi nào. Trang admin không phải cửa sau vòng qua cơ chế ghi dấu — nếu nó là cửa sau thì toàn bộ `rules_changed_today` và `rules_at_entry` mất giá trị.
 
 Chỉ những ô **thực sự đổi** mới được gửi lên, nên bấm Lưu mà không động vào rule thì không sinh bản ghi lịch sử rỗng.
+
+Bỏ một cặp khỏi danh sách theo dõi **không** xoá phần rule đặt riêng của nó trong `rules.json` — giống như file nến cũ vẫn được giữ lại. Thêm cặp đó trở lại thì ngưỡng riêng cũ có hiệu lực lại luôn.
 
 ### Nút "Kiểm tra kết nối sàn"
 
@@ -341,7 +366,7 @@ Không có REST API nào khác. Muốn pull dữ liệu ngay thì bảo Claude g
 <data_root>/          # Docker: /data, mount ra ./data trên host
 ├── klines/    1w.json  1d.json  4h.json  1h.json  15m.json
 ├── bias/      2026-09-12.json
-├── rules.json            # quy định đang hiệu lực + lịch sử đổi
+├── rules.json            # rule chung + phần đặt riêng từng cặp + lịch sử đổi
 ├── settings.json         # username/password (hash) + credential sàn — chmod 600
 └── journal/   2026-09-12.json
 ```

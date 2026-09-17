@@ -218,6 +218,29 @@ def _write_json(path: Path, payload: Any) -> None:
 
 # ---------------------------------------------------------------- rules
 
+# HAI PHAM VI.
+#
+# Rule ve VON va KY LUAT NGAY dung CHUNG cho ca tai khoan: ban chi co mot tai
+# khoan, nen them cap giao dich khong duoc phep nhan ngan sach rui ro len.
+# Het quota la het, du cham vao cap nao.
+#
+# Rule do bang DIEM thi thuoc TUNG CAP: 300 diem tren BTC (~0.3%) va 300 diem
+# tren ADA khong phai cung mot thu. Dung chung mot con so cho moi cap la bat
+# BTC choi qua chat con cac cap gia thap thi khong co rao nao ca.
+GLOBAL_RULE_KEYS = (
+    "max_trades_per_day",
+    "max_margin_per_trade",
+    "daily_stop_loss",
+    "swing_max_margin_per_trade",
+)
+
+SYMBOL_RULE_KEYS = (
+    "max_stop_points",
+    "min_take_profit_points",
+    "swing_min_take_profit_points",
+    "swing_max_stop_points",
+)
+
 # Rang buoc ky thuat, KHONG phai rang buoc ky luat. Chung chi chan gia tri lam
 # vo logic tinh toan (vd daily_stop_loss duong -> stop_hit dung ngay tu lenh dau).
 # Muon noi long hay siet chat bao nhieu la quyen cua ban.
@@ -234,29 +257,73 @@ _RULE_BOUNDS: dict[str, tuple[float | None, float | None]] = {
 }
 
 
-def _load_rules() -> dict[str, Any]:
-    """Doc rule moi lan goi, khong cache. Sua rules.json la co hieu luc ngay.
+def _rules_doc() -> dict[str, Any]:
+    """Doc nguyen file rules.json, chuan hoa thanh ba khoi: values / symbols / history.
 
-    File thieu key nao thi lay key do tu config.yaml, nen them rule moi vao config
-    khong lam hong file dang co.
+    `values` = rule chung + gia tri MAC DINH cho cac rule theo cap. Cap nao chua
+    duoc dat rieng thi ke thua tu day, nen file cua ban cu (chi co `values`) van
+    chay dung: moi cap deu nhan dung bo so truoc kia.
+
+    `symbols` = {"ETHUSDT": {chi cac key thuoc SYMBOL_RULE_KEYS}}. Chi luu phan
+    DAT RIENG, khong sao chep ca bo - de sau nay doi mac dinh thi cap nao chua
+    dat rieng van duoc keo theo.
     """
     stored = _read_json(RULES_FILE, None)
-    values = stored.get("values") if isinstance(stored, dict) else None
+    if not isinstance(stored, dict):
+        stored = {}
+
+    values = stored.get("values")
     if not isinstance(values, dict):
         values = {}
-    return {**RULES_SEED, **values}
+
+    raw_symbols = stored.get("symbols")
+    if not isinstance(raw_symbols, dict):
+        raw_symbols = {}
+    symbols: dict[str, dict[str, Any]] = {}
+    for sym, override in raw_symbols.items():
+        if not isinstance(override, dict):
+            continue
+        kept = {k: v for k, v in override.items() if k in SYMBOL_RULE_KEYS}
+        if kept:
+            symbols[str(sym).strip().upper()] = kept
+
+    history = stored.get("history")
+    if not isinstance(history, list):
+        history = []
+
+    return {"values": {**RULES_SEED, **values}, "symbols": symbols,
+            "history": history}
+
+
+def _load_rules(symbol: str = "") -> dict[str, Any]:
+    """Bo rule co hieu luc, doc moi lan goi va khong cache.
+
+    symbol bo trong = rule chung + gia tri mac dinh cua cac rule theo cap.
+    Dien symbol = ban day du de cham mot lenh tren dung cap do.
+    """
+    doc = _rules_doc()
+    if not symbol:
+        return doc["values"]
+    return {**doc["values"], **doc["symbols"].get(symbol.strip().upper(), {})}
+
+
+def _symbol_overrides() -> dict[str, dict[str, Any]]:
+    """Cac cap dang dat rieng, kem dung nhung key duoc dat."""
+    return _rules_doc()["symbols"]
 
 
 def _rules_history(limit: int = 0) -> list[dict[str, Any]]:
-    stored = _read_json(RULES_FILE, None)
-    history = stored.get("history") if isinstance(stored, dict) else None
-    if not isinstance(history, list):
-        return []
+    history = _rules_doc()["history"]
     return history[-limit:] if limit else history
 
 
-def _validate_rule_changes(changes: dict[str, Any]) -> dict[str, float]:
-    """Tra ve int cho gia tri nguyen, float cho gia tri le."""
+def _validate_rule_changes(changes: dict[str, Any], symbol: str = "") -> dict[str, float]:
+    """Tra ve int cho gia tri nguyen, float cho gia tri le.
+
+    Co symbol thi chi nhan rule thuoc pham vi cap. Doi rule chung ma kem symbol
+    la bao loi chu khong am tham ghi vao mot cap - nguoi dung tuong minh vua siet
+    quota ma thuc ra khong siet gi ca la kieu hong te nhat.
+    """
     if not changes:
         raise ValueError("changes rong, khong co gi de doi")
 
@@ -265,6 +332,10 @@ def _validate_rule_changes(changes: dict[str, Any]) -> dict[str, float]:
         if key not in RULES_SEED:
             raise ValueError(
                 f"rule khong ton tai: {key}. Cho phep: {sorted(RULES_SEED)}")
+        if symbol and key not in SYMBOL_RULE_KEYS:
+            raise ValueError(
+                f"{key} dung chung cho moi cap - goi lai khong kem symbol. "
+                f"Rule dat rieng theo cap: {sorted(SYMBOL_RULE_KEYS)}")
         if isinstance(raw, bool) or not isinstance(raw, (int, float)):
             raise ValueError(f"{key} phai la so, nhan duoc {type(raw).__name__}")
         value = float(raw)
@@ -282,41 +353,61 @@ def _changed_today(history: list[dict[str, Any]], day: str) -> list[dict[str, An
     return [h for h in history if str(h.get("at", "")).startswith(day)]
 
 
-def _apply_rule_changes(changes: dict[str, Any], reason: str) -> dict[str, Any]:
+def _apply_rule_changes(changes: dict[str, Any], reason: str,
+                        symbol: str = "") -> dict[str, Any]:
     """Duong DUY NHAT de doi rule. Ca tool update_rules lan trang admin deu di qua day.
 
     Co mot cua thi lich su khong bao gio thung: khong co cach nao doi rule ma
     khong de lai dau, du doi tu Claude hay tu trinh duyet.
+
+    symbol bo trong  -> ghi vao `values`: rule chung, va mac dinh cho moi cap
+                        chua dat rieng.
+    symbol co gia tri -> ghi vao `symbols[SYM]`: chi cap do doi, cac cap khac
+                        khong bi dong toi.
     """
     reason = (reason or "").strip()
     if not reason:
         raise ValueError("reason la bat buoc - ghi ro vi sao doi rule")
 
-    clean = _validate_rule_changes(changes)
-    current = _load_rules()
+    # Cap phai dang duoc theo doi. Go sai ten thi bao ngay, con hon ghi mot bo
+    # rule cho mot cap khong ton tai roi thac mac sao no khong co tac dung.
+    sym = _resolve_symbol(symbol) if symbol else ""
+
+    clean = _validate_rule_changes(changes, sym)
+    current = _load_rules(sym)
     diff = {k: {"from": current.get(k), "to": v}
             for k, v in clean.items() if current.get(k) != v}
     if not diff:
         return {"updated": False, "reason": "gia tri moi trung gia tri cu",
-                "rules": current}
+                "scope": sym or "chung", "symbol": sym or None, "rules": current}
 
-    stored = _read_json(RULES_FILE, None)
-    history = stored.get("history") if isinstance(stored, dict) else None
-    if not isinstance(history, list):
-        history = []
-    history.append({"at": _now_iso(), "changes": diff, "reason": reason})
+    doc = _rules_doc()
+    history = doc["history"]
+    entry: dict[str, Any] = {"at": _now_iso(), "changes": diff, "reason": reason}
+    if sym:
+        entry["symbol"] = sym
+    history.append(entry)
 
-    values = {**current, **clean}
+    values = doc["values"]
+    symbols = doc["symbols"]
+    if sym:
+        symbols[sym] = {**symbols.get(sym, {}), **clean}
+    else:
+        values = {**values, **clean}
+
     _write_json(RULES_FILE, {
         "values": values,
+        "symbols": symbols,
         "updated_at": _now_iso(),
         "history": history,
     })
     return {
         "updated": True,
+        "scope": sym or "chung",
+        "symbol": sym or None,
         "changes": diff,
         "reason": reason,
-        "rules": values,
+        "rules": {**values, **symbols.get(sym, {})} if sym else values,
         "changed_today": len(_changed_today(history, _today())),
     }
 
@@ -658,16 +749,20 @@ async def _fetcher_loop() -> None:
 TRADE_TYPES = ("scalp", "swing")
 
 
-def _evaluate_trade(*, side: str, entry: float, stop: float, target: float,
-                    margin_usd: float, trade_type: str,
+def _evaluate_trade(*, symbol: str, side: str, entry: float, stop: float,
+                    target: float, margin_usd: float, trade_type: str,
                     trades: list[dict[str, Any]], rules: dict[str, Any],
                     realized: float) -> dict[str, Any]:
     """Cham mot lenh theo bo rule dang hieu luc. Khong ghi gi.
 
+    `rules` phai la bo da giai theo dung cap (_load_rules(symbol)): nguong diem
+    cua SL/TP va nguong swing khac nhau giua cac cap, con quota va daily stop
+    thi dung chung.
+
     Hai bo han muc: scalp (chat) va swing (rong). Nhung KHONG duoc tu dan nhan
     swing de lach - lenh chi duoc huong han muc swing khi TP thuc su dat nguong
-    swing_min_take_profit_points. Neu khong, no bi ha xuong scalp va ghi lai
-    dieu do. Cai nhan la he qua cua con so, khong phai y muon.
+    swing_min_take_profit_points cua CHINH CAP DO. Neu khong, no bi ha xuong
+    scalp va ghi lai dieu do. Cai nhan la he qua cua con so, khong phai y muon.
     """
     side = side.strip().lower()
     if side not in ("long", "short"):
@@ -716,6 +811,7 @@ def _evaluate_trade(*, side: str, entry: float, stop: float, target: float,
         violations.append(f"margin {margin_usd} > {prefix}max_margin_per_trade ({max_margin:g})")
 
     return {
+        "symbol": symbol,
         "side": side,
         "trade_type": trade_type,
         "demoted_to_scalp": demoted,
@@ -727,9 +823,14 @@ def _evaluate_trade(*, side: str, entry: float, stop: float, target: float,
         "rr": round(target_points / stop_points, 2) if stop_points else None,
         "margin_usd": float(margin_usd),
         "limits_applied": {
+            "symbol": symbol,
             "max_margin_per_trade": max_margin or "khong gioi han",
             "max_stop_points": max_stop,
             "min_take_profit_points": min_tp,
+            # Nhac lai cai gi tu dau, de doc lai nhat ky cu khong phai doan
+            "max_stop_points_scope": f"rieng {symbol}",
+            "min_take_profit_points_scope": f"rieng {symbol}",
+            "max_margin_per_trade_scope": "chung moi cap",
         },
         "rule_violations": violations,
     }
@@ -918,14 +1019,26 @@ def save_bias(
 
 
 @mcp.tool()
-def get_rules(history_limit: int = 10) -> dict[str, Any]:
+def get_rules(symbol: str = "", history_limit: int = 10) -> dict[str, Any]:
     """Doc bo quy dinh dang co hieu luc va lich su thay doi.
 
+    symbol: dien ten cap de xem dung bo rule ap cho cap do (SL/TP/nguong swing
+      cua no). Bo trong = rule chung + gia tri mac dinh cho cap chua dat rieng.
     history_limit: so lan doi gan nhat can xem, 0 = xem tat ca.
     """
-    history = _rules_history()
+    sym = _resolve_symbol(symbol) if symbol else ""
+    doc = _rules_doc()
+    history = doc["history"]
     return {
-        "rules": _load_rules(),
+        "symbol": sym or None,
+        "rules": _load_rules(sym),
+        "scope": {
+            "chung_moi_cap": list(GLOBAL_RULE_KEYS),
+            "rieng_tung_cap": list(SYMBOL_RULE_KEYS),
+        },
+        # Cap chua dat rieng thi an theo bo nay
+        "defaults_for_symbols": {k: doc["values"][k] for k in SYMBOL_RULE_KEYS},
+        "symbol_overrides": doc["symbols"],
         "defaults": RULES_SEED,
         "file": str(RULES_FILE),
         "changes_total": len(history),
@@ -935,26 +1048,41 @@ def get_rules(history_limit: int = 10) -> dict[str, Any]:
 
 
 @mcp.tool()
-def update_rules(changes: dict[str, float], reason: str) -> dict[str, Any]:
+def update_rules(changes: dict[str, float], reason: str,
+                 symbol: str = "") -> dict[str, Any]:
     """Doi quy dinh giao dich. Co hieu luc NGAY cho moi lan goi tool sau do.
 
     changes: chi dien rule muon doi, vd {"max_trades_per_day": 2}.
       Rule khong nhac den thi giu nguyen.
     reason: bat buoc. Vi sao doi. Duoc ghi vao lich su cung moc thoi gian,
       va hien lai trong get_today_status neu doi trong ngay dang giao dich.
+    symbol: bo trong = doi rule CHUNG (quota lenh/ngay, margin, daily_stop_loss),
+      dong thoi la mac dinh cho cap chua dat rieng. Dien ten cap = chi doi rule
+      cua rieng cap do, va chi duoc doi max_stop_points, min_take_profit_points,
+      swing_min_take_profit_points, swing_max_stop_points.
+
+    Doi rule chung ma van dien symbol thi tool bao loi - khong am tham ghi nham
+    pham vi.
     """
-    return _apply_rule_changes(changes, reason)
+    return _apply_rule_changes(changes, reason, symbol)
 
 
 @mcp.tool()
-async def get_today_status(date: str = "") -> dict[str, Any]:
+async def get_today_status(date: str = "", symbol: str = "") -> dict[str, Any]:
     """Kiem tra quota lenh va PnL trong ngay truoc khi vao lenh moi.
+
+    Quota lenh, margin va daily_stop_loss dung CHUNG cho moi cap - het la het,
+    du ban dang nhin cap nao.
+
+    symbol: dien ten cap de khoi 'rules' tra ve dung nguong SL/TP/swing cua cap
+      do. Bo trong = rule chung + gia tri mac dinh.
 
     Khi account.enabled = true, khoi 'exchange' chua so THAT lay tu san va
     'can_trade' duoc tinh theo so that do, khong phai theo nhat ky tu khai.
     """
     day = date or _today()
-    rules = _load_rules()
+    sym = _resolve_symbol(symbol) if symbol else ""
+    rules = _load_rules(sym)
     trades = _read_json(JOURNAL_DIR / f"{day}.json", [])
     closed = [t for t in trades if t.get("pnl") is not None]
     journal_pnl = round(sum(float(t["pnl"]) for t in closed), 2)
@@ -997,6 +1125,7 @@ async def get_today_status(date: str = "") -> dict[str, Any]:
 
     return {
         "date": day,
+        "symbol": sym or None,
         "counted_from": source,
         "trades_taken": trades_counted,
         "trades_remaining": remaining,
@@ -1009,6 +1138,13 @@ async def get_today_status(date: str = "") -> dict[str, Any]:
         "daily_stop_hit": stop_hit,
         "can_trade": remaining > 0 and not stop_hit,
         "rules": rules,
+        # Quota va daily stop khong tach theo cap: chi mot tai khoan, mot ngan sach
+        "rules_scope": {
+            "chung_moi_cap": list(GLOBAL_RULE_KEYS),
+            "rieng_tung_cap": list(SYMBOL_RULE_KEYS),
+            "note": ("quota lenh/ngay va daily_stop_loss dung chung cho tat ca "
+                     "cac cap; SL/TP/nguong swing thi theo tung cap"),
+        },
         # Rule bi doi trong chinh ngay dang giao dich la tin hieu dang de y
         "rules_changed_today": edits,
         "exchange": exchange_block,
@@ -1023,30 +1159,37 @@ def log_trade(
     stop: float,
     target: float,
     margin_usd: float,
+    symbol: str = "",
     trade_type: str = "scalp",
     setup: str = "",
     date: str = "",
 ) -> dict[str, Any]:
     """Ghi mot lenh vua vao. Tra ve canh bao neu pham rule, nhung van ghi de nhat ky dung thuc te.
 
+    symbol: bo trong = cap mac dinh. Nguong SL toi da, TP toi thieu va nguong
+      swing duoc lay theo DUNG CAP NAY. Quota lenh/ngay, margin va daily_stop_loss
+      thi dung chung cho moi cap.
     trade_type: scalp (mac dinh, han muc chat) hoac swing (han muc rong hon).
-      Khai swing ma TP khong dat nguong swing_min_take_profit_points thi lenh
-      tu dong bi ha xuong han muc scalp - dan nhan khong lach duoc.
+      Khai swing ma TP khong dat nguong swing_min_take_profit_points CUA CAP DO
+      thi lenh tu dong bi ha xuong han muc scalp - dan nhan khong lach duoc.
     """
     day = date or _today()
+    sym = _resolve_symbol(symbol)
     path = JOURNAL_DIR / f"{day}.json"
     trades = _read_json(path, [])
     realized = round(sum(float(t["pnl"]) for t in trades if t.get("pnl") is not None), 2)
-    rules = _load_rules()
+    rules = _load_rules(sym)
 
     verdict = _evaluate_trade(
-        side=side, entry=entry, stop=stop, target=target, margin_usd=margin_usd,
-        trade_type=trade_type, trades=trades, rules=rules, realized=realized,
+        symbol=sym, side=side, entry=entry, stop=stop, target=target,
+        margin_usd=margin_usd, trade_type=trade_type, trades=trades,
+        rules=rules, realized=realized,
     )
     violations = verdict["rule_violations"]
 
     trade = {
         "id": len(trades) + 1,
+        "symbol": sym,
         "side": verdict["side"],
         "trade_type": verdict["trade_type"],
         "entry": verdict["entry"],
@@ -1059,8 +1202,9 @@ def log_trade(
         "setup": setup,
         "opened_at": _now_iso(),
         "pnl": None,
-        # Chup lai rule dang hieu luc luc vao lenh. Doi rule ve sau khong sua duoc
-        # nhat ky cu, nen doc lai van biet luc do minh dang choi theo luat nao.
+        # Chup lai rule dang hieu luc luc vao lenh - la bo DA GIAI cho cap nay,
+        # tuc rule chung da tron voi rule rieng cua cap. Doi rule ve sau khong
+        # sua duoc nhat ky cu, nen doc lai van biet luc do choi theo luat nao.
         "rules_at_entry": rules,
         "limits_applied": verdict["limits_applied"],
         "demoted_to_scalp": verdict["demoted_to_scalp"],
@@ -1078,20 +1222,26 @@ def log_trade(
 
 @mcp.tool()
 def check_trade(side: str, entry: float, stop: float, target: float,
-                margin_usd: float, trade_type: str = "scalp",
+                margin_usd: float, symbol: str = "", trade_type: str = "scalp",
                 date: str = "") -> dict[str, Any]:
     """Cham thu mot lenh theo rule ma KHONG ghi vao nhat ky.
 
     Dung truoc khi bam lenh: xem no duoc xep scalp hay swing, han muc nao ap
     dung, co pham rule gi khong. Muon ghi that thi goi log_trade voi cung tham so.
+
+    symbol: bo trong = cap mac dinh. Nguong diem (SL toi da, TP toi thieu,
+      nguong swing) lay theo dung cap nay, nen cham cung mot bo so tren hai cap
+      khac nhau co the ra hai ket qua khac nhau - do la co y.
     """
     day = date or _today()
+    sym = _resolve_symbol(symbol)
     trades = _read_json(JOURNAL_DIR / f"{day}.json", [])
     realized = round(sum(float(t["pnl"]) for t in trades if t.get("pnl") is not None), 2)
 
     verdict = _evaluate_trade(
-        side=side, entry=entry, stop=stop, target=target, margin_usd=margin_usd,
-        trade_type=trade_type, trades=trades, rules=_load_rules(), realized=realized,
+        symbol=sym, side=side, entry=entry, stop=stop, target=target,
+        margin_usd=margin_usd, trade_type=trade_type, trades=trades,
+        rules=_load_rules(sym), realized=realized,
     )
     return {
         "date": day,
@@ -1452,6 +1602,20 @@ def _optional(payload: dict[str, Any], field: str) -> str | None:
     return value or None
 
 
+def _numeric_rules(raw: dict[str, Any]) -> dict[str, float]:
+    """Form gui so duoi dang chuoi. Doi sang so truoc khi dua vao _apply_rule_changes.
+
+    Nem ValueError de di chung mot duong bao loi voi phan validate con lai.
+    """
+    numeric: dict[str, float] = {}
+    for key, value in raw.items():
+        try:
+            numeric[key] = float(str(value).strip())
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} phai la so, nhan duoc '{value}'") from None
+    return numeric
+
+
 @mcp.custom_route(ADMIN_PATH, methods=["GET"])
 async def http_admin(request):
     from starlette.responses import HTMLResponse
@@ -1461,6 +1625,15 @@ async def http_admin(request):
                            for tf in KL["timeframes"])
         for row in tracked
     }
+    doc = _rules_doc()
+    # Gia tri DA GIAI cho tung cap: cap chua dat rieng thi hien gia tri mac dinh
+    # dang ke thua, de o nhap khong bao gio trong va nguoi dung thay ngay no dang
+    # chay theo so nao.
+    symbol_rules = {
+        row["symbol"]: {k: doc["symbols"].get(row["symbol"], {}).get(k, doc["values"][k])
+                        for k in SYMBOL_RULE_KEYS}
+        for row in tracked
+    }
     page = admin.render(
         STORE.masked(),
         settings_path=str(SETTINGS_FILE),
@@ -1468,10 +1641,14 @@ async def http_admin(request):
         test_path=ADMIN_TEST_PATH,
         symbol_path=ADMIN_SYMBOL_PATH,
         exchange_names=settings.EXCHANGE_NAMES,
-        rules=_load_rules(),
+        rules=doc["values"],
         rules_history=_rules_history(),
         symbols=tracked,
         symbol_ready=ready,
+        symbol_rules=symbol_rules,
+        symbol_overrides={s: sorted(o) for s, o in doc["symbols"].items()},
+        global_rule_keys=GLOBAL_RULE_KEYS,
+        symbol_rule_keys=SYMBOL_RULE_KEYS,
     )
     return HTMLResponse(page, headers={"Cache-Control": "no-store"})
 
@@ -1519,26 +1696,50 @@ async def http_admin_save(request):
 
         # Rule di qua dung ham ma tool update_rules dung: bat buoc co ly do,
         # ghi vao cung so lich su. Trang admin khong phai cua sau.
+        reason = str(payload.get("rules_reason") or "")
+
+        # Gom cac lo rule can ghi. Rule chung va rule tung cap la nhung lan ghi
+        # rieng biet, nen phai soat het ca lo TRUOC khi ghi lo dau tien - khong
+        # thi mot so go sai o cap cuoi se de lai nua chung da ghi, nua bao loi.
+        batches: list[tuple[dict[str, Any], str]] = []
+
         raw_rules = payload.get("rules")
         if isinstance(raw_rules, dict) and raw_rules:
-            numeric: dict[str, Any] = {}
-            for key, value in raw_rules.items():
-                try:
-                    numeric[key] = float(str(value).strip())
-                except (TypeError, ValueError):
-                    return JSONResponse(
-                        {"error": f"{key} phai la so, nhan duoc '{value}'"}, status_code=400)
-            result = _apply_rule_changes(numeric, str(payload.get("rules_reason") or ""))
-            if result["updated"]:
-                changed.append(f"{len(result['changes'])} quy dinh")
+            batches.append((_numeric_rules(raw_rules), ""))
+
+        raw_symbol_rules = payload.get("symbol_rules")
+        if isinstance(raw_symbol_rules, dict):
+            for sym, raw in raw_symbol_rules.items():
+                if not isinstance(raw, dict) or not raw:
+                    continue
+                batches.append((_numeric_rules(raw), str(sym)))
+
+        for numeric, sym in batches:
+            _validate_rule_changes(numeric, _resolve_symbol(sym) if sym else "")
+        if batches and not reason.strip():
+            raise ValueError("reason la bat buoc - ghi ro vi sao doi rule")
+
+        # Rule theo cap: moi cap mot lan ghi, moi lan mot dong lich su rieng
+        # gan ten cap - nhin lai van biet siet cap nao.
+        rules_touched = False
+        for numeric, sym in batches:
+            result = _apply_rule_changes(numeric, reason, symbol=sym)
+            if not result["updated"]:
+                continue
+            rules_touched = True
+            changed.append(
+                f"{len(result['changes'])} quy dinh chung" if not sym else
+                f"{len(result['changes'])} quy dinh cho {result['symbol']}")
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
 
     return JSONResponse({
         "saved": True,
         "message": "Da luu: " + ", ".join(changed) + ". Co hieu luc ngay.",
-        # Vua dat mat khau lan dau thi tai lai de trinh duyet hoi dang nhap
-        "reload": bool(password),
+        # Vua dat mat khau lan dau thi tai lai de trinh duyet hoi dang nhap.
+        # Doi rule cung tai lai: trang giu ban sao rule theo cap trong JS, khong
+        # nap lai thi lan luu ke tiep so sanh voi gia tri cu va gui thua.
+        "reload": bool(password) or rules_touched,
         "state": STORE.masked(),
     })
 
