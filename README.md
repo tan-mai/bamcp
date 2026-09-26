@@ -75,7 +75,7 @@ Dữ liệu từ bản một-cặp được **tự động chuyển** sang bố 
 | Quota lệnh/ngày, dừng ngày, hạn mức margin | **Chung tất cả các cặp** |
 | SL tối đa, TP tối thiểu, ngưỡng swing | **Riêng từng cặp** |
 | Nhật ký lệnh | Chung |
-| Đọc tài khoản sàn | Một cặp duy nhất — cặp khai trong mục *Tài khoản sàn* |
+| Đọc tài khoản sàn | **Mọi cặp đang theo dõi** — vị thế, lệnh khớp, PnL |
 
 Ngân sách rủi ro dùng chung là cố ý: nếu mỗi cặp một bộ quota thì thêm 5 cặp là nhân ngân sách rủi ro lên 5 lần, mà tài khoản thì vẫn chỉ có một.
 
