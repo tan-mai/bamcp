@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import secrets
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -54,11 +55,21 @@ class SettingsStore:
             return self._cache
         data: dict[str, Any] = {}
         if self.path.exists():
-            with contextlib.suppress(Exception):
-                with self.path.open("r", encoding="utf-8") as fh:
+            try:
+                # utf-8-sig: file sua tay tren Windows rat de dinh BOM, ma json
+                # khong doc duoc BOM. Doc kieu nay thi co hay khong BOM deu duoc.
+                with self.path.open("r", encoding="utf-8-sig") as fh:
                     loaded = json.load(fh)
                 if isinstance(loaded, dict):
                     data = loaded
+                else:
+                    print(f"CANH BAO: {self.path} khong phai JSON object - bo qua",
+                          file=sys.stderr)
+            except Exception as exc:
+                # Khong duoc nuot im: file hong nghia la MAT HET cau hinh
+                # (mat khau, credential san, danh sach cap) ma khong bao gi.
+                print(f"CANH BAO: khong doc duoc {self.path} - {type(exc).__name__}: "
+                      f"{exc}. Dang chay nhu chua cai dat gi.", file=sys.stderr)
         self._cache = data
         return data
 

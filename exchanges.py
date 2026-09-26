@@ -40,6 +40,18 @@ def _f(value: Any, default: float = 0.0) -> float:
 
 # ---------------------------------------------------------------- base
 
+_QUOTES = ("USDT", "USDC", "BUSD", "USD")
+
+
+def split_pair(symbol: str) -> tuple[str, str]:
+    """BTCUSDT -> (BTC, USDT). Khong nhan ra dong tien dinh gia thi tra ve nguyen."""
+    text = symbol.strip().upper()
+    for quote in _QUOTES:
+        if text.endswith(quote) and len(text) > len(quote):
+            return text[:-len(quote)], quote
+    return text, ""
+
+
 class BaseExchange:
     """Giao dien chung. Ba phuong thuc, ba dang du lieu chuan hoa.
 
@@ -63,15 +75,24 @@ class BaseExchange:
         self.recv_window = int(recv_window)
         self.options = options or {}
 
-    async def positions(self, client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    def market_symbol(self, symbol: str = "") -> str:
+        """Doi ma phan tich (BTCUSDT) sang ma cua san nay.
+
+        Binance va Bybit dung thang BTCUSDT; OKX doi thanh BTC-USDT-SWAP.
+        Bo trong = cap mac dinh cau hinh trong trang admin.
+        """
+        return (symbol or self.symbol).strip().upper()
+
+    async def positions(self, client: httpx.AsyncClient,
+                        symbol: str = "") -> list[dict[str, Any]]:
         raise NotImplementedError
 
     async def fills(self, client: httpx.AsyncClient, start_ms: int,
-                    end_ms: int) -> list[dict[str, Any]]:
+                    end_ms: int, symbol: str = "") -> list[dict[str, Any]]:
         raise NotImplementedError
 
     async def settlements(self, client: httpx.AsyncClient, start_ms: int,
-                          end_ms: int) -> list[dict[str, Any]]:
+                          end_ms: int, symbol: str = "") -> list[dict[str, Any]]:
         raise NotImplementedError
 
     async def _request(self, client: httpx.AsyncClient, url: str,
@@ -114,8 +135,9 @@ class BinanceFutures(BaseExchange):
             raise ExchangeError(f"binance: {data.get('code')} - {data.get('msg')}")
         return data
 
-    async def positions(self, client):
-        rows = await self._get(client, "/fapi/v2/positionRisk", {"symbol": self.symbol})
+    async def positions(self, client, symbol=""):
+        rows = await self._get(client, "/fapi/v2/positionRisk",
+                               {"symbol": self.market_symbol(symbol)})
         out = []
         for row in rows if isinstance(rows, list) else []:
             amount = _f(row.get("positionAmt"))
@@ -132,9 +154,10 @@ class BinanceFutures(BaseExchange):
             })
         return out
 
-    async def fills(self, client, start_ms, end_ms):
+    async def fills(self, client, start_ms, end_ms, symbol=""):
         rows = await self._get(client, "/fapi/v1/userTrades", {
-            "symbol": self.symbol, "startTime": start_ms, "endTime": end_ms, "limit": 1000})
+            "symbol": self.market_symbol(symbol), "startTime": start_ms,
+            "endTime": end_ms, "limit": 1000})
         out = []
         for row in rows if isinstance(rows, list) else []:
             out.append({
@@ -153,9 +176,10 @@ class BinanceFutures(BaseExchange):
     _INCOME_MAP = {"REALIZED_PNL": "realized_pnl", "COMMISSION": "commission",
                    "FUNDING_FEE": "funding"}
 
-    async def settlements(self, client, start_ms, end_ms):
+    async def settlements(self, client, start_ms, end_ms, symbol=""):
         rows = await self._get(client, "/fapi/v1/income", {
-            "symbol": self.symbol, "startTime": start_ms, "endTime": end_ms, "limit": 1000})
+            "symbol": self.market_symbol(symbol), "startTime": start_ms,
+            "endTime": end_ms, "limit": 1000})
         out = []
         for row in rows if isinstance(rows, list) else []:
             kind = self._INCOME_MAP.get(row.get("incomeType"))
@@ -201,9 +225,9 @@ class BybitV5(BaseExchange):
     def _category(self) -> str:
         return str(self.options.get("category", "linear"))
 
-    async def positions(self, client):
+    async def positions(self, client, symbol=""):
         rows = await self._get(client, "/v5/position/list",
-                               {"category": self._category, "symbol": self.symbol})
+                               {"category": self._category, "symbol": self.market_symbol(symbol)})
         out = []
         for row in rows:
             size = _f(row.get("size"))
@@ -221,9 +245,9 @@ class BybitV5(BaseExchange):
             })
         return out
 
-    async def fills(self, client, start_ms, end_ms):
+    async def fills(self, client, start_ms, end_ms, symbol=""):
         rows = await self._get(client, "/v5/execution/list", {
-            "category": self._category, "symbol": self.symbol,
+            "category": self._category, "symbol": self.market_symbol(symbol),
             "startTime": start_ms, "endTime": end_ms, "limit": 100})
         out = []
         for row in rows:
@@ -240,10 +264,10 @@ class BybitV5(BaseExchange):
             })
         return out
 
-    async def settlements(self, client, start_ms, end_ms):
+    async def settlements(self, client, start_ms, end_ms, symbol=""):
         out: list[dict[str, Any]] = []
         closed = await self._get(client, "/v5/position/closed-pnl", {
-            "category": self._category, "symbol": self.symbol,
+            "category": self._category, "symbol": self.market_symbol(symbol),
             "startTime": start_ms, "endTime": end_ms, "limit": 100})
         for row in closed:
             out.append({"ts": int(_f(row.get("updatedTime"))), "type": "realized_pnl",
@@ -298,9 +322,24 @@ class OkxV5(BaseExchange):
     def _inst_type(self) -> str:
         return str(self.options.get("inst_type", "SWAP"))
 
-    async def positions(self, client):
+    def market_symbol(self, symbol: str = "") -> str:
+        """BTCUSDT -> BTC-USDT-SWAP. OKX dung dau gach, Binance/Bybit thi khong.
+
+        Chuoi da dung dang OKX (co dau gach) thi giu nguyen - de nguoi dung khai
+        tay duoc nhung ma khong suy ra duoc theo quy tac.
+        """
+        text = (symbol or self.symbol).strip().upper()
+        if "-" in text:
+            return text
+        base, quote = split_pair(text)
+        if not quote:
+            return text
+        suffix = "" if self._inst_type == "SPOT" else f"-{self._inst_type}"
+        return f"{base}-{quote}{suffix}"
+
+    async def positions(self, client, symbol=""):
         rows = await self._get(client, "/api/v5/account/positions",
-                               {"instType": self._inst_type, "instId": self.symbol})
+                               {"instType": self._inst_type, "instId": self.market_symbol(symbol)})
         out = []
         for row in rows:
             pos = _f(row.get("pos"))
@@ -322,9 +361,9 @@ class OkxV5(BaseExchange):
             })
         return out
 
-    async def fills(self, client, start_ms, end_ms):
+    async def fills(self, client, start_ms, end_ms, symbol=""):
         rows = await self._get(client, "/api/v5/trade/fills-history", {
-            "instType": self._inst_type, "instId": self.symbol,
+            "instType": self._inst_type, "instId": self.market_symbol(symbol),
             "begin": start_ms, "end": end_ms, "limit": 100})
         out = []
         for row in rows:
@@ -344,9 +383,9 @@ class OkxV5(BaseExchange):
     # bills: type 2 = giao dich, type 8 = funding fee
     _BILL_TYPES = {"2": "realized_pnl", "8": "funding"}
 
-    async def settlements(self, client, start_ms, end_ms):
+    async def settlements(self, client, start_ms, end_ms, symbol=""):
         rows = await self._get(client, "/api/v5/account/bills", {
-            "instType": self._inst_type, "instId": self.symbol,
+            "instType": self._inst_type, "instId": self.market_symbol(symbol),
             "begin": start_ms, "end": end_ms, "limit": 100})
         out = []
         for row in rows:

@@ -1108,6 +1108,10 @@ async def get_today_status(date: str = "", symbol: str = "") -> dict[str, Any]:
                 "orders": len(data["order_ids"]),
                 "fills": len(data["fills"]),
                 "open_positions": positions["open_positions"],
+                # Cap nao dang gop vao con so nay, va cap nao doc khong duoc
+                "symbols": data["symbols"],
+                "errors": data["errors"],
+                "by_symbol": {s: d["totals"] for s, d in data["per_symbol"].items()},
                 **data["totals"],
             }
             # San la nguon su that. Lenh quen log van tinh vao quota.
@@ -1418,77 +1422,178 @@ def _position_counts(groups: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
-async def _account_day(day: str) -> dict[str, Any]:
-    """Fills + settlement cua mot ngay, da chuan hoa. Dung chung cho nhieu tool."""
+# Cap khong niem yet tren san se loi moi lan goi. Nho lai trong mot luc de
+# khong lam cham get_today_status - vi du XAUUSDT co tren Binance nhung khong
+# co tren OKX. Quen sau TTL de neu san niem yet them thi tu nhan ra.
+_SYMBOL_MISS: dict[str, float] = {}
+_SYMBOL_MISS_TTL = 1800.0
+
+
+def _symbol_recently_failed(key: str) -> bool:
+    at = _SYMBOL_MISS.get(key)
+    return bool(at and (time.time() - at) < _SYMBOL_MISS_TTL)
+
+
+async def _account_day_one(client, adapter, day: str, symbol: str) -> dict[str, Any]:
+    """Fill + settlement cua MOT cap trong mot ngay."""
     start_ms, end_ms = _day_window_ms(day)
-    adapter = _exchange()
-    async with httpx.AsyncClient() as client:
-        fills = await adapter.fills(client, start_ms, end_ms)
-        settlements = await adapter.settlements(client, start_ms, end_ms)
+    fills = await adapter.fills(client, start_ms, end_ms, symbol)
+    settlements = await adapter.settlements(client, start_ms, end_ms, symbol)
     for row in fills:
         row["time"] = _stamp(row["ts"])
+        row["symbol"] = symbol
     for row in settlements:
         row["time"] = _stamp(row["ts"])
+        row["symbol"] = symbol
 
-    # Gom fill thanh vi the TRUOC khi dem. TP tung phan va SL deu la order rieng
-    # nhung van thuoc mot vi the - dem theo order_id se thoi phong so lenh.
+    # Gom vi the RIENG tung cap: khoi luong cong don cua BTC va ETH khong the
+    # tron vao mot chuoi, tron vao la ranh gioi vi the sai hoan toan.
     positions = _group_fills_into_positions(fills)
+    for group in positions:
+        group["symbol"] = symbol
+        group["position_id"] = f"{symbol}-{group['position_id']}"
+    return {
+        "symbol": symbol,
+        "market_symbol": adapter.market_symbol(symbol),
+        "fills": fills,
+        "settlements": settlements,
+        "positions": positions,
+        "position_counts": _position_counts(positions),
+        "totals": _summarize(settlements),
+    }
+
+
+async def _account_day(day: str, symbols: list[str] | None = None) -> dict[str, Any]:
+    """Gop du lieu tai khoan cua NHIEU cap trong mot ngay.
+
+    Danh sach cap lay tu trang admin - them cap o do la tu dong duoc doc luon,
+    khong phai khai lai o dau.
+
+    Cap nao san khong niem yet thi ghi vao 'errors' roi di tiep, khong lam hong
+    ca lan goi. Mot cap loi khong duoc keo theo bon cap con lai.
+    """
+    adapter = _exchange()
+    targets = [s.upper() for s in (symbols or _symbols())]
+    gate = asyncio.Semaphore(int(ACCOUNT.get("max_concurrent_requests", 4)))
+
+    async def one(client, symbol):
+        cache_key = f"{adapter.name}:{adapter.market_symbol(symbol)}"
+        if _symbol_recently_failed(cache_key):
+            return symbol, None, "bo qua tam thoi - lan truoc san khong co cap nay"
+        async with gate:
+            try:
+                return symbol, await _account_day_one(client, adapter, day, symbol), None
+            except Exception as exc:
+                _SYMBOL_MISS[cache_key] = time.time()
+                return symbol, None, f"{type(exc).__name__}: {exc}"
+
+    async with httpx.AsyncClient() as client:
+        done = await asyncio.gather(*[one(client, s) for s in targets])
+
+    per_symbol: dict[str, Any] = {}
+    errors: dict[str, str] = {}
+    fills: list[dict[str, Any]] = []
+    settlements: list[dict[str, Any]] = []
+    positions: list[dict[str, Any]] = []
+    for symbol, data, error in done:
+        if error:
+            errors[symbol] = error
+            continue
+        per_symbol[symbol] = data
+        fills.extend(data["fills"])
+        settlements.extend(data["settlements"])
+        positions.extend(data["positions"])
+
+    counts = {"opened_today": 0, "closed_today": 0, "carried_in": 0, "still_open": 0}
+    for data in per_symbol.values():
+        for key in counts:
+            counts[key] += data["position_counts"][key]
+
     return {
         "date": day,
         "exchange": adapter.name,
-        "symbol": adapter.symbol,
+        "symbols": sorted(per_symbol),
+        "errors": errors,
+        "per_symbol": per_symbol,
         "fills": fills,
         "order_ids": sorted({f["order_id"] for f in fills if f.get("order_id")}),
         "positions": positions,
-        "position_counts": _position_counts(positions),
+        "position_counts": counts,
         "settlements": settlements,
         "totals": _summarize(settlements),
     }
 
 
-async def _open_positions() -> dict[str, Any]:
-    """Ham thuan, khong boc decorator, de cac tool khac goi lai duoc."""
+async def _open_positions(symbols: list[str] | None = None) -> dict[str, Any]:
+    """Vi the dang mo tren tat ca cac cap dang theo doi."""
     adapter = _exchange()
+    targets = [s.upper() for s in (symbols or _symbols())]
+    gate = asyncio.Semaphore(int(ACCOUNT.get("max_concurrent_requests", 4)))
+
+    async def one(client, symbol):
+        cache_key = f"{adapter.name}:{adapter.market_symbol(symbol)}"
+        if _symbol_recently_failed(cache_key):
+            return symbol, [], None
+        async with gate:
+            try:
+                rows = await adapter.positions(client, symbol)
+                for row in rows:
+                    row["tracked_symbol"] = symbol
+                return symbol, rows, None
+            except Exception as exc:
+                _SYMBOL_MISS[cache_key] = time.time()
+                return symbol, [], f"{type(exc).__name__}: {exc}"
+
     async with httpx.AsyncClient() as client:
-        positions = await adapter.positions(client)
+        done = await asyncio.gather(*[one(client, s) for s in targets])
+
+    positions: list[dict[str, Any]] = []
+    errors: dict[str, str] = {}
+    for symbol, rows, error in done:
+        if error:
+            errors[symbol] = error
+        positions.extend(rows)
+
     return {
         "exchange": adapter.name,
-        "symbol": adapter.symbol,
+        "symbols_checked": targets,
+        "errors": errors,
         "checked_at": _now_iso(),
         "open_positions": len(positions),
         "positions": positions,
         "flat": not positions,
     }
 
-
 @mcp.tool()
-async def get_positions() -> dict[str, Any]:
-    """Vi the dang mo THAT TREN SAN. Day la su that, khong phai nhat ky tu khai.
+async def get_positions(symbol: str = "") -> dict[str, Any]:
+    """Vi the dang mo THAT TREN SAN, tren MOI cap dang theo doi.
 
-    Dung truoc khi phan tich de biet minh dang cam gi, va sau khi vao lenh de
-    xac nhan lenh da khop dung gia du dinh.
+    symbol: bo trong = tat ca cac cap trong danh sach o trang admin.
+    Day la su that, khong phai nhat ky tu khai.
     """
-    return await _open_positions()
+    return await _open_positions([_resolve_symbol(symbol)] if symbol else None)
 
 
 @mcp.tool()
-async def get_fills(date: str = "") -> dict[str, Any]:
+async def get_fills(date: str = "", symbol: str = "") -> dict[str, Any]:
     """Lenh da khop trong ngay, lay thang tu san, GOM THEO VI THE.
 
+    symbol: bo trong = tat ca cac cap dang theo doi.
     Mot vi the co the gom nhieu fill: mo, TP tung phan, SL. Chung cung
     position_id. Dem so lenh trong ngay phai dem vi the, khong dem fill hay order.
     """
-    data = await _account_day(date or _today())
+    data = await _account_day(date or _today(),
+                              [_resolve_symbol(symbol)] if symbol else None)
     counts = data["position_counts"]
     return {
         "date": data["date"],
         "exchange": data["exchange"],
-        "symbol": data["symbol"],
+        "symbols": data["symbols"],
+        "errors": data["errors"],
         "positions_opened_today": counts["opened_today"],
         "positions_carried_in": counts["carried_in"],
         "positions_still_open": counts["still_open"],
         "fill_count": len(data["fills"]),
-        "order_count": len(data["order_ids"]),
         "note": ("Mot vi the = mot lenh. carried_in = mo tu hom truoc, "
                  "khong tinh vao quota hom nay."),
         "positions": [
@@ -1503,18 +1608,22 @@ async def get_fills(date: str = "") -> dict[str, Any]:
 
 
 @mcp.tool()
-async def get_account_pnl(date: str = "") -> dict[str, Any]:
+async def get_account_pnl(date: str = "", symbol: str = "") -> dict[str, Any]:
     """PnL THUC trong ngay, tach rieng lai/lo, phi giao dich va funding.
 
-    Khac voi realized_pnl trong get_today_status - so do la tu khai. So o day
-    lay tu sao ke cua san nen da bao gom phi va funding, thuong xau hon so tu khai.
+    symbol: bo trong = cong gop tat ca cac cap dang theo doi.
+    Khac realized_pnl trong get_today_status o cho so nay lay tu sao ke cua san
+    nen da bao gom phi va funding - thuong xau hon so tu khai.
     """
-    data = await _account_day(date or _today())
+    data = await _account_day(date or _today(),
+                              [_resolve_symbol(symbol)] if symbol else None)
     return {
         "date": data["date"],
         "exchange": data["exchange"],
-        "symbol": data["symbol"],
+        "symbols": data["symbols"],
+        "errors": data["errors"],
         "totals": data["totals"],
+        "by_symbol": {s: d["totals"] for s, d in data["per_symbol"].items()},
         "note": "net = realized_pnl + commission + funding. Phi va funding la so am.",
         "settlements": data["settlements"],
     }
@@ -1565,11 +1674,14 @@ async def reconcile_journal(date: str = "") -> dict[str, Any]:
         "findings": findings,
         "journal": {"trades": len(trades), "realized_pnl": journal_pnl},
         "exchange_data": {
+            "symbols": data["symbols"],
+            "errors": data["errors"],
             "positions_opened_today": data["position_counts"]["opened_today"],
             "positions_carried_in": data["position_counts"]["carried_in"],
             "orders": len(data["order_ids"]),
             "fills": len(data["fills"]),
             **data["totals"],
+            "by_symbol": {s: d["totals"] for s, d in data["per_symbol"].items()},
         },
     }
 

@@ -24,9 +24,9 @@ Tuỳ chọn đọc tài khoản thật từ Binance, Bybit hoặc OKX bằng AP
 | `check_trade` | Chấm thử một lệnh theo rule mà không ghi nhật ký |
 | `log_trade` | Ghi lệnh, cảnh báo nếu phạm rule |
 | `close_trade` | Đóng lệnh, cập nhật PnL thực |
-| `get_positions` | Vị thế đang mở **thật trên sàn** |
-| `get_fills` | Lệnh đã khớp trong ngày, lấy thẳng từ sàn |
-| `get_account_pnl` | PnL thật, tách lãi/lỗ, phí giao dịch, funding |
+| `get_positions` | Vị thế đang mở **thật trên sàn**, mọi cặp đang theo dõi |
+| `get_fills` | Lệnh đã khớp trong ngày theo từng vị thế, mọi cặp |
+| `get_account_pnl` | PnL thật, tách lãi/lỗ, phí, funding — và tách theo cặp |
 | `reconcile_journal` | Đối chiếu nhật ký tự ghi với sàn, chỉ ra chỗ lệch |
 
 Không có tool đặt lệnh. Cố ý.
@@ -218,6 +218,27 @@ Trước đây tính là **4 lệnh**. Giờ là **2 vị thế**, và chỉ **1
 `get_fills` trả về danh sách vị thế, mỗi vị thế có `position_id`, `carried_in`, `closed`, tổng `realized_pnl` và các fill thành phần. `get_today_status` và `reconcile_journal` đều đếm theo vị thế.
 
 Các trường hợp đã kiểm: TP từng phần (mở 10, chốt 3+3+4 → 1 vị thế), scale in (5+5 rồi đóng 10 → 1), hai vị thế độc lập → 2, vị thế còn mở cuối ngày → 1 với `still_open`.
+
+### Đọc tài khoản theo danh sách cặp
+
+Bốn tool đọc tài khoản — `get_positions`, `get_fills`, `get_account_pnl`, `reconcile_journal` — đều chạy trên **toàn bộ danh sách cặp trong trang admin**. Thêm một cặp ở đó là nó tự động được đọc, không phải khai lại ở đâu.
+
+Mỗi tool nhận `symbol` để lọc về một cặp; bỏ trống là gộp tất cả.
+
+**Mã sàn tự suy.** Cặp phân tích là `ETHUSDT`, nhưng mỗi sàn gọi một kiểu:
+
+| Cặp | Binance | Bybit | OKX |
+|---|---|---|---|
+| `BTCUSDT` | `BTCUSDT` | `BTCUSDT` | `BTC-USDT-SWAP` |
+| `ETHUSDT` | `ETHUSDT` | `ETHUSDT` | `ETH-USDT-SWAP` |
+
+Khai sẵn dạng có dấu gạch (`BTC-USDT-SWAP`) thì giữ nguyên — dùng cho mã không suy ra được theo quy tắc.
+
+**Vị thế gom riêng từng cặp.** Khối lượng cộng dồn của BTC và ETH không thể trộn vào một chuỗi; trộn vào là ranh giới vị thế sai hoàn toàn. `position_id` mang tiền tố cặp: `BTCUSDT-P1`.
+
+**Một cặp lỗi không kéo đổ cả lần gọi.** Cặp sàn không niêm yết được ghi vào `errors` rồi đi tiếp. Cặp lỗi còn được nhớ trong 30 phút để không làm chậm mọi lần gọi sau — ví dụ `XAUUSDT` có trên Binance nhưng có thể không có trên OKX.
+
+`get_today_status` giờ có thêm `by_symbol` để thấy PnL từng cặp, và `errors` để biết cặp nào đọc không được — số liệu thiếu thì phải nhìn thấy, không được im lặng.
 
 ### `reconcile_journal`
 

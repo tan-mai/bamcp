@@ -199,3 +199,13 @@ instructions: |
   get_rules(symbol="ETHUSDT") tra ve bo so da giai cho ETH (rule chung + phan
   ETH dat rieng, hoac mac dinh neu ETH chua dat rieng). Khoi 'symbol_overrides'
   cho biet cap nao dang dat rieng nhung rule gi.
+
+  DOC TAI KHOAN NHIEU CAP: get_positions, get_fills, get_account_pnl va
+  reconcile_journal chay tren TOAN BO danh sach cap trong trang admin. Moi tool
+  nhan symbol de loc ve mot cap; bo trong la gop tat ca.
+
+  - get_today_status co khoi by_symbol cho biet PnL tung cap, va errors cho biet
+    cap nao doc khong duoc. Neu errors khong rong thi NOI RA - so lieu dang
+    thieu, dung ket luan nhu the day du.
+  - position_id mang tien to cap: BTCUSDT-P1. Vi the gom rieng tung cap.
+  - Quota lenh va daily_stop_loss van tinh gop tat ca cac cap.
