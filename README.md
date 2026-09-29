@@ -28,8 +28,21 @@ Tuỳ chọn đọc tài khoản thật từ Binance, Bybit hoặc OKX bằng AP
 | `get_fills` | Lệnh đã khớp trong ngày theo từng vị thế, mọi cặp |
 | `get_account_pnl` | PnL thật, tách lãi/lỗ, phí, funding — và tách theo cặp |
 | `reconcile_journal` | Đối chiếu nhật ký tự ghi với sàn, chỉ ra chỗ lệch |
+| `list_orb_sessions` | Các phiên ORB, giờ mở kế tiếp (UTC + giờ VN), watch M5 có đang chạy |
+| `get_opening_range` | High/Low của OR (nến M15 đầu phiên), ATR H1, cờ lọc `too_narrow`/`too_wide` |
+| `check_orb_signal` | State của phiên, nến M5 kích hoạt, plan entry/SL/TP/qty đã tính phí |
+| `skip_orb_session` | Bỏ một phiên trong ngày (bắt buộc lý do), dừng watch M5 |
+| `backtest_orb` | Backtest ORB trên M5 lịch sử, tách in-sample/out-of-sample |
+| `get_backtest_result` | Lấy kết quả backtest chạy lâu theo `run_id` |
+| `get_orb_config` | Tham số ORB đang áp dụng |
 
-Không có tool đặt lệnh. Cố ý.
+Không có tool đặt lệnh. Cố ý. Plan của ORB chỉ là con số đề xuất — người dùng tự đặt lệnh trên sàn.
+
+Bốn tool cũ nhận thêm tham số **tuỳ chọn** cho ORB; không truyền thì hành vi và các khoá trả về giữ nguyên như trước:
+
+- `get_today_status(strategy, session_id)` và `get_account_pnl(strategy, session_id)` — thêm khối lọc theo chiến lược/phiên. Quota và `daily_stop_loss` vẫn tính gộp.
+- `check_trade(strategy="ORB", session_id, or_date)` — thêm khối `orb_checks`: còn trong cửa sổ không, phiên/ngày còn quota không.
+- `log_trade(strategy="ORB", session_id, variant, or_date, or_high, or_low)` — ghi lệnh ORB và dừng watch M5 của phiên đó. Lệnh không phải ORB được gắn `strategy: "OTHER"`.
 
 ## Nến đang chạy vs nến đã đóng
 
@@ -143,6 +156,58 @@ Server chỉ chặn giá trị làm vỡ logic tính toán — `daily_stop_loss`
 Đổi rule giữa lúc đang lỗ thì vẫn đổi được. Nhưng bản ghi sẽ nói ra điều đó, và Claude được dặn phải nhắc lại trước khi bàn tiếp chuyện vào lệnh.
 
 **Quy trình phân tích** — nằm ở key `instructions` trong `config.yaml`, không còn hardcode trong `server.py`. Claude đọc nó một lần lúc bắt tay, nên sửa xong cần `docker compose restart` rồi tắt/bật lại connector trong chat. Không phải build lại image.
+
+## Phân tích ORB
+
+ORB (Opening Range Breakout) chỉ chạy trên một cặp — `orb.symbol`, mặc định `BTCUSDT`. **OR = nến M15 đầu tiên** của mỗi phiên.
+
+### Hai giai đoạn
+
+1. **Chốt OR.** Nến M15 đầu phiên đóng + 20 giây (`candle_close_delay_seconds`), scheduler kéo M15 và H1, tính High/Low của OR và ATR(14) của H1 tính đến trước giờ mở. `OR / ATR` dưới `min_or_atr_ratio` là `too_narrow`, trên `max_or_atr_ratio` là `too_wide` — phiên bị lọc thì **không kéo M5**.
+2. **Watch M5.** OR hợp lệ thì cứ 5 phút (nến M5 đóng + 20 giây) kéo M5 một lần, tìm breakout theo `entry.mode`. Watch dừng khi phiên `TAKEN` (đã `log_trade`), `SKIPPED` (đã `skip_orb_session`), hoặc hết `trade_window_minutes`. Ngoài cửa sổ đó không có request M5 nào.
+
+Mọi giờ tính theo timezone IANA của từng phiên nên tự đổi giờ mùa hè — London 08:00 là 07:00Z vào mùa hè, 08:00Z vào mùa đông. Tool trả cả UTC lẫn giờ VN.
+
+State của một phiên trong một ngày:
+
+```
+WAITING_OPEN → FORMING → RANGE_SET → BREAKOUT_LONG / BREAKOUT_SHORT
+                                    → FAILED_BREAKOUT_LONG / FAILED_BREAKOUT_SHORT
+kết thúc: FILTERED · EXPIRED · SKIPPED · TAKEN
+```
+
+Bộ lọc khác: `use_bias_filter` (so với bias đã `save_bias` trong ngày), `skip_news_days` (ngày có tin lớn), quota `max_trades` mỗi phiên và `max_orb_trades_per_day` (đếm theo `or_date`).
+
+Plan tính sẵn phí taker + trượt giá hai chiều vào 1R, rồi làm tròn `qty` theo `qty_step`, chặn theo `min_notional_usd` và `max_margin_usd`. Tài khoản nhỏ thì nhiều tín hiệu ra `not_executable` — đó là con số thật, không phải lỗi.
+
+### Cấu hình
+
+Tham số **chung** nằm ở khối `orb:` trong `config.yaml` (sửa xong phải restart): entry, exit, filters, risk, costs, `exchange_limits`. Bật/tắt nhanh cả module bằng `BAMCP_ORB_ENABLED=true|false`.
+
+Danh sách **phiên** thì quản lý ở trang `/admin/orb`, lưu trong `data/orb/sessions.json`, **không cần restart**. `default_sessions` trong config chỉ là hạt giống cho lần chạy đầu. Trên trang đó:
+
+- thêm/sửa phiên: `session_id`, tên, timezone, giờ mở, ngày giao dịch, cửa sổ, quota, override riêng (chỉ các khoá entry/exit/filters an toàn — không override được risk);
+- **Xem trước** giờ mở kế tiếp theo UTC và giờ VN trước khi lưu;
+- bật/tắt, xoá phiên. Tắt hay xoá giữa phiên thì watch đang chạy dừng ngay;
+- lịch sử thay đổi.
+
+`session_id` không đổi được sau khi tạo — state, nhật ký và backtest đều gắn vào nó.
+
+Ngày có tin lớn: ghi vào `data/orb/news_days.json` dạng `["2026-10-02", "2026-10-07"]`, đọc lại mỗi lần tính, không cần restart.
+
+### Dùng trong chat
+
+> *"Phiên New York hôm nay OR thế nào, có tín hiệu chưa?"*
+
+Claude gọi `get_opening_range` → `check_orb_signal`, đọc `trigger_candle` (nến M5 **đã đóng**) và `plan`. Muốn vào lệnh thì `check_trade(strategy="ORB", session_id="ny")`, bạn tự đặt lệnh trên sàn, rồi `log_trade(strategy="ORB", session_id="ny", variant="breakout")`. Giá đã chạy xa, không đuổi: `skip_orb_session("ny", reason="...")`.
+
+### Backtest
+
+> *"Backtest ORB 2 năm, lấy 2026-03-01 làm mốc out-of-sample."*
+
+`backtest_orb(from_date, to_date, session_ids, split_date, overrides, initial_equity)` chạy trên M5 lịch sử. Lần đầu nó tải M5 từ `data.binance.vision` (file tháng, tháng đang chạy ghép từ file ngày, có kiểm SHA256) — khoảng nửa phút cho 2 năm; sau đó đọc cache dưới một giây. Chạy quá ~55 giây thì tool trả `status: running` kèm `run_id`, gọi `get_backtest_result(run_id)` sau.
+
+Kết quả gồm: số lệnh, win rate, expectancy theo R, profit factor, drawdown, chuỗi thua dài nhất, tách in-sample/out-of-sample và theo phiên, lý do thoát (tp/sl/breakeven/time), số tín hiệu bị lọc hoặc không vào được vì quy mô tài khoản, và `data_gaps` cho những ngày thiếu dữ liệu. Nến M5 chạm cả SL lẫn TP thì tính là **thua** (`sl_tp_same_bar`). File `trades.csv`, `equity.csv`, `result.json` nằm trong `data/orb/backtests/<run_id>/`.
 
 ## Đọc tài khoản thật từ sàn
 
@@ -369,13 +434,15 @@ So sánh credential dùng `secrets.compare_digest` cho cả hai vế, không sho
 
 ## Bề mặt HTTP
 
-Ba đường:
+Các đường chính:
 
 | Endpoint | Auth | Việc |
 |---|---|---|
 | `POST /mcp` | có | giao thức MCP — Claude nói chuyện ở đây |
 | `GET /healthz` | không | health check cho Docker HEALTHCHECK và reverse proxy |
 | `GET /admin` | có* | trang đặt username/password, credential sàn, quy định |
+| `GET /admin/orb` | có* | quản lý phiên ORB (chỉ có khi `orb.enabled`) |
+| `POST /admin/orb/sessions` | có* | xem trước / lưu / bật / tắt / xoá phiên — trang trên gọi |
 
 `*` `/admin` mở công khai khi **chưa** đặt mật khẩu lần nào, nhưng lúc đó phải có setup token mới ghi được. Xem mục [Trang admin](#trang-admin).
 
@@ -389,8 +456,18 @@ Không có REST API nào khác. Muốn pull dữ liệu ngay thì bảo Claude g
 ├── bias/      2026-09-12.json
 ├── rules.json            # rule chung + phần đặt riêng từng cặp + lịch sử đổi
 ├── settings.json         # username/password (hash) + credential sàn — chmod 600
-└── journal/   2026-09-12.json
+├── journal/   2026-09-12.json
+│   └── orb_skips/  2026-09-12.json      # phiên ORB đã skip, kèm lý do
+└── orb/
+    ├── sessions.json     # danh sách phiên + lịch sử đổi (trang /admin/orb)
+    ├── news_days.json    # ngày có tin lớn — tạo tay khi cần
+    ├── state/     ny/2026-09-12.json    # state + watch của một phiên trong một ngày
+    ├── logs/      2026-09-12.jsonl      # log sự kiện: chốt OR, tick M5, dừng watch
+    ├── history/   BTCUSDT/5m/*.csv      # M5 lịch sử cho backtest
+    └── backtests/ <run_id>/  result.json  trades.csv  equity.csv
 ```
+
+`klines/<cặp>/5m.json` chỉ xuất hiện khi ORB watch hoặc khi gọi `refresh_data(timeframes=["5m"])`; vòng pull 15 phút không bao giờ kéo khung 5m.
 
 Mỗi chu kỳ (mặc định 15 phút) server gọi Binance, merge theo `openTime` nên không trùng nến, và giữ tối đa `max_history` nến.
 
@@ -511,6 +588,15 @@ $env:BAMCP_PASSWORD = "test123"
 ```
 
 Mở `http://127.0.0.1:8848/healthz`.
+
+## Chạy test
+
+```powershell
+.venv\Scripts\pip install pytest
+.venv\Scripts\python -m pytest tests -q
+```
+
+Test không gọi mạng và không đụng `data/` thật: chúng dùng thư mục tạm, sàn giả và đồng hồ giả. Bộ test gồm logic ORB (`test_orb_logic.py`), scheduler + watch M5 (`test_orb_runtime.py`), trang admin + backtest (`test_orb_admin_backtest.py`), và tầng tool của server — trong đó có kiểm tra tool cũ không đổi khi không truyền tham số ORB (`test_server.py`).
 
 ## Gắn vào Claude
 

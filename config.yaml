@@ -2,7 +2,8 @@
 # Doi duong dan o day khi deploy. Khong sua server.py.
 # Bien moi truong thang config: BAMCP_HOST, BAMCP_PORT, BAMCP_ALLOWED_HOSTS,
 # BAMCP_DATA_ROOT, BAMCP_USERNAME, BAMCP_PASSWORD, BAMCP_SYMBOL, BAMCP_MARKET, TZ,
-# BAMCP_ACCOUNT_ENABLED (true/false - tat nhanh phan doc tai khoan khi test).
+# BAMCP_ACCOUNT_ENABLED (true/false - tat nhanh phan doc tai khoan khi test),
+# BAMCP_ORB_ENABLED (true/false - bat/tat module ORB).
 
 server:
   host: "0.0.0.0"            # 0.0.0.0 khi chay trong container; 127.0.0.1 khi chay truc tiep sau Caddy
@@ -59,6 +60,9 @@ klines:
   # Neu file JSON boc trong 1 key (vd {"data": [...]}), dien ten key vao day
   wrapper_key: ""
   timeframes: ["1w", "1d", "4h", "1h", "15m"]
+  # Khung chi keo khi goi refresh_data(timeframes=["5m"]) hoac trong giai doan
+  # watch cua ORB. Fetcher nen KHONG bao gio keo cac khung nay.
+  on_demand_timeframes: ["5m"]
   default_limit: 120
   max_limit: 1000
   context_lookback: 60       # so nen dung de tinh range / volume trung binh
@@ -121,6 +125,79 @@ rules:
   # swing_min_take_profit_points - dan nhan "swing" khong lach duoc.
   swing_min_take_profit_points: 2000
   swing_max_stop_points: 1500
+
+# ORB - Opening Range Breakout. OR = nen M15 DAU TIEN cua moi phien.
+# Tham so CHUNG o day (sua xong thi restart). Danh sach PHIEN (gio mo, timezone,
+# ngay giao dich, override rieng) quan ly o trang <admin_path>/orb, luu o
+# sessions_store_path - khong can restart. default_sessions chi la hat giong cho
+# lan chay dau, khi file phien chua ton tai.
+# Moi duong dan tuong doi deu tinh tu data_root.
+orb:
+  enabled: true
+  symbol: "BTCUSDT"
+  or_timeframe: "M15"
+  watch_timeframe: "M5"
+  sessions_store_path: "orb/sessions.json"
+  scheduler:
+    candle_close_delay_seconds: 20   # doi nen dong them 20 giay roi moi pull
+  defaults:                          # phien de trong truong nay thi dung gia tri o day
+    trade_window_minutes: 180        # tinh tu luc OR chot
+    max_trades: 1                    # so lenh ORB toi da moi phien
+  max_orb_trades_per_day: 2          # tong moi phien, dem theo or_date
+  entry:
+    mode: "close"                    # close | touch | retest
+    buffer_pct: 0.02                 # % cong/tru vao bien OR
+    allow_reversal: false            # co ra plan cho failed breakout khong
+    failed_lookback_bars: 3          # so nen M5 de xac nhan failed breakout
+  exit:
+    sl_mode: "opposite"              # opposite | mid
+    tp_r: 1.5
+    move_sl_to_be_at_r: 1.0          # 0 = khong doi SL ve hoa von
+    time_exit_minutes: 180
+  filters:
+    atr_timeframe: "H1"
+    atr_period: 14
+    min_or_atr_ratio: 0.3            # OR / ATR duoi nguong = too_narrow
+    max_or_atr_ratio: 1.2            # OR / ATR tren nguong = too_wide
+    use_bias_filter: true            # doi chieu voi bias da save_bias trong ngay
+    skip_news_days: true
+    news_days_file: "orb/news_days.json"   # ["2026-10-02", ...] ngay co tin lon
+  risk:
+    account_equity: 100
+    risk_usd: 1                      # 1R tinh bang USD, DA gom phi + truot gia
+    max_margin_usd: 20
+    max_leverage: 10
+  costs:
+    taker_fee_pct: 0.05              # moi chieu
+    slippage_pct: 0.02               # moi chieu
+  exchange_limits:                   # Binance USDT-M BTCUSDT; doi san thi kiem tra lai
+    qty_step: 0.001
+    min_notional_usd: 100
+  data:
+    m5_history_path: "orb/history"   # M5 lich su tu data.binance.vision
+    history_years: 2
+    backtest_output_path: "orb/backtests"
+  default_sessions:
+    - session_id: "ldn"
+      name: "London"
+      timezone: "Europe/London"
+      open_time: "08:00"
+      trade_days: ["Mon", "Tue", "Wed", "Thu", "Fri"]
+      holiday_calendar: "UK"
+      trade_window_minutes: null
+      max_trades: null
+      overrides: {}
+      enabled: true
+    - session_id: "ny"
+      name: "New York"
+      timezone: "America/New_York"
+      open_time: "09:30"
+      trade_days: ["Mon", "Tue", "Wed", "Thu", "Fri"]
+      holiday_calendar: "US"
+      trade_window_minutes: null
+      max_trades: null
+      overrides: {}
+      enabled: true
 
 # Quy trinh phan tich ma Claude doc luc bat tay. Sua o day, `docker compose restart`,
 # roi tat/bat lai connector trong chat de Claude doc ban moi. Khong can build lai image.
@@ -209,3 +286,26 @@ instructions: |
     thieu, dung ket luan nhu the day du.
   - position_id mang tien to cap: BTCUSDT-P1. Vi the gom rieng tung cap.
   - Quota lenh va daily_stop_loss van tinh gop tat ca cac cap.
+
+  ORB - OPENING RANGE BREAKOUT (chi tren cap orb.symbol, mac dinh BTCUSDT):
+  OR = nen M15 DAU TIEN cua phien. Moi gio deu theo timezone cua tung phien
+  (tu xu ly gio mua he), tool tra ca UTC lan gio VN.
+
+  Quy trinh:
+  1. get_bias -> bias D/H4 (bo loc bias cua ORB doc tu day).
+  2. list_orb_sessions -> phien nao bat, gio mo ke tiep, watch M5 co dang chay.
+  3. get_opening_range -> High/Low cua OR va range_flag (ok/too_narrow/too_wide).
+     status khac 'set' thi CHUA co OR chot - dung ket luan.
+  4. check_orb_signal -> state, trigger_candle (nen M5 da dong) va plan.
+     Tu danh gia volume/VSA cua trigger_candle bang so lieu tool tra ve.
+  5. Quyet dinh:
+     - vao lenh: check_trade(strategy="ORB", session_id=...) -> nguoi dung tu dat
+       lenh tren san -> log_trade(strategy="ORB", session_id=..., variant=...).
+     - gia da chay xa vung entry, khong duoi: skip_orb_session(session_id, reason).
+     - chua co tin hieu: goi lai check_orb_signal sau (scheduler tu keo M5 5 phut/lan).
+
+  BAMCP KHONG dat lenh. plan chi la de xuat da tinh san phi va truot gia vao R.
+  Neu check_orb_signal co warning 'stale_m5' hoac data_status khac 'ok' thi noi ra.
+  state FILTERED / EXPIRED / SKIPPED / TAKEN nghia la phien do khong con vao lenh.
+  Backtest: backtest_orb(from_date, to_date, ...) -> neu status=running thi
+  get_backtest_result(run_id) sau. Tham so dang ap dung: get_orb_config.
