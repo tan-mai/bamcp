@@ -29,8 +29,11 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 COPY server.py exchanges.py settings.py admin.py probe.py config.yaml ./
+# ORB: logic thuan, M5 lich su, scheduler + state, backtest, trang quan ly phien
+COPY orb.py orb_history.py orb_runtime.py orb_backtest.py admin_orb.py ./
 
-RUN mkdir -p /data/klines /data/bias /data/journal \
+RUN mkdir -p /data/klines /data/bias /data/journal /data/journal/orb_skips \
+             /data/orb/state /data/orb/logs /data/orb/history /data/orb/backtests \
     && chown -R bamcp:bamcp /data /app
 
 USER bamcp

@@ -26,6 +26,13 @@ from starlette.responses import JSONResponse
 import admin       # module cuc bo: trang cai dat
 import exchanges   # module cuc bo: adapter doc tai khoan san
 import settings    # module cuc bo: luu credential xuong volume
+# TM - #ORB - ORB Enhancement
+import admin_orb     # module cuc bo: trang quan ly phien ORB
+import orb           # module cuc bo: logic ORB thuan (OR, tin hieu, sizing)
+import orb_backtest  # module cuc bo: backtest ORB tren M5 lich su
+import orb_history   # module cuc bo: M5 lich su tu data.binance.vision
+import orb_runtime   # module cuc bo: session store, state theo ngay, scheduler ORB
+from orb import iso_utc, iso_vn
 
 # Nap .env neu co, de chay local khong phai export tay moi lan mo terminal.
 # override=False: bien moi truong that luon thang .env, nen Docker (compose truyen
@@ -414,10 +421,22 @@ def _apply_rule_changes(changes: dict[str, Any], reason: str,
 
 # ---------------------------------------------------------------- klines
 
+def _on_demand_timeframes() -> list[str]:
+    """Khung chi keo khi goi thu cong hoac trong giai doan watch ORB (vd 5m).
+
+    Fetcher nen khong bao gio keo cac khung nay - BR-03.
+    """
+    # TM - #ORB - ORB Enhancement
+    return [str(tf).strip().lower() for tf in (KL.get("on_demand_timeframes") or [])
+            if str(tf).strip().lower() not in KL["timeframes"]]
+
+
 def _validate_timeframe(timeframe: str) -> str:
     tf = timeframe.strip().lower()
-    if tf not in KL["timeframes"]:
-        raise ValueError(f"timeframe khong hop le: {timeframe}. Cho phep: {KL['timeframes']}")
+    # TM - #ORB - ORB Enhancement: nhan them khung on-demand (5m)
+    allowed = list(KL["timeframes"]) + _on_demand_timeframes()
+    if tf not in allowed:
+        raise ValueError(f"timeframe khong hop le: {timeframe}. Cho phep: {allowed}")
     return tf
 
 
@@ -635,12 +654,17 @@ def _merge_bars(old: list[Any], new: list[Any], cap: int) -> list[Any]:
 
 
 async def _fetch_one(client: httpx.AsyncClient, symbol: str,
-                     timeframe: str) -> dict[str, Any]:
+                     timeframe: str, limit: int | None = None,
+                     source: str = "manual") -> dict[str, Any]:
     params = {
         "symbol": symbol,
         "interval": timeframe,
-        "limit": int(FETCH["fetch_limit"]),
+        # TM - #ORB - ORB Enhancement: watch ORB chi can vai chuc nen M5
+        "limit": int(limit or FETCH["fetch_limit"]),
     }
+    # TM - #ORB - ORB Enhancement: moi request M5 deu de lai dau vet (TC-31)
+    if timeframe == "5m":
+        ORB_LOG("m5_request", symbol=symbol, limit=params["limit"], source=source)
     retries = max(1, int(FETCH.get("retry", 3)))
     last_exc: Exception | None = None
     for attempt in range(retries):
@@ -691,7 +715,8 @@ async def probe_symbol(symbol: str) -> None:
 
 
 async def fetch_all(symbols: list[str] | None = None,
-                    timeframes: list[str] | None = None) -> dict[str, Any]:
+                    timeframes: list[str] | None = None,
+                    source: str = "manual") -> dict[str, Any]:
     """Mot lan pull duy nhat tai mot thoi diem, du goi tu MCP tool hay vong lap nen.
 
     Chay song song nhung co gioi han: them nhieu cap ma ban het cung luc thi de
@@ -703,7 +728,8 @@ async def fetch_all(symbols: list[str] | None = None,
 
     async def one(client, symbol, tf):
         async with gate:
-            return (symbol, tf, await _fetch_one(client, symbol, tf))
+            # TM - #ORB - ORB Enhancement: ghi nguon goi de doi chieu request M5
+            return (symbol, tf, await _fetch_one(client, symbol, tf, source=source))
 
     async with FETCH_LOCK:
         async with httpx.AsyncClient() as client:
@@ -738,12 +764,169 @@ async def _fetcher_loop() -> None:
             await asyncio.sleep(interval)
         first = False
         try:
-            await fetch_all()
+            await fetch_all(source="fetcher")    # TM - #ORB - ORB Enhancement
         except asyncio.CancelledError:
             raise                      # tat server: de no thoat that
         except Exception as exc:
             FETCH_STATE["last_error"] = f"{type(exc).__name__}: {exc}"
             print(f"BAMCP fetcher loi: {FETCH_STATE['last_error']}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------- ORB
+# TM - #ORB - ORB Enhancement
+#
+# Logic nam o orb*.py, day chi noi cac ham doc/ghi san co cua server vao do:
+# file kline live, bias, journal, fetcher. Tham so chung o section `orb` trong
+# config.yaml; danh sach phien o session store do trang admin quan ly (BR-12).
+
+ORB_CFG: dict[str, Any] = CFG.get("orb") or {}
+if _env("BAMCP_ORB_ENABLED"):
+    ORB_CFG["enabled"] = _env("BAMCP_ORB_ENABLED").lower() in ("1", "true", "yes", "on")
+ORB_ENABLED = bool(ORB_CFG.get("enabled"))
+
+
+def _orb_path(value: Any, default: str) -> Path:
+    """Duong dan trong section orb: tuong doi thi tinh tu data_root."""
+    path = Path(str(value or default)).expanduser()
+    return path if path.is_absolute() else DATA_ROOT / path
+
+
+ORB_DATA_CFG = ORB_CFG.get("data") or {}
+ORB_SESSIONS_FILE = _orb_path(ORB_CFG.get("sessions_store_path"), "orb/sessions.json")
+ORB_NEWS_FILE = _orb_path((ORB_CFG.get("filters") or {}).get("news_days_file"),
+                          "orb/news_days.json")
+ORB_HISTORY_DIR = _orb_path(ORB_DATA_CFG.get("m5_history_path"), "orb/history")
+ORB_BACKTEST_DIR = _orb_path(ORB_DATA_CFG.get("backtest_output_path"), "orb/backtests")
+ORB_STATE_DIR = DATA_ROOT / "orb" / "state"
+ORB_LOG_DIR = DATA_ROOT / "orb" / "logs"
+# Dong skip de rieng: de vao journal chinh thi quota lenh/ngay va
+# reconcile_journal se dem nham mot lan bo phien thanh mot lenh.
+ORB_SKIPS_DIR = JOURNAL_DIR / "orb_skips"
+ORB_SYMBOL = str(ORB_CFG.get("symbol") or DEFAULT_SYMBOL).upper()
+ORB_CFG["symbol"] = ORB_SYMBOL
+ORB_HISTORY_YEARS = int(ORB_DATA_CFG.get("history_years") or 2)
+
+ORB_LOG = orb_runtime.EventLog(ORB_LOG_DIR)
+
+
+def _orb_load_live(symbol: str, timeframe: str) -> tuple[list[dict[str, Any]], int | None]:
+    """Nen trong file kline live + luc file duoc ghi (ms). Khong co file thi rong."""
+    path = _kline_path(symbol, timeframe)
+    try:
+        stamp = int(path.stat().st_mtime * 1000)
+        return _normalize_bars(_read_json(path, [])), stamp
+    except FileNotFoundError:
+        return [], None
+    except (OSError, ValueError) as exc:
+        ORB_LOG("data_error", symbol=symbol, timeframe=timeframe, error=str(exc))
+        return [], None
+
+
+def _orb_bias(symbol: str, day: str) -> dict[str, Any] | None:
+    """Bias da luu bang save_bias - cung nguon voi get_bias."""
+    data = _read_json(_bias_dir(symbol) / f"{day}.json", None)
+    return data if isinstance(data, dict) else None
+
+
+def _journal_rows(days: list[str]) -> list[dict[str, Any]]:
+    """Cac dong journal cua nhieu ngay, kem ngay cua file (_journal_date)."""
+    rows: list[dict[str, Any]] = []
+    for day in days:
+        data = _read_json(JOURNAL_DIR / f"{day}.json", [])
+        for row in data if isinstance(data, list) else []:
+            if isinstance(row, dict):
+                rows.append({**row, "_journal_date": day})
+    return rows
+
+
+async def _orb_fetch(symbol: str, timeframe: str, limit: int | None,
+                     source: str) -> dict[str, Any]:
+    """Keo mot khung cho scheduler ORB. Dung chung FETCH_LOCK voi fetcher nen
+    de hai ben khong ghi de cung mot file cung luc."""
+    async with FETCH_LOCK:
+        async with httpx.AsyncClient() as client:
+            return await _fetch_one(client, symbol, timeframe, limit=limit, source=source)
+
+
+ORB_HISTORY = orb_history.HistoryStore(
+    ORB_HISTORY_DIR, market=str(FETCH.get("market") or "futures"), log=ORB_LOG)
+
+
+async def _orb_history_update() -> dict[str, Any]:
+    return await asyncio.to_thread(ORB_HISTORY.update, ORB_SYMBOL, ORB_HISTORY_YEARS)
+
+
+ORB_SESSIONS: orb_runtime.SessionStore | None = None
+ORB_SVC: orb_runtime.OrbService | None = None
+ORB_SCHEDULER: orb_runtime.OrbScheduler | None = None
+ORB_BACKTEST: orb_backtest.BacktestManager | None = None
+
+if ORB_ENABLED:
+    ORB_SESSIONS = orb_runtime.SessionStore(
+        ORB_SESSIONS_FILE, ORB_CFG.get("default_sessions"), ORB_LOG)
+    ORB_SVC = orb_runtime.OrbService(
+        cfg=ORB_CFG, sessions=ORB_SESSIONS,
+        states=orb_runtime.StateStore(ORB_STATE_DIR), log=ORB_LOG,
+        load_live=_orb_load_live, load_history=ORB_HISTORY.load, get_bias=_orb_bias,
+        journal_rows=_journal_rows, skips_dir=ORB_SKIPS_DIR, news_file=ORB_NEWS_FILE, tz=TZ)
+    ORB_SCHEDULER = orb_runtime.OrbScheduler(
+        ORB_SVC, fetch=_orb_fetch, history_update=_orb_history_update,
+        history_ready=lambda: bool(ORB_HISTORY.files(ORB_SYMBOL)))
+    # Luu phien / log_trade / skip -> scheduler tinh lai lich ngay, khong cho vong sau
+    ORB_SVC.notify = ORB_SCHEDULER.wake
+    ORB_SESSIONS.listeners.append(ORB_SCHEDULER.wake)
+    ORB_BACKTEST = orb_backtest.BacktestManager(
+        ORB_BACKTEST_DIR, symbol=ORB_SYMBOL, history=ORB_HISTORY,
+        history_years=ORB_HISTORY_YEARS,
+        load_live_m5=lambda symbol: _orb_load_live(symbol, "5m")[0],
+        log=ORB_LOG, now_fn=orb_runtime.now_ms)
+
+
+def _orb() -> orb_runtime.OrbService:
+    if ORB_SVC is None:
+        raise ValueError("ORB dang tat: bat `orb.enabled` trong config.yaml "
+                         "(hoac BAMCP_ORB_ENABLED=true) roi restart.")
+    return ORB_SVC
+
+
+def _journal_filter(trades: list[dict[str, Any]], strategy: str = "",
+                    session_id: str = "") -> dict[str, Any]:
+    """Loc nhat ky theo strategy / phien, kem PnL tach theo strategy va phien (BR-10).
+
+    Dong cu chua co strategy duoc tinh la OTHER.
+    """
+    strategy = (strategy or "").strip().upper()
+    sid = (session_id or "").strip().lower()
+    if strategy and strategy not in orb.STRATEGIES:
+        raise ValueError(f"strategy phai la mot trong {list(orb.STRATEGIES)}")
+
+    def strat(row: dict[str, Any]) -> str:
+        return str(row.get("strategy") or "OTHER").upper()
+
+    picked = [t for t in trades
+              if (not strategy or strat(t) == strategy)
+              and (not sid or str(t.get("session_id") or "").lower() == sid)]
+
+    def summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        closed = [float(t["pnl"]) for t in rows if t.get("pnl") is not None]
+        return {"trades": len(rows), "closed": len(closed), "open": len(rows) - len(closed),
+                "wins": sum(1 for p in closed if p > 0),
+                "losses": sum(1 for p in closed if p < 0),
+                "realized_pnl": round(sum(closed), 2)}
+
+    by_strategy: dict[str, list[dict[str, Any]]] = {}
+    by_session: dict[str, list[dict[str, Any]]] = {}
+    for row in picked:
+        by_strategy.setdefault(strat(row), []).append(row)
+        if row.get("session_id"):
+            by_session.setdefault(str(row["session_id"]), []).append(row)
+    return {
+        "filter": {"strategy": strategy or None, "session_id": sid or None},
+        **summary(picked),
+        "by_strategy": {k: summary(v) for k, v in sorted(by_strategy.items())},
+        "by_session": {k: summary(v) for k, v in sorted(by_session.items())},
+        "rows": picked,
+    }
 
 
 TRADE_TYPES = ("scalp", "swing")
@@ -885,7 +1068,25 @@ def list_timeframes() -> dict[str, Any]:
         "last_fetch": FETCH_STATE["last_run"],
         "last_fetch_error": FETCH_STATE["last_error"],
         "symbols": rows,
+        # TM - #ORB - ORB Enhancement: khung chi keo theo yeu cau + M5 lich su
+        "on_demand_timeframes": _orb_on_demand_view(),
+        "orb_m5_history": ORB_HISTORY.status(ORB_SYMBOL) if ORB_ENABLED else None,
     }
+
+
+def _orb_on_demand_view() -> list[dict[str, Any]]:
+    """Khung on-demand (5m): fetcher nen khong keo, chi refresh_data / watch ORB."""
+    out = []
+    for tf in _on_demand_timeframes():
+        path = _kline_path(ORB_SYMBOL, tf)
+        item: dict[str, Any] = {"symbol": ORB_SYMBOL, "timeframe": tf,
+                                "exists": path.exists(),
+                                "pulled_by": "refresh_data / ORB watch (khong theo fetcher nen)"}
+        if path.exists():
+            item["updated_at"] = datetime.fromtimestamp(
+                path.stat().st_mtime, TZ).strftime("%Y-%m-%d %H:%M:%S")
+        out.append(item)
+    return out
 
 @mcp.tool()
 def get_klines(timeframe: str, symbol: str = "", limit: int = 0,
@@ -925,21 +1126,36 @@ def get_klines(timeframe: str, symbol: str = "", limit: int = 0,
 
 
 @mcp.tool()
-async def refresh_data(symbol: str = "", timeframes: list[str] | None = None) -> dict[str, Any]:
+async def refresh_data(symbol: str = "", timeframes: list[str] | None = None,
+                       history: bool = False) -> dict[str, Any]:
     """Keo du lieu moi nhat tu Binance ngay lap tuc, khong cho den chu ky tiep theo.
 
     symbol: bo trong = TAT CA cac cap dang bat. Dien ten de chi keo mot cap.
     Dung khi can gia moi nhat truoc luc tim entry.
+    timeframes: bo trong = cac khung thuong. Khung on-demand (vd "5m") chi duoc keo
+      khi ghi ro o day - fetcher nen khong bao gio keo M5.
+    history: True = tai/cap nhat M5 lich su (data.binance.vision) cho backtest ORB.
+      Lan dau co the mat vai phut.
     """
     symbols = [_resolve_symbol(symbol)] if symbol else _symbols()
-    targets = timeframes or KL["timeframes"]
-    for tf in targets:
-        _validate_timeframe(tf)
-    return {
+    targets = [_validate_timeframe(tf) for tf in (timeframes or KL["timeframes"])]
+    out: dict[str, Any] = {
         "refreshed_at": _now_iso(),
         "symbols": symbols,
-        "results": await fetch_all(symbols, targets),
+        # TM - #ORB - ORB Enhancement: ghi nguon de phan biet voi M5 do watch ORB keo
+        "results": await fetch_all(symbols, targets, source="refresh_data"),
     }
+    if history:
+        # TM - #ORB - ORB Enhancement
+        if not ORB_ENABLED:
+            raise ValueError("M5 lich su chi dung cho ORB - bat orb.enabled truoc.")
+        report = await _orb_history_update()
+        out["orb_history"] = {
+            **{k: report.get(k) for k in ("from", "to", "missing_remote", "errors")},
+            "downloaded": len(report.get("downloaded") or []),
+            "status": ORB_HISTORY.status(ORB_SYMBOL),
+        }
+    return out
 
 
 @mcp.tool()
@@ -1068,7 +1284,8 @@ def update_rules(changes: dict[str, float], reason: str,
 
 
 @mcp.tool()
-async def get_today_status(date: str = "", symbol: str = "") -> dict[str, Any]:
+async def get_today_status(date: str = "", symbol: str = "", strategy: str = "",
+                           session_id: str = "") -> dict[str, Any]:
     """Kiem tra quota lenh va PnL trong ngay truoc khi vao lenh moi.
 
     Quota lenh, margin va daily_stop_loss dung CHUNG cho moi cap - het la het,
@@ -1076,12 +1293,18 @@ async def get_today_status(date: str = "", symbol: str = "") -> dict[str, Any]:
 
     symbol: dien ten cap de khoi 'rules' tra ve dung nguong SL/TP/swing cua cap
       do. Bo trong = rule chung + gia tri mac dinh.
+    strategy / session_id: loc them nhat ky theo chien luoc (ORB/WYCKOFF/OTHER)
+      va phien ORB - ket qua o khoi 'filtered'. Quota va daily stop VAN tinh tren
+      toan bo lenh trong ngay, khong tach theo strategy.
 
     Khi account.enabled = true, khoi 'exchange' chua so THAT lay tu san va
     'can_trade' duoc tinh theo so that do, khong phai theo nhat ky tu khai.
     """
     day = date or _today()
     sym = _resolve_symbol(symbol) if symbol else ""
+    # TM - #ORB - ORB Enhancement: loc sai thi bao truoc khi goi san
+    filtered = (_journal_filter([], strategy, session_id)
+                if (strategy or session_id) else None)
     rules = _load_rules(sym)
     trades = _read_json(JOURNAL_DIR / f"{day}.json", [])
     closed = [t for t in trades if t.get("pnl") is not None]
@@ -1127,6 +1350,18 @@ async def get_today_status(date: str = "", symbol: str = "") -> dict[str, Any]:
     remaining = max(0, int(rules["max_trades_per_day"]) - trades_counted)
     stop_hit = pnl_counted <= float(rules["daily_stop_loss"])
 
+    extra: dict[str, Any] = {}
+    if filtered is not None:
+        # TM - #ORB - ORB Enhancement: chi them khoa moi, khoa cu giu nguyen
+        extra["filtered"] = _journal_filter(trades, strategy, session_id)
+        if filtered["filter"]["strategy"] in (None, "ORB"):
+            skips = _read_json(ORB_SKIPS_DIR / f"{day}.json", [])
+            sid = filtered["filter"]["session_id"]
+            extra["orb_skips"] = [s for s in (skips if isinstance(skips, list) else [])
+                                  if not sid or s.get("session_id") == sid]
+        extra["filtered_note"] = ("PnL o 'filtered' lay tu nhat ky tu khai - san khong "
+                                  "biet lenh nao thuoc strategy nao.")
+
     return {
         "date": day,
         "symbol": sym or None,
@@ -1153,6 +1388,7 @@ async def get_today_status(date: str = "", symbol: str = "") -> dict[str, Any]:
         "rules_changed_today": edits,
         "exchange": exchange_block,
         "trades": trades,
+        **extra,
     }
 
 
@@ -1167,6 +1403,12 @@ def log_trade(
     trade_type: str = "scalp",
     setup: str = "",
     date: str = "",
+    strategy: str = "OTHER",
+    variant: str = "",
+    session_id: str = "",
+    or_date: str = "",
+    or_high: float = 0.0,
+    or_low: float = 0.0,
 ) -> dict[str, Any]:
     """Ghi mot lenh vua vao. Tra ve canh bao neu pham rule, nhung van ghi de nhat ky dung thuc te.
 
@@ -1176,9 +1418,19 @@ def log_trade(
     trade_type: scalp (mac dinh, han muc chat) hoac swing (han muc rong hon).
       Khai swing ma TP khong dat nguong swing_min_take_profit_points CUA CAP DO
       thi lenh tu dong bi ha xuong han muc scalp - dan nhan khong lach duoc.
+    strategy: ORB | WYCKOFF | OTHER (mac dinh OTHER).
+    Chi cho strategy = ORB:
+      session_id (bat buoc), variant (breakout | retest | reversal),
+      or_date (ngay cua phien, bo trong = phien dang chay),
+      or_high / or_low (bo trong = lay OR he thong da tinh).
+      Kiem tra them trade window, max_trades cua phien, max_orb_trades_per_day,
+      range bi loc, phien da skip. Ghi xong thi watch cua phien dung (taken).
     """
     day = date or _today()
     sym = _resolve_symbol(symbol)
+    # TM - #ORB - ORB Enhancement: kiem tra truoc khi ghi de input sai khong de lai dong rac
+    tag = _strategy_fields(strategy, variant, session_id, or_date, or_high, or_low)
+    orb_checks = _orb_trade_checks(tag, sym)
     path = JOURNAL_DIR / f"{day}.json"
     trades = _read_json(path, [])
     realized = round(sum(float(t["pnl"]) for t in trades if t.get("pnl") is not None), 2)
@@ -1190,6 +1442,12 @@ def log_trade(
         rules=rules, realized=realized,
     )
     violations = verdict["rule_violations"]
+    if orb_checks:
+        violations = violations + orb_checks["violations"]
+        tag["or_date"] = orb_checks["or_date"]
+        rng = orb_checks["opening_range"]
+        tag["or_high"] = tag["or_high"] if tag["or_high"] is not None else rng.get("high")
+        tag["or_low"] = tag["or_low"] if tag["or_low"] is not None else rng.get("low")
 
     trade = {
         "id": len(trades) + 1,
@@ -1213,21 +1471,76 @@ def log_trade(
         "limits_applied": verdict["limits_applied"],
         "demoted_to_scalp": verdict["demoted_to_scalp"],
         "rule_violations": violations,
+        # TM - #ORB - ORB Enhancement
+        **tag,
     }
     trades.append(trade)
     _write_json(path, trades)
-    return {
+    out = {
         "logged": True,
         "trade": trade,
         "rule_violations": violations,
         "rules_changed_today": _changed_today(_rules_history(), day),
     }
+    if orb_checks:
+        # TM - #ORB - ORB Enhancement: da vao lenh thi dung watch phien (BR-04)
+        out["orb_checks"] = orb_checks
+        out["orb_watch"] = _orb().mark_taken(
+            orb_checks["session_id"], orb_checks["or_date"], {**trade, "_journal_date": day})
+    return out
+
+
+def _strategy_fields(strategy: str, variant: str, session_id: str, or_date: str,
+                     or_high: float, or_low: float) -> dict[str, Any]:
+    """Chuan hoa cac truong strategy cua log_trade (muc 4.6).
+
+    Lenh khong phai ORB chi mang them 'strategy'; truong ORB ma di kem strategy
+    khac la nham lan - bao loi thay vi ghi am tham.
+    """
+    # TM - #ORB - ORB Enhancement
+    name = (strategy or "OTHER").strip().upper()
+    if name not in orb.STRATEGIES:
+        raise ValueError(f"strategy phai la mot trong {list(orb.STRATEGIES)}")
+    variant = (variant or "").strip().lower()
+    if name != "ORB":
+        if variant or session_id or or_date or or_high or or_low:
+            raise ValueError("variant/session_id/or_date/or_high/or_low chi dung cho "
+                             "strategy = ORB")
+        return {"strategy": name}
+    if not (session_id or "").strip():
+        raise ValueError("strategy = ORB bat buoc co session_id")
+    if variant and variant not in orb.VARIANTS:
+        raise ValueError(f"variant phai la mot trong {list(orb.VARIANTS)}")
+    if or_date:
+        orb.parse_date(or_date)
+    if (or_high or or_low) and not (float(or_high) > float(or_low) > 0):
+        raise ValueError("or_high phai lon hon or_low va ca hai > 0")
+    return {
+        "strategy": name,
+        "variant": variant or None,
+        "session_id": session_id.strip().lower(),
+        "or_date": or_date or None,
+        "or_high": float(or_high) if or_high else None,
+        "or_low": float(or_low) if or_low else None,
+    }
+
+
+def _orb_trade_checks(tag: dict[str, Any], symbol: str) -> dict[str, Any] | None:
+    """Quy tac ORB (BR-11) cho log_trade / check_trade. None neu khong phai ORB."""
+    # TM - #ORB - ORB Enhancement
+    if tag.get("strategy") != "ORB":
+        return None
+    checks = _orb().orb_checks(tag["session_id"], tag.get("or_date") or "")
+    if symbol != ORB_SYMBOL:
+        checks["violations"].append(f"ORB chi chay tren {ORB_SYMBOL}, lenh nay la {symbol}")
+    return checks
 
 
 @mcp.tool()
 def check_trade(side: str, entry: float, stop: float, target: float,
                 margin_usd: float, symbol: str = "", trade_type: str = "scalp",
-                date: str = "") -> dict[str, Any]:
+                date: str = "", strategy: str = "OTHER", session_id: str = "",
+                or_date: str = "") -> dict[str, Any]:
     """Cham thu mot lenh theo rule ma KHONG ghi vao nhat ky.
 
     Dung truoc khi bam lenh: xem no duoc xep scalp hay swing, han muc nao ap
@@ -1236,9 +1549,14 @@ def check_trade(side: str, entry: float, stop: float, target: float,
     symbol: bo trong = cap mac dinh. Nguong diem (SL toi da, TP toi thieu,
       nguong swing) lay theo dung cap nay, nen cham cung mot bo so tren hai cap
       khac nhau co the ra hai ket qua khac nhau - do la co y.
+    strategy = ORB (can session_id): cham them trade window, max_trades cua phien,
+      max_orb_trades_per_day, range bi loc, phien da skip - xem khoi 'orb_checks'.
     """
     day = date or _today()
     sym = _resolve_symbol(symbol)
+    # TM - #ORB - ORB Enhancement
+    tag = _strategy_fields(strategy, "", session_id, or_date, 0.0, 0.0)
+    orb_checks = _orb_trade_checks(tag, sym)
     trades = _read_json(JOURNAL_DIR / f"{day}.json", [])
     realized = round(sum(float(t["pnl"]) for t in trades if t.get("pnl") is not None), 2)
 
@@ -1247,12 +1565,19 @@ def check_trade(side: str, entry: float, stop: float, target: float,
         margin_usd=margin_usd, trade_type=trade_type, trades=trades,
         rules=_load_rules(sym), realized=realized,
     )
-    return {
+    out = {
         "date": day,
         "would_pass": not verdict["rule_violations"],
         "logged": False,
         **verdict,
     }
+    if orb_checks:
+        # TM - #ORB - ORB Enhancement: gop vi pham ORB vao cung danh sach
+        out["rule_violations"] = verdict["rule_violations"] + orb_checks["violations"]
+        out["would_pass"] = not out["rule_violations"]
+        out["strategy"] = "ORB"
+        out["orb_checks"] = orb_checks
+    return out
 
 
 @mcp.tool()
@@ -1608,15 +1933,39 @@ async def get_fills(date: str = "", symbol: str = "") -> dict[str, Any]:
 
 
 @mcp.tool()
-async def get_account_pnl(date: str = "", symbol: str = "") -> dict[str, Any]:
+async def get_account_pnl(date: str = "", symbol: str = "", strategy: str = "",
+                          session_id: str = "") -> dict[str, Any]:
     """PnL THUC trong ngay, tach rieng lai/lo, phi giao dich va funding.
 
     symbol: bo trong = cong gop tat ca cac cap dang theo doi.
     Khac realized_pnl trong get_today_status o cho so nay lay tu sao ke cua san
     nen da bao gom phi va funding - thuong xau hon so tu khai.
+    strategy / session_id: them khoi 'journal_filtered' - PnL theo strategy/phien
+      lay tu NHAT KY, vi san khong biet lenh nao thuoc strategy nao.
     """
-    data = await _account_day(date or _today(),
-                              [_resolve_symbol(symbol)] if symbol else None)
+    day = date or _today()
+    symbols = [_resolve_symbol(symbol)] if symbol else None
+    if strategy or session_id:
+        # TM - #ORB - ORB Enhancement: loc theo strategy van tra duoc khi san loi/tat
+        rows = _read_json(JOURNAL_DIR / f"{day}.json", [])
+        if symbols:
+            rows = [r for r in rows if str(r.get("symbol") or DEFAULT_SYMBOL) == symbols[0]]
+        journal = _journal_filter(rows, strategy, session_id)
+        note = ("journal_filtered lay tu nhat ky tu khai (khong gom phi/funding that). "
+                "San khong tach duoc PnL theo strategy.")
+        try:
+            data = await _account_day(day, symbols)
+        except Exception as exc:
+            return {"date": day, "exchange_error": str(exc),
+                    "journal_filtered": journal, "journal_note": note}
+        out = _account_pnl_view(data)
+        out.update(journal_filtered=journal, journal_note=note)
+        return out
+    data = await _account_day(day, symbols)
+    return _account_pnl_view(data)
+
+
+def _account_pnl_view(data: dict[str, Any]) -> dict[str, Any]:
     return {
         "date": data["date"],
         "exchange": data["exchange"],
@@ -1683,6 +2032,162 @@ async def reconcile_journal(date: str = "") -> dict[str, Any]:
             **data["totals"],
             "by_symbol": {s: d["totals"] for s, d in data["per_symbol"].items()},
         },
+    }
+
+
+# ---------------------------------------------------------------- ORB tools
+# TM - #ORB - ORB Enhancement
+
+def _orb_as_of() -> dict[str, Any]:
+    now = _orb().now()
+    return {"as_of_utc": iso_utc(now), "as_of_vn": iso_vn(now), "symbol": ORB_SYMBOL}
+
+
+@mcp.tool()
+def list_orb_sessions(include_disabled: bool = False) -> dict[str, Any]:
+    """Cac phien ORB: gio mo ke tiep (UTC + gio VN), job co dang chay khong, watch M5.
+
+    include_disabled: True = liet ke ca phien dang tat.
+    Them/sua/tat phien o trang admin (admin_path), khong can restart.
+    """
+    svc = _orb()
+    return {**_orb_as_of(), "admin_path": ADMIN_ORB_PATH,
+            "sessions": svc.list_sessions(include_disabled)}
+
+
+@mcp.tool()
+def get_opening_range(session_id: str = "", date: str = "") -> dict[str, Any]:
+    """Opening Range = nen M15 DAU TIEN cua phien (da dong), kem ATR va co loc range.
+
+    session_id: bo trong = moi phien dang bat.
+    date: ngay theo TIMEZONE CUA PHIEN (YYYY-MM-DD). Bo trong = phien gan nhat
+      (phien hom qua neu trade window cua no con chua het).
+    status: no_session | pending | forming | set | data_missing.
+    range_flag: ok | too_narrow | too_wide (so voi ATR H1).
+    """
+    svc = _orb()
+    now = svc.now()
+    day = orb.parse_date(date) if date else None
+    rows = []
+    for session in svc.resolve(session_id, include_disabled=bool(session_id)):
+        rows.append(svc.opening_range(session, day or svc.default_day(session, now), now))
+    return {**_orb_as_of(), "sessions": rows}
+
+
+@mcp.tool()
+def check_orb_signal(session_id: str = "", as_of: str = "",
+                     risk_usd: float = 0.0) -> dict[str, Any]:
+    """Trang thai tin hieu ORB + ke hoach lenh (entry/SL/TP/qty) neu co.
+
+    session_id: bo trong = moi phien dang bat.
+    as_of: thoi diem UTC (ISO) de xem lai qua khu. Bo trong = bay gio.
+    risk_usd: > 0 thi ghi de risk.risk_usd trong config cho lan tinh nay.
+    state: WAITING_OPEN, FORMING, RANGE_SET, BREAKOUT_LONG/SHORT,
+      FAILED_BREAKOUT_LONG/SHORT, FILTERED, EXPIRED, SKIPPED, TAKEN.
+    Chi doc du lieu da co - khong keo M5 (scheduler lo viec do, BR-03).
+    Danh gia VSA cua trigger_candle la viec cua Claude, tool chi tra so.
+    """
+    svc = _orb()
+    now = svc.now()
+    at = orb.parse_utc(as_of) if as_of else now
+    if at > now + 1000:
+        raise ValueError(f"as_of o tuong lai ({iso_utc(at)} > {iso_utc(now)})")
+    if risk_usd and float(risk_usd) <= 0:
+        raise ValueError("risk_usd phai > 0")
+    rows = []
+    for session in svc.resolve(session_id, include_disabled=bool(session_id)):
+        rows.append(svc.signal(session, svc.default_day(session, at), at,
+                               risk_usd=float(risk_usd) if risk_usd else None))
+    return {"as_of_utc": iso_utc(at), "as_of_vn": iso_vn(at), "symbol": ORB_SYMBOL,
+            "replay": at < now - 1000, "sessions": rows,
+            "note": "BAMCP khong dat lenh. Vao lenh thi check_trade -> dat tay -> "
+                    "log_trade(strategy=ORB, session_id); bo thi skip_orb_session."}
+
+
+@mcp.tool()
+def skip_orb_session(session_id: str, reason: str) -> dict[str, Any]:
+    """Bo phien ORB hom nay (vd gia da chay xa vung entry). Dung pull M5 cua phien.
+
+    reason: bat buoc, ghi ro vi sao bo. Duoc luu vao journal ORB (variant=skipped)
+      de thong ke so lan bo lo. Phien da TAKEN/da dung thi tra trang thai hien tai.
+    """
+    return _orb().skip(session_id, reason)
+
+
+@mcp.tool()
+async def backtest_orb(from_date: str, to_date: str, session_ids: list[str] | None = None,
+                       split_date: str = "", overrides: dict[str, Any] | None = None,
+                       initial_equity: float = 100.0) -> dict[str, Any]:
+    """Backtest ORB tren M5 lich su, tra ve ban tom tat (khong tra du lieu tho).
+
+    from_date / to_date: YYYY-MM-DD (ngay cua phien).
+    session_ids: bo trong = moi phien dang bat.
+    split_date: moc chia in-sample / out-of-sample (mac dinh 70% dau la in-sample).
+    overrides: ghi de tham so, vd {"entry_mode": "retest", "tp_r": 2}.
+    Lan dau phai tai M5 lich su nen co the > 60 giay: khi do tra status=running
+    kem run_id, goi get_backtest_result(run_id) sau.
+    """
+    svc = _orb()
+    from_day, to_day = orb.parse_date(from_date), orb.parse_date(to_date)
+    today = datetime.fromtimestamp(svc.now() / 1000, ZoneInfo("UTC")).date()
+    if to_day < from_day:
+        raise ValueError("to_date phai sau from_date")
+    if to_day > today:
+        raise ValueError(f"to_date khong duoc o tuong lai (hom nay UTC: {today})")
+    if (to_day - from_day).days > 5 * 366:
+        raise ValueError("khoang backtest toi da 5 nam")
+    split_day = orb.parse_date(split_date) if split_date else None
+    if split_day and not from_day < split_day <= to_day:
+        raise ValueError("split_date phai nam trong (from_date, to_date]")
+    if float(initial_equity) <= 0:
+        raise ValueError("initial_equity phai > 0")
+    flat = orb.normalize_overrides(overrides)
+    if session_ids:
+        sessions = [svc.resolve(sid, include_disabled=True)[0] for sid in session_ids]
+    else:
+        sessions = svc.resolve()
+    if not sessions:
+        raise ValueError("khong co phien ORB nao dang bat de backtest")
+    for session in sessions:
+        svc.params(session, flat)          # overrides sai thi bao ngay, truoc khi tai du lieu
+    request = {"from_day": from_day, "to_day": to_day, "split_day": split_day,
+               "overrides": flat, "initial_equity": float(initial_equity)}
+    return await ORB_BACKTEST.run(request, sessions, ORB_CFG, svc.news_days())
+
+
+@mcp.tool()
+def get_backtest_result(run_id: str) -> dict[str, Any]:
+    """Ket qua mot lan backtest_orb (cung dang output). status: running | done | error."""
+    _orb()
+    try:
+        return ORB_BACKTEST.result(run_id)
+    except ValueError as exc:
+        raise ValueError(f"{exc}. Cac run gan day: {ORB_BACKTEST.runs(10)}") from None
+
+
+@mcp.tool()
+def get_orb_config() -> dict[str, Any]:
+    """Cau hinh ORB dang ap dung (read-only): tham so chung, tham so da giai cho tung
+    phien (sau override), duong dan du lieu. Doi tham so chung o config.yaml,
+    doi phien o trang admin."""
+    svc = _orb()
+    sessions = svc.resolve(include_disabled=True)
+    return {
+        **_orb_as_of(),
+        "enabled": ORB_ENABLED,
+        "config": ORB_CFG,
+        "effective_defaults": svc.params(),
+        "sessions": [{"session_id": s["session_id"], "enabled": s["enabled"],
+                      "overrides": s["overrides"], "params": svc.params(s)}
+                     for s in sessions],
+        "news_days": svc.news_days(),
+        "paths": {"sessions": str(ORB_SESSIONS_FILE), "news_days": str(ORB_NEWS_FILE),
+                  "m5_history": str(ORB_HISTORY_DIR), "backtests": str(ORB_BACKTEST_DIR),
+                  "state": str(ORB_STATE_DIR), "logs": str(ORB_LOG_DIR),
+                  "skips": str(ORB_SKIPS_DIR)},
+        "admin_path": ADMIN_ORB_PATH,
+        "note": ("Moi gio deu tinh theo timezone cua tung phien (tu xu ly DST), hien thi "
+                 "UTC + gio VN. Phi va truot gia da tinh vao R."),
     }
 
 
@@ -1761,6 +2266,8 @@ async def http_admin(request):
         symbol_overrides={s: sorted(o) for s, o in doc["symbols"].items()},
         global_rule_keys=GLOBAL_RULE_KEYS,
         symbol_rule_keys=SYMBOL_RULE_KEYS,
+        # TM - #ORB - ORB Enhancement
+        orb_path=ADMIN_ORB_PATH if ORB_ENABLED else "",
     )
     return HTMLResponse(page, headers={"Cache-Control": "no-store"})
 
@@ -1929,6 +2436,55 @@ async def http_admin_test(request):
 
 # ---------------------------------------------------------------- health
 
+# TM - #ORB - ORB Enhancement: trang quan ly phien ORB (BR-12)
+ADMIN_ORB_PATH = ADMIN_PATH.rstrip("/") + "/orb"
+ADMIN_ORB_ACTION_PATH = ADMIN_ORB_PATH + "/sessions"
+
+
+def _orb_admin_page() -> str:
+    svc = _orb()
+    return admin_orb.render(
+        rows=svc.list_sessions(include_disabled=True),
+        sessions=ORB_SESSIONS.all(include_disabled=True),
+        history=ORB_SESSIONS.history(20),
+        action_path=ADMIN_ORB_ACTION_PATH,
+        admin_path=ADMIN_PATH,
+        store_path=str(ORB_SESSIONS_FILE),
+        global_params=svc.params(),
+        setup_required=not STORE.has_auth(),
+        now_ms=svc.now(),
+    )
+
+
+@mcp.custom_route(ADMIN_ORB_PATH, methods=["GET"])
+async def http_admin_orb(request):
+    from starlette.responses import HTMLResponse
+    if not ORB_ENABLED:
+        return HTMLResponse(
+            "<p>ORB dang tat. Bat <code>orb.enabled</code> trong config.yaml roi restart.</p>",
+            status_code=404, headers={"Cache-Control": "no-store"})
+    page = await asyncio.to_thread(_orb_admin_page)
+    return HTMLResponse(page, headers={"Cache-Control": "no-store"})
+
+
+@mcp.custom_route(ADMIN_ORB_ACTION_PATH, methods=["POST"])
+async def http_admin_orb_sessions(request):
+    if not ORB_ENABLED:
+        return JSONResponse({"error": "ORB dang tat"}, status_code=404)
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "body khong phai JSON"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "body phai la object"}, status_code=400)
+    if not _setup_ok(payload):
+        return JSONResponse({"error": "Setup token sai"}, status_code=403)
+    status, body = await asyncio.to_thread(
+        admin_orb.handle, payload, sessions=ORB_SESSIONS, now_ms=ORB_SVC.now(),
+        params_for=ORB_SVC.params)
+    return JSONResponse(body, status_code=status)
+
+
 @mcp.custom_route(SRV.get("health_path", "/healthz"), methods=["GET"])
 async def http_health(request):
     """Public, khong can auth. Dung cho Docker HEALTHCHECK va proxy."""
@@ -2009,7 +2565,9 @@ def build_app():
             store=STORE,
             realm=AUTH_REALM,
             public_paths=(SRV["health_path"],),
-            setup_paths=(ADMIN_PATH, ADMIN_SAVE_PATH, ADMIN_TEST_PATH, ADMIN_SYMBOL_PATH),
+            setup_paths=(ADMIN_PATH, ADMIN_SAVE_PATH, ADMIN_TEST_PATH, ADMIN_SYMBOL_PATH,
+                         # TM - #ORB - ORB Enhancement
+                         ADMIN_ORB_PATH, ADMIN_ORB_ACTION_PATH),
         )
 
     inner = app.router.lifespan_context
@@ -2017,14 +2575,18 @@ def build_app():
     @contextlib.asynccontextmanager
     async def lifespan(scope):
         task = asyncio.create_task(_fetcher_loop()) if FETCH.get("enabled") else None
+        # TM - #ORB - ORB Enhancement: scheduler ORB song cung vong doi app nhu fetcher
+        orb_task = (asyncio.create_task(ORB_SCHEDULER.run_forever())
+                    if ORB_SCHEDULER is not None else None)
         try:
             async with inner(scope):
                 yield
         finally:
-            if task:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+            for running in (task, orb_task):
+                if running:
+                    running.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await running
 
     app.router.lifespan_context = lifespan
     return app
@@ -2033,6 +2595,11 @@ def build_app():
 if __name__ == "__main__":
     for directory in (KLINES_DIR, BIAS_DIR, JOURNAL_DIR):
         directory.mkdir(parents=True, exist_ok=True)
+    # TM - #ORB - ORB Enhancement
+    if ORB_ENABLED:
+        for directory in (ORB_STATE_DIR, ORB_LOG_DIR, ORB_SKIPS_DIR, ORB_HISTORY_DIR,
+                          ORB_BACKTEST_DIR, ORB_SESSIONS_FILE.parent):
+            directory.mkdir(parents=True, exist_ok=True)
     _migrate_flat_layout()
 
     _seed_settings()
@@ -2060,6 +2627,13 @@ if __name__ == "__main__":
 
     print(f"BAMCP data_root={DATA_ROOT} symbol={FETCH.get('symbol')} "
           f"market={FETCH.get('market')} fetcher={bool(FETCH.get('enabled'))}", file=sys.stderr)
+    # TM - #ORB - ORB Enhancement
+    if ORB_ENABLED:
+        print(f"BAMCP ORB: symbol={ORB_SYMBOL} sessions={ORB_SESSIONS.ids()} "
+              f"admin={ADMIN_ORB_PATH} m5_history={'co' if ORB_HISTORY.files(ORB_SYMBOL) else 'chua tai'}",
+              file=sys.stderr)
+    else:
+        print("BAMCP ORB: tat (orb.enabled = false)", file=sys.stderr)
 
     uvicorn.run(
         build_app(),
