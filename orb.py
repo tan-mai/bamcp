@@ -21,6 +21,8 @@ from datetime import date, datetime, time as dtime, timedelta, timezone
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
+import orb_rules  # TM - #ORB-RULES - ORB Rule Set
+
 UTC = timezone.utc
 # Gio VN co dinh UTC+7, khong co DST. Dung offset co dinh de khong phu thuoc
 # bien TZ cua container.
@@ -282,13 +284,16 @@ def previous_trade_day(session: dict[str, Any], day: date, max_days: int = 30) -
 
 # Ten phang -> (section trong config orb, key, kieu, rang buoc).
 # Section None = key nam thang o goc section orb.
+# TM - #ORB-RULES - ORB Rule Set: bo khoi risk va max_orb_trades_per_day (BR-ORB-18).
+# Cac khoa trong RULE_PARAM_KEYS van giu section de doc override long cua phien
+# ({"exit": {"tp_r": 2}}), nhung gia tri lay tu bo rule ORB, khong tu config.yaml.
 PARAM_SPEC: dict[str, tuple[str | None, str, str, Any]] = {
     "entry_mode": ("entry", "mode", "choice", ENTRY_MODES),
     "buffer_pct": ("entry", "buffer_pct", "float", (0.0, 5.0)),
     "allow_reversal": ("entry", "allow_reversal", "bool", None),
     "failed_lookback_bars": ("entry", "failed_lookback_bars", "int", (1, 36)),
     "sl_mode": ("exit", "sl_mode", "choice", SL_MODES),
-    "tp_r": ("exit", "tp_r", "float", (0.1, 20.0)),
+    "tp_r": ("exit", "tp_r", "float", (0.0, 20.0)),
     "move_sl_to_be_at_r": ("exit", "move_sl_to_be_at_r", "float", (0.0, 20.0)),
     "time_exit_minutes": ("exit", "time_exit_minutes", "int", (5, 1440)),
     "atr_period": ("filters", "atr_period", "int", (2, 100)),
@@ -296,26 +301,27 @@ PARAM_SPEC: dict[str, tuple[str | None, str, str, Any]] = {
     "max_or_atr_ratio": ("filters", "max_or_atr_ratio", "float", (0.0, 10.0)),
     "use_bias_filter": ("filters", "use_bias_filter", "bool", None),
     "skip_news_days": ("filters", "skip_news_days", "bool", None),
-    "account_equity": ("risk", "account_equity", "float", (1.0, 1e9)),
-    "risk_usd": ("risk", "risk_usd", "float", (0.01, 1e7)),
-    "max_margin_usd": ("risk", "max_margin_usd", "float", (0.01, 1e9)),
-    "max_leverage": ("risk", "max_leverage", "float", (1.0, 125.0)),
     "taker_fee_pct": ("costs", "taker_fee_pct", "float", (0.0, 1.0)),
     "slippage_pct": ("costs", "slippage_pct", "float", (0.0, 1.0)),
     "qty_step": ("exchange_limits", "qty_step", "float", (1e-8, 1e6)),
     "min_notional_usd": ("exchange_limits", "min_notional_usd", "float", (0.0, 1e9)),
     "trade_window_minutes": ("defaults", "trade_window_minutes", "int", (15, 720)),
     "max_trades": ("defaults", "max_trades", "int", (1, 20)),
-    "max_orb_trades_per_day": (None, "max_orb_trades_per_day", "int", (1, 50)),
 }
 # Phien chi duoc ghi de nhom entry/exit/filters (muc 4.9)
 SESSION_OVERRIDE_SECTIONS = ("entry", "exit", "filters")
 SESSION_OVERRIDE_KEYS = tuple(k for k, spec in PARAM_SPEC.items()
                               if spec[0] in SESSION_OVERRIDE_SECTIONS)
+# TM - #ORB-RULES - ORB Rule Set: tham so doc tu bo rule ORB (BR-ORB-16, BR-ORB-17)
+RULE_PARAM_KEYS = orb_rules.SESSION_FIELDS
+# Override cua phien sua tren form phien; nhom rule thi sua o muc "Rule ORB"
+SESSION_FORM_KEYS = tuple(k for k in SESSION_OVERRIDE_KEYS if k not in RULE_PARAM_KEYS)
 
 
 def coerce_param(key: str, value: Any) -> Any:
     """Ep kieu + kiem tra rang buoc. Nem ValueError voi thong bao ro rang."""
+    if key in RULE_PARAM_KEYS:
+        return orb_rules.coerce(key, value)  # TM - #ORB-RULES - ORB Rule Set
     if key not in PARAM_SPEC:
         raise ValueError(f"tham so khong ho tro: {key}. Cho phep: {sorted(PARAM_SPEC)}")
     _section, _name, kind, rule = PARAM_SPEC[key]
@@ -378,24 +384,51 @@ def normalize_overrides(raw: Any, allowed: Iterable[str] | None = None) -> dict[
 
 
 def effective_params(cfg: dict[str, Any], session: dict[str, Any] | None = None,
-                     overrides: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Tham so phang da giai: config chung < gia tri rieng cua phien < overrides."""
+                     overrides: dict[str, Any] | None = None,
+                     rules: dict[str, Any] | None = None,
+                     rules_override: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Tham so phang da giai.
+
+    Tham so ky thuat (entry.mode, ATR, phi, exchange_limits...): config chung <
+    gia tri rieng cua phien < overrides.
+    TM - #ORB-RULES - ORB Rule Set: nhom rule (RULE_PARAM_KEYS, nguong cham lenh,
+    sizing) lay tu khoi `orb` cua rules.json qua orb_rules.resolve. `rules` None
+    thi dung khoi migrate tu config (luc chua co rules.json, va trong test).
+    """
     params: dict[str, Any] = {}
     for key, (section, name, _kind, _rule) in PARAM_SPEC.items():
+        if key in RULE_PARAM_KEYS:
+            continue                 # BR-ORB-18: yaml khong con la nguon
         source = cfg if section is None else (cfg.get(section) or {})
         if name in source and source[name] is not None:
             params[key] = source[name]
     params["atr_timeframe"] = str((cfg.get("filters") or {}).get("atr_timeframe") or "H1")
+    session_flat: dict[str, Any] = {}
     if session:
         for key in ("trade_window_minutes", "max_trades"):
             if session.get(key) not in (None, ""):
                 params[key] = int(session[key])
-        params.update(normalize_overrides(session.get("overrides"), SESSION_OVERRIDE_KEYS))
-    if overrides:
-        params.update(normalize_overrides(overrides))
-    missing = [k for k in PARAM_SPEC if k not in params]
+        session_flat = normalize_overrides(session.get("overrides"), SESSION_OVERRIDE_KEYS)
+    flat = normalize_overrides(overrides) if overrides else {}
+    params.update({k: v for k, v in session_flat.items() if k not in RULE_PARAM_KEYS})
+    params.update({k: v for k, v in flat.items() if k not in RULE_PARAM_KEYS})
+    missing = [k for k in PARAM_SPEC if k not in RULE_PARAM_KEYS and k not in params]
     if missing:
         raise ValueError(f"config orb thieu tham so: {missing}")
+
+    symbol = str(cfg.get("symbol") or "BTCUSDT").upper()
+    block = rules if rules is not None else orb_rules.migrate(cfg, symbol)[0]
+    resolved = orb_rules.resolve(
+        block, symbol,
+        session_values={k: v for k, v in session_flat.items() if k in RULE_PARAM_KEYS},
+        override={**{k: v for k, v in flat.items() if k in RULE_PARAM_KEYS},
+                  **(rules_override or {})},
+        session_id=(session or {}).get("session_id"))
+    missing_rules = orb_rules.missing_errors(resolved, RULE_PARAM_KEYS)
+    if missing_rules:
+        raise ValueError("; ".join(missing_rules))
+    params.update(resolved["values"])
+    params["rule_sources"] = resolved["sources"]
     return params
 
 
@@ -802,17 +835,26 @@ def stop_price(direction: str, or_high: float, or_low: float, params: dict[str, 
     return or_low if direction == "long" else or_high
 
 
-def size_position(entry: float, r_distance: float, risk_usd: float,
+def size_position(entry: float, r_distance: float,
                   params: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """Size = risk_usd / khoang cach SL, lam tron XUONG theo qty_step (BR-07).
+    """TM - #ORB-RULES - ORB Rule Set: size = margin_usd x leverage / entry, lam tron
+    XUONG theo qty_step (BR-ORB-15) - thay cho sizing theo risk_usd.
 
     Khong bao gio tu tang size de dat min notional - chi canh bao (TC-19).
     Phi uoc tinh = notional x 2 chieu x (taker_fee + slippage) (BR-08).
     """
     warnings: list[str] = []
     step = float(params["qty_step"])
-    leverage = float(params["max_leverage"])
-    qty_raw = risk_usd / r_distance if r_distance > 0 else 0.0
+    margin_rule, leverage = params.get("margin_usd"), params.get("leverage")
+    if margin_rule is None or leverage is None or entry <= 0:
+        absent = [k for k in ("margin_usd", "leverage") if params.get(k) is None]
+        warnings.append(f"no_sizing: chua dat rule ORB {absent} - khong tinh duoc qty")
+        return {"qty": None, "qty_raw": None, "notional": None, "margin": None,
+                "margin_usd": margin_rule, "leverage": leverage,
+                "sizing": "margin_x_leverage", "risk_actual_usd": None,
+                "fee_est_usd": None, "fee_in_r": None}, warnings
+    leverage = float(leverage)
+    qty_raw = float(margin_rule) * leverage / entry
     qty = floor_step(qty_raw, step)
     notional = qty * entry
     margin = notional / leverage
@@ -821,28 +863,21 @@ def size_position(entry: float, r_distance: float, risk_usd: float,
     risk_actual = qty * r_distance
     if qty <= 0:
         warnings.append(
-            f"qty_below_step: risk_usd {risk_usd:g} / SL {r_distance:.2f} = "
-            f"{qty_raw:.6f} < qty_step {step:g} - khong vao duoc lenh voi muc rui ro nay")
+            f"qty_below_step: margin_usd {float(margin_rule):g} x {leverage:g} / entry "
+            f"{entry:.2f} = {qty_raw:.6f} < qty_step {step:g} - khong vao duoc lenh")
     elif notional < float(params["min_notional_usd"]):
         warnings.append(
             f"below_min_notional: notional {notional:.2f} < min_notional_usd "
             f"{float(params['min_notional_usd']):g} - san se tu choi lenh; "
             "BAMCP khong tu tang size")
-    if margin > float(params["max_margin_usd"]):
-        max_qty = floor_step(float(params["max_margin_usd"]) * leverage / entry, step)
-        warnings.append(
-            f"margin_exceeds_max: margin {margin:.2f} > max_margin_usd "
-            f"{float(params['max_margin_usd']):g} o {leverage:g}x - qty toi da {max_qty:g}")
-    if margin > float(params["account_equity"]):
-        warnings.append(
-            f"margin_exceeds_equity: margin {margin:.2f} > account_equity "
-            f"{float(params['account_equity']):g}")
     return {
         "qty": qty,
         "qty_raw": round(qty_raw, 8),
         "notional": round(notional, 2),
         "margin": round(margin, 2),
+        "margin_usd": float(margin_rule),
         "leverage": leverage,
+        "sizing": "margin_x_leverage",
         "risk_actual_usd": round(risk_actual, 4),
         "fee_est_usd": round(fee_est, 2),
         "fee_in_r": round(fee_est / risk_actual, 3) if risk_actual > 0 else None,
@@ -853,8 +888,12 @@ def build_plan(*, direction: str, entry: float, or_high: float, or_low: float,
                params: dict[str, Any], trigger_close_ms: int,
                risk_usd: float | None = None, variant: str = "breakout",
                reversal_extreme: float | None = None) -> tuple[dict[str, Any] | None, list[str]]:
-    """Entry / SL / TP / size / time exit cho mot tin hieu."""
-    risk = float(params["risk_usd"] if risk_usd in (None, 0, "") else risk_usd)
+    """Entry / SL / TP / size / time exit cho mot tin hieu.
+
+    TM - #ORB-RULES - ORB Rule Set: `risk_usd` giu lai cho tuong thich nhung khong
+    con anh huong size (BR-ORB-15). plan.risk_usd = so USD mat neu cham SL (chua phi).
+    """
+    del risk_usd
     sl = stop_price(direction, or_high, or_low, params,
                     reversal_extreme if variant == "reversal" else None)
     r_distance = (entry - sl) if direction == "long" else (sl - entry)
@@ -862,7 +901,7 @@ def build_plan(*, direction: str, entry: float, or_high: float, or_low: float,
         return None, [f"invalid_sl: entry {entry} va SL {sl} khong hop le cho lenh {direction}"]
     tp_r = float(params["tp_r"])
     tp = entry + tp_r * r_distance if direction == "long" else entry - tp_r * r_distance
-    sizing, warnings = size_position(entry, r_distance, risk, params)
+    sizing, warnings = size_position(entry, r_distance, params)
     time_exit = trigger_close_ms + int(params["time_exit_minutes"]) * 60_000
     plan = {
         "direction": direction,
@@ -873,7 +912,7 @@ def build_plan(*, direction: str, entry: float, or_high: float, or_low: float,
         "tp_r": tp_r,
         "sl_mode": "reversal_extreme" if variant == "reversal" else params["sl_mode"],
         "r_distance": round(r_distance, 2),
-        "risk_usd": risk,
+        "risk_usd": sizing["risk_actual_usd"],
         **sizing,
         "move_sl_to_be_at_r": params.get("move_sl_to_be_at_r"),
         "time_exit_utc": iso_utc(time_exit),

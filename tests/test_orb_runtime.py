@@ -175,12 +175,14 @@ class WatchFlowTest(Base):
                          ("BREAKOUT_LONG", "long", "breakout"))
         plan = sig["plan"]
         self.assertEqual((plan["entry"], plan["sl"], plan["tp"]), (P + 100, P - 30, P + 295))
-        self.assertEqual(plan["qty"], 0.007)
+        # TM - #ORB-RULES - ORB Rule Set: 20 USD x100 / 100100 -> 0.019 (BR-ORB-15)
+        self.assertEqual(plan["qty"], 0.019)
+        self.assertEqual(plan["rule_check"]["would_pass"], True)
         self.assertEqual(sig["trigger_candle"]["open_utc"], "2026-09-29T13:50:00Z")
         self.assertIn("bias_missing", " ".join(sig["warnings"]))
-        self.assertIn("margin_exceeds_max", " ".join(sig["warnings"]))
         with_risk = self.h.svc.signal(self.ny(), D, at("13:56"), risk_usd=0.5)
-        self.assertEqual(with_risk["plan"]["qty"], 0.003)
+        self.assertEqual(with_risk["plan"]["qty"], 0.019)
+        self.assertIn("risk_usd_ignored", " ".join(with_risk["warnings"]))
 
     def test_bias_against_blocks_plan(self):
         self.ny_only()
@@ -518,10 +520,18 @@ class OrbChecksTest(Base):
         checks = self.h.svc.orb_checks("ny", DAY, at=at("14:00"))
         self.assertEqual(checks["limits"]["day_trades"], 2)
         self.assertEqual(checks["limits"]["status"], "day_limit_reached")
-        self.assertIn("vuot max_orb_trades_per_day (2/2)", checks["violations"])
+        # TM - #ORB-RULES - ORB Rule Set: quota ngay la rule ORB (score_trade)
+        verdict = self.h.svc.score_trade("ny", DAY, side="long", entry=P + 100, stop=P - 30,
+                                         target=P + 295, margin_usd=19, at=at("14:00"))
+        self.assertIn("vuot orb.max_trades_per_day (2): da co 2 lenh ORB ngay 2026-09-29",
+                      verdict["rule_violations"])
+        self.assertFalse(verdict["would_pass"])
         # trade cua or_date khac khong tinh
         self.h.journal[:] = [self.trade("ldn", or_date="2026-09-28")]
         self.assertEqual(self.h.svc.orb_checks("ny", DAY, at=at("14:00"))["violations"], [])
+        verdict = self.h.svc.score_trade("ny", DAY, side="long", entry=P + 100, stop=P - 30,
+                                         target=P + 295, margin_usd=19, at=at("14:00"))
+        self.assertEqual(verdict["rule_violations"], [])
 
     def test_day_limit_blocks_signal_plan(self):
         self.ny_only()
@@ -531,8 +541,11 @@ class OrbChecksTest(Base):
         self.h.drive(at("13:45"), at("13:56"))
         sig = self.h.svc.signal(self.ny(), D, at("13:56"))
         self.assertEqual(sig["state"], "BREAKOUT_LONG")
-        self.assertEqual(sig["blocked_by"], ["day_limit_reached"])
-        self.assertIsNone(sig["plan"])
+        # TM - #ORB-RULES - ORB Rule Set: quota ngay cung la rule ORB -> "rules"; plan
+        # van tra de thay rule_check (AC-10) nhung danh dau blocked_by
+        self.assertEqual(sig["blocked_by"], ["day_limit_reached", "rules"])
+        self.assertEqual(sig["plan"]["blocked_by"], ["day_limit_reached", "rules"])
+        self.assertFalse(sig["plan"]["rule_check"]["would_pass"])
 
     def test_filtered_and_skipped_are_violations(self):
         self.ny_only(or_half=5)

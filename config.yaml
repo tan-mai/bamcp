@@ -132,8 +132,16 @@ rules:
 # sessions_store_path - khong can restart. default_sessions chi la hat giong cho
 # lan chay dau, khi file phien chua ton tai.
 # Moi duong dan tuong doi deu tinh tu data_root.
+# TM - #ORB-RULES - ORB Rule Set: nguong cham lenh, quota/daily stop, sizing va tham
+# so chien luoc ORB (tp_r, buffer_pct, OR/ATR, bias, news...) KHONG con doc tu day.
+# Chung nam trong khoi `orb` cua data/rules.json - doi bang update_rules(orb=true) hoac
+# muc "Rule ORB" o /admin/orb (bat buoc ly do, ghi lich su, co hieu luc ngay).
+# Lan dau chay, khoi do duoc migrate tu gia tri cu (neu con) + mac dinh cua BR.
+# Field cu con sot lai o day (risk.*, exit.tp_r, ...) bi bo qua va bao trong
+# get_orb_config.warnings.
 orb:
-  enabled: true
+  enabled: true                      # bat module (scheduler, tool, trang admin); cong tac
+                                     # nghiep vu la orb.enabled trong rules.json
   symbol: "BTCUSDT"
   or_timeframe: "M15"
   watch_timeframe: "M5"
@@ -142,31 +150,16 @@ orb:
     candle_close_delay_seconds: 20   # doi nen dong them 20 giay roi moi pull
   defaults:                          # phien de trong truong nay thi dung gia tri o day
     trade_window_minutes: 180        # tinh tu luc OR chot
-    max_trades: 1                    # so lenh ORB toi da moi phien
-  max_orb_trades_per_day: 2          # tong moi phien, dem theo or_date
+    max_trades: 1                    # so lenh ORB toi da moi phien (quota ngay: orb.max_trades_per_day)
   entry:
     mode: "close"                    # close | touch | retest
-    buffer_pct: 0.02                 # % cong/tru vao bien OR
-    allow_reversal: false            # co ra plan cho failed breakout khong
     failed_lookback_bars: 3          # so nen M5 de xac nhan failed breakout
   exit:
     sl_mode: "opposite"              # opposite | mid
-    tp_r: 1.5
-    move_sl_to_be_at_r: 1.0          # 0 = khong doi SL ve hoa von
-    time_exit_minutes: 180
   filters:
     atr_timeframe: "H1"
     atr_period: 14
-    min_or_atr_ratio: 0.3            # OR / ATR duoi nguong = too_narrow
-    max_or_atr_ratio: 1.2            # OR / ATR tren nguong = too_wide
-    use_bias_filter: true            # doi chieu voi bias da save_bias trong ngay
-    skip_news_days: true
-    news_days_file: "orb/news_days.json"   # ["2026-10-02", ...] ngay co tin lon
-  risk:
-    account_equity: 100
-    risk_usd: 1                      # 1R tinh bang USD, DA gom phi + truot gia
-    max_margin_usd: 20
-    max_leverage: 10
+    news_days_file: "orb/news_days.json"   # [{"date": "2026-10-02", "note": "CPI"}] - sua o /admin/orb
   costs:
     taker_fee_pct: 0.05              # moi chieu
     slippage_pct: 0.02               # moi chieu
@@ -288,6 +281,22 @@ instructions: |
   - Quota lenh va daily_stop_loss van tinh gop tat ca cac cap.
 
   ORB - OPENING RANGE BREAKOUT (chi tren cap orb.symbol, mac dinh BTCUSDT):
+  Lenh ORB co BO RULE RIENG (khoi 'orb' cua get_rules), khong dung max_stop_points /
+  min_take_profit_points / max_trades_per_day / daily_stop_loss cua scalp-swing.
+  - Cham lenh ORB: SL <= orb.max_stop_points, TP >= orb.min_take_profit_points,
+    R:R >= orb.min_rr, va SL phai nam trong vung an toan thanh ly.
+  - Quota va daily stop cua ORB tinh RIENG (orb.max_trades_per_day,
+    orb.daily_stop_loss): get_today_status co orb_trades_remaining,
+    orb_daily_stop_hit, can_trade_orb. Lenh ORB khong an quota chung va nguoc lai.
+  - Size ORB = orb.margin_usd x orb.leverage / gia vao, lam tron xuong qty_step.
+    Khong tinh size theo risk_usd.
+  - Doi rule ORB: update_rules(orb=true, changes={...}, reason=..., symbol=... hoac
+    session_id=...). Bo trong ca hai la doi orb.defaults. Luon co ly do.
+  - get_orb_config.warnings co 'rule_infeasible' (vd TP toi thieu khong the dat voi
+    tp_r va max_or_atr_ratio hien tai) thi NOI RA truoc khi ban plan.
+  - Cap chua dat rule ORB (loi "chua dat rule ORB cho ...") thi lenh ORB bi chan -
+    bao nguoi dung dat rule, khong tu doan nguong.
+
   OR = nen M15 DAU TIEN cua phien. Moi gio deu theo timezone cua tung phien
   (tu xu ly gio mua he), tool tra ca UTC lan gio VN.
 
@@ -299,6 +308,8 @@ instructions: |
   4. check_orb_signal -> state, trigger_candle (nen M5 da dong) va plan.
      Tu danh gia volume/VSA cua trigger_candle bang so lieu tool tra ve.
   5. Quyet dinh:
+     - plan co blocked_by chua "rules" nghia la plan pham rule ORB - doc
+       plan.rule_check.violations, khong de xuat vao lenh.
      - vao lenh: check_trade(strategy="ORB", session_id=...) -> nguoi dung tu dat
        lenh tren san -> log_trade(strategy="ORB", session_id=..., variant=...).
      - gia da chay xa vung entry, khong duoi: skip_orb_session(session_id, reason).

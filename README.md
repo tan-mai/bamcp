@@ -19,7 +19,7 @@ Tuỳ chọn đọc tài khoản thật từ Binance, Bybit hoặc OKX bằng AP
 | `get_bias` | Đọc bias đã lưu của một cặp |
 | `save_bias` | Lưu bias cho một cặp sau bước W/D/H4 |
 | `get_rules` | Đọc quy định đang hiệu lực (kèm `symbol` để xem bộ số của một cặp) + lịch sử thay đổi |
-| `update_rules` | Đổi quy định, bắt buộc kèm lý do; rule theo cặp thì bắt buộc kèm `symbol` |
+| `update_rules` | Đổi quy định, bắt buộc kèm lý do; rule theo cặp thì bắt buộc kèm `symbol`; `orb=true` đổi bộ rule ORB riêng |
 | `get_today_status` | Quota lệnh + PnL, rule đổi hôm nay, check trước khi vào lệnh |
 | `check_trade` | Chấm thử một lệnh theo rule mà không ghi nhật ký |
 | `log_trade` | Ghi lệnh, cảnh báo nếu phạm rule |
@@ -34,14 +34,14 @@ Tuỳ chọn đọc tài khoản thật từ Binance, Bybit hoặc OKX bằng AP
 | `skip_orb_session` | Bỏ một phiên trong ngày (bắt buộc lý do), dừng watch M5 |
 | `backtest_orb` | Backtest ORB trên M5 lịch sử, tách in-sample/out-of-sample |
 | `get_backtest_result` | Lấy kết quả backtest chạy lâu theo `run_id` |
-| `get_orb_config` | Tham số ORB đang áp dụng |
+| `get_orb_config` | Tham số + rule ORB đang áp dụng (kèm nguồn từng lớp), cảnh báo `rule_infeasible` |
 
 Không có tool đặt lệnh. Cố ý. Plan của ORB chỉ là con số đề xuất — người dùng tự đặt lệnh trên sàn.
 
 Bốn tool cũ nhận thêm tham số **tuỳ chọn** cho ORB; không truyền thì hành vi và các khoá trả về giữ nguyên như trước:
 
-- `get_today_status(strategy, session_id)` và `get_account_pnl(strategy, session_id)` — thêm khối lọc theo chiến lược/phiên. Quota và `daily_stop_loss` vẫn tính gộp.
-- `check_trade(strategy="ORB", session_id, or_date)` — thêm khối `orb_checks`: còn trong cửa sổ không, phiên/ngày còn quota không.
+- `get_today_status(strategy, session_id)` và `get_account_pnl(strategy, session_id)` — thêm khối lọc theo chiến lược/phiên. Quota và `daily_stop_loss` chung chỉ đếm lệnh **không phải ORB**; ORB có quota và daily stop riêng (`orb_trades_remaining`, `orb_daily_stop_hit`, `can_trade_orb` — luôn có trong `get_today_status`).
+- `check_trade(strategy="ORB", session_id, or_date)` — chấm bằng [bộ rule ORB riêng](#bộ-rule-orb-riêng) (`rule_set: "orb"`, lỗi rule nằm ở `orb_rule_violations`), kèm khối `orb_checks`: còn trong cửa sổ không, phiên còn quota không, range có bị lọc không.
 - `log_trade(strategy="ORB", session_id, variant, or_date, or_high, or_low)` — ghi lệnh ORB và dừng watch M5 của phiên đó. Lệnh không phải ORB được gắn `strategy: "OTHER"`.
 
 ## Nến đang chạy vs nến đã đóng
@@ -132,6 +132,8 @@ Rule chia làm hai phạm vi.
 | `swing_min_take_profit_points` | 2000 |
 | `swing_max_stop_points` | 1500 |
 
+Lệnh `strategy="ORB"` **không** chấm bằng các rule trên (trừ `max_margin_per_trade`) và không ăn quota/daily stop chung — ORB có bộ rule riêng, xem [Bộ rule ORB riêng](#bộ-rule-orb-riêng).
+
 Đổi ngay trong chat, từ bất kỳ thiết bị nào:
 
 > *"Từ hôm nay giảm xuống 2 lệnh một ngày, tôi đang vào lệnh quá tay."*
@@ -176,38 +178,67 @@ WAITING_OPEN → FORMING → RANGE_SET → BREAKOUT_LONG / BREAKOUT_SHORT
 kết thúc: FILTERED · EXPIRED · SKIPPED · TAKEN
 ```
 
-Bộ lọc khác: `use_bias_filter` (so với bias đã `save_bias` trong ngày), `skip_news_days` (ngày có tin lớn), quota `max_trades` mỗi phiên và `max_orb_trades_per_day` (đếm theo `or_date`).
+Bộ lọc khác: `use_bias_filter` (so với bias đã `save_bias` trong ngày), `skip_news_days` (ngày có tin lớn), quota `max_trades` mỗi phiên và `orb.max_trades_per_day` (đếm theo `or_date`).
 
-Plan tính sẵn phí taker + trượt giá hai chiều vào 1R, rồi làm tròn `qty` theo `qty_step`, chặn theo `min_notional_usd` và `max_margin_usd`. Tài khoản nhỏ thì nhiều tín hiệu ra `not_executable` — đó là con số thật, không phải lỗi.
+Plan tính sẵn phí taker + trượt giá hai chiều vào 1R. `qty` = `orb.margin_usd × orb.leverage / entry`, làm tròn **xuống** theo `qty_step` — 20 × 100 / 83,500 → 0.023 BTC. Dưới `min_notional_usd` thì plan có cảnh báo, BAMCP không tự tăng size. Mỗi plan còn được chấm bằng rule ORB (`plan.rule_check`, `filters.rules`); trượt rule hoặc đã chạm daily stop ORB thì `blocked_by` chứa `rules` — plan vẫn trả về để xem vì sao, nhưng không phải lệnh để vào.
+
+### Bộ rule ORB riêng
+
+Lệnh ORB có SL/TP nhỏ hơn hẳn scalp/swing, nên được chấm bằng một bộ rule riêng: khối `orb` trong `data/rules.json`. `check_trade`, `log_trade`, `check_orb_signal`, `get_today_status` và `backtest_orb` đều dùng chung một hàm giải rule nên không lệch nhau.
+
+| Rule | BTC | Việc |
+|---|---|---|
+| `max_stop_points` | 350 | SL tối đa |
+| `min_take_profit_points` | 200 | TP tối thiểu |
+| `min_rr` | 1.5 | R:R tối thiểu (TP / SL) |
+| `max_trades_per_day` | 2 | quota lệnh ORB mỗi `or_date` — riêng, không ăn quota chung |
+| `daily_stop_loss` | -25 | PnL ORB trong `or_date` chạm ngưỡng thì chặn ORB — lệnh khác vẫn vào được |
+| `margin_usd` × `leverage` | 20 × 100 | sizing của plan |
+| `maint_margin_pct`, `liq_safety_pct` | 0.4, 80 | SL phải nằm trong 80% khoảng cách tới giá thanh lý (≈354 điểm ở 83,500) |
+
+Tham số chiến lược cũng nằm ở đây: `min_or_atr_ratio` (0.3), `max_or_atr_ratio` (0.7), `tp_r` (1.5), `buffer_pct` (0.02), `move_sl_to_be_at_r`, `time_exit_minutes`, `use_bias_filter`, `allow_reversal`, `skip_news_days`.
+
+Ba lớp, lớp trên đè lớp dưới: **phiên** (chỉ tham số chiến lược) → **cặp** (`symbol_overrides`) → **`orb.defaults`**. `get_orb_config` ghi rõ mỗi giá trị lấy từ lớp nào (`source`). Cặp chưa đặt SL/TP ORB thì lệnh ORB bị chặn với lỗi `chua dat rule ORB cho <CẶP>.<field>` — server không tự đoán ngưỡng. `orb.enabled = false` là công tắc nghiệp vụ: không phiên nào chốt OR/watch M5, `check_orb_signal` trả `orb_disabled`, `check_trade(strategy="ORB")` báo ORB đang tắt.
+
+Sửa bằng một trong hai đường, cả hai bắt buộc lý do, mỗi trường đổi là một dòng `history` (nguồn `mcp` hoặc `admin`), có hiệu lực ngay:
+
+- chat: `update_rules({"min_rr": 2}, reason="...", symbol="BTCUSDT", orb=true)` — bỏ trống `symbol` là sửa `orb.defaults`, `session_id="ny"` là override của phiên, giá trị `null` là bỏ override;
+- mục **Rule ORB** trên `/admin/orb`: chọn phạm vi, sửa, xem trước bộ rule đã giải kèm cảnh báo trước khi lưu. Mục này hiện luôn số lệnh ORB đã dùng và PnL ORB hôm nay.
+
+**Cảnh báo `rule_infeasible`.** Theo ATR H1 và giá hiện tại, server kiểm xem bộ số có tự mâu thuẫn không — vd `min_take_profit_points` 900 với `tp_r` 1.5 và `max_or_atr_ratio` 1.2 ở ATR 462 thì TP tối đa chỉ ~832, mọi tín hiệu đều trượt; hoặc OR tối đa + buffer đã vượt `max_stop_points`. Cảnh báo hiện trong `get_orb_config.warnings`, trên trang admin và ngay ở bước xem trước. Nó không chặn lưu.
+
+Lần đầu chạy bản này, khối `orb` được tạo **một lần** từ giá trị cũ trong `config.yaml` (nếu còn) + mặc định BTC ở trên, kèm một dòng `history` nguồn `migrate`. Các field cũ trong `config.yaml` (`risk.*`, `exit.tp_r`, `filters.max_or_atr_ratio`, `max_orb_trades_per_day`...) từ đó bị bỏ qua và được liệt kê trong `get_orb_config.warnings` dạng `deprecated: ...` — xoá chúng khỏi `config.yaml` là hết cảnh báo.
 
 ### Cấu hình
 
-Tham số **chung** nằm ở khối `orb:` trong `config.yaml` (sửa xong phải restart): entry, exit, filters, risk, costs, `exchange_limits`. Bật/tắt nhanh cả module bằng `BAMCP_ORB_ENABLED=true|false`.
+Tham số **kỹ thuật** nằm ở khối `orb:` trong `config.yaml` (sửa xong phải restart): `entry.mode`, `failed_lookback_bars`, `exit.sl_mode`, khung và chu kỳ ATR, costs, `exchange_limits`, đường dẫn dữ liệu. Rule và tham số chiến lược nằm trong `rules.json` — xem [Bộ rule ORB riêng](#bộ-rule-orb-riêng). Bật/tắt nhanh cả module (scheduler, tool, trang admin) bằng `BAMCP_ORB_ENABLED=true|false`.
 
 Danh sách **phiên** thì quản lý ở trang `/admin/orb`, lưu trong `data/orb/sessions.json`, **không cần restart**. `default_sessions` trong config chỉ là hạt giống cho lần chạy đầu. Trên trang đó:
 
-- thêm/sửa phiên: `session_id`, tên, timezone, giờ mở, ngày giao dịch, cửa sổ, quota, override riêng (chỉ các khoá entry/exit/filters an toàn — không override được risk);
+- thêm/sửa phiên: `session_id`, tên, timezone, giờ mở, ngày giao dịch, cửa sổ, quota, override kỹ thuật (vd `entry_mode`). Override **rule** của phiên (OR/ATR, `tp_r`, `buffer_pct`...) sửa ở mục Rule ORB — form phiên giữ nguyên chúng và từ chối nếu bị sửa ở đây;
 - **Xem trước** giờ mở kế tiếp theo UTC và giờ VN trước khi lưu;
 - bật/tắt, xoá phiên. Tắt hay xoá giữa phiên thì watch đang chạy dừng ngay;
 - lịch sử thay đổi.
 
 `session_id` không đổi được sau khi tạo — state, nhật ký và backtest đều gắn vào nó.
 
-Ngày có tin lớn: ghi vào `data/orb/news_days.json` dạng `["2026-10-02", "2026-10-07"]`, đọc lại mỗi lần tính, không cần restart.
+Ngày có tin lớn: thêm/xoá ở mục **News days** trên `/admin/orb`. File là `data/orb/news_days.json` dạng `[{"date": "2026-10-02", "note": "CPI"}]` (dạng cũ `["2026-10-02"]` vẫn đọc được), đọc lại mỗi lần tính, không cần restart. `skip_news_days = true` thì phiên của ngày đó bị lọc (`news_day: true`, `filtered: true`), không ra plan.
 
 ### Dùng trong chat
 
 > *"Phiên New York hôm nay OR thế nào, có tín hiệu chưa?"*
 
-Claude gọi `get_opening_range` → `check_orb_signal`, đọc `trigger_candle` (nến M5 **đã đóng**) và `plan`. Muốn vào lệnh thì `check_trade(strategy="ORB", session_id="ny")`, bạn tự đặt lệnh trên sàn, rồi `log_trade(strategy="ORB", session_id="ny", variant="breakout")`. Giá đã chạy xa, không đuổi: `skip_orb_session("ny", reason="...")`.
+Claude gọi `get_opening_range` → `check_orb_signal`, đọc `trigger_candle` (nến M5 **đã đóng**) và `plan`. Plan có `blocked_by` chứa `rules` thì đọc `plan.rule_check.rule_violations` — không vào. Muốn vào lệnh thì `check_trade(strategy="ORB", session_id="ny")`, bạn tự đặt lệnh trên sàn, rồi `log_trade(strategy="ORB", session_id="ny", variant="breakout")`. Giá đã chạy xa, không đuổi: `skip_orb_session("ny", reason="...")`.
 
 ### Backtest
 
 > *"Backtest ORB 2 năm, lấy 2026-03-01 làm mốc out-of-sample."*
 
-`backtest_orb(from_date, to_date, session_ids, split_date, overrides, initial_equity)` chạy trên M5 lịch sử. Lần đầu nó tải M5 từ `data.binance.vision` (file tháng, tháng đang chạy ghép từ file ngày, có kiểm SHA256) — khoảng nửa phút cho 2 năm; sau đó đọc cache dưới một giây. Chạy quá ~55 giây thì tool trả `status: running` kèm `run_id`, gọi `get_backtest_result(run_id)` sau.
+`backtest_orb(from_date, to_date, session_ids, split_date, overrides, initial_equity, rules_override)` chạy trên M5 lịch sử. Lần đầu nó tải M5 từ `data.binance.vision` (file tháng, tháng đang chạy ghép từ file ngày, có kiểm SHA256) — khoảng nửa phút cho 2 năm; sau đó đọc cache dưới một giây. Chạy quá ~55 giây thì tool trả `status: running` kèm `run_id`, gọi `get_backtest_result(run_id)` sau.
 
 Kết quả gồm: số lệnh, win rate, expectancy theo R, profit factor, drawdown, chuỗi thua dài nhất, tách in-sample/out-of-sample và theo phiên, lý do thoát (tp/sl/breakeven/time), số tín hiệu bị lọc hoặc không vào được vì quy mô tài khoản, và `data_gaps` cho những ngày thiếu dữ liệu. Nến M5 chạm cả SL lẫn TP thì tính là **thua** (`sl_tp_same_bar`). File `trades.csv`, `equity.csv`, `result.json` nằm trong `data/orb/backtests/<run_id>/`.
+
+Mỗi lệnh giả lập được chấm bằng rule ORB hiện hành, kể cả quota và daily stop ORB theo ngày: kết quả có `rules_used` (bộ rule đã dùng), `rejected_by_rule` (số lệnh bị loại theo từng rule) và `stopped_days` (ngày chạm daily stop ORB). `rules_override` — vd `{"min_take_profit_points": 900}` — thử bộ số khác cho riêng lần chạy đó, không sửa `rules.json`.
 
 ## Đọc tài khoản thật từ sàn
 
@@ -441,8 +472,9 @@ Các đường chính:
 | `POST /mcp` | có | giao thức MCP — Claude nói chuyện ở đây |
 | `GET /healthz` | không | health check cho Docker HEALTHCHECK và reverse proxy |
 | `GET /admin` | có* | trang đặt username/password, credential sàn, quy định |
-| `GET /admin/orb` | có* | quản lý phiên ORB (chỉ có khi `orb.enabled`) |
+| `GET /admin/orb` | có* | quản lý phiên, rule ORB và news days (chỉ có khi `orb.enabled`) |
 | `POST /admin/orb/sessions` | có* | xem trước / lưu / bật / tắt / xoá phiên — trang trên gọi |
+| `POST /admin/orb/rules` | có* | xem trước / lưu rule ORB, thêm / xoá news day — trang trên gọi |
 
 `*` `/admin` mở công khai khi **chưa** đặt mật khẩu lần nào, nhưng lúc đó phải có setup token mới ghi được. Xem mục [Trang admin](#trang-admin).
 
@@ -454,13 +486,13 @@ Không có REST API nào khác. Muốn pull dữ liệu ngay thì bảo Claude g
 <data_root>/          # Docker: /data, mount ra ./data trên host
 ├── klines/    1w.json  1d.json  4h.json  1h.json  15m.json
 ├── bias/      2026-09-12.json
-├── rules.json            # rule chung + phần đặt riêng từng cặp + lịch sử đổi
+├── rules.json            # rule chung + phần đặt riêng từng cặp + khối orb (rule ORB) + lịch sử đổi
 ├── settings.json         # username/password (hash) + credential sàn — chmod 600
 ├── journal/   2026-09-12.json
 │   └── orb_skips/  2026-09-12.json      # phiên ORB đã skip, kèm lý do
 └── orb/
     ├── sessions.json     # danh sách phiên + lịch sử đổi (trang /admin/orb)
-    ├── news_days.json    # ngày có tin lớn — tạo tay khi cần
+    ├── news_days.json    # ngày có tin lớn — sửa ở /admin/orb
     ├── state/     ny/2026-09-12.json    # state + watch của một phiên trong một ngày
     ├── logs/      2026-09-12.jsonl      # log sự kiện: chốt OR, tick M5, dừng watch
     ├── history/   BTCUSDT/5m/*.csv      # M5 lịch sử cho backtest
@@ -596,7 +628,7 @@ Mở `http://127.0.0.1:8848/healthz`.
 .venv\Scripts\python -m pytest tests -q
 ```
 
-Test không gọi mạng và không đụng `data/` thật: chúng dùng thư mục tạm, sàn giả và đồng hồ giả. Bộ test gồm logic ORB (`test_orb_logic.py`), scheduler + watch M5 (`test_orb_runtime.py`), trang admin + backtest (`test_orb_admin_backtest.py`), và tầng tool của server — trong đó có kiểm tra tool cũ không đổi khi không truyền tham số ORB (`test_server.py`).
+Test không gọi mạng và không đụng `data/` thật: chúng dùng thư mục tạm, sàn giả và đồng hồ giả. Bộ test gồm logic ORB (`test_orb_logic.py`), scheduler + watch M5 (`test_orb_runtime.py`), trang admin + backtest (`test_orb_admin_backtest.py`), bộ rule ORB riêng theo các acceptance criteria của BR (`test_orb_rules.py`), và tầng tool của server — trong đó có kiểm tra tool cũ không đổi khi không truyền tham số ORB (`test_server.py`).
 
 ## Gắn vào Claude
 

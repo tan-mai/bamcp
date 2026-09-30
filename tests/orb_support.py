@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import orb  # noqa: E402
+import orb_rules  # noqa: E402
 import orb_runtime  # noqa: E402
 from orb import M5_MS, M15_MS, H1_MS  # noqa: E402
 
@@ -45,6 +46,18 @@ def ms(text: str) -> int:
 def orb_cfg() -> dict[str, Any]:
     with (ROOT / "config.yaml").open(encoding="utf-8") as fh:
         return copy.deepcopy(yaml.safe_load(fh)["orb"])
+
+
+# TM - #ORB-RULES - ORB Rule Set: nen gia trong test chi ~100 diem ATR, nen TP
+# toi thieu 200 cua BTC khong bao gio dat. Test cu dung bo rule ORB co ha nguong TP.
+TEST_SYMBOL_RULES = {"min_take_profit_points": 50.0}
+
+
+def scaled_rules(cfg: dict[str, Any] | None = None, **symbol_values: Any) -> dict[str, Any]:
+    """Khoi `orb` nhu migrate tu config.yaml, nguong TP ha cho nen gia tam 100 diem."""
+    block = orb_rules.migrate(cfg or orb_cfg(), "BTCUSDT")[0]
+    block["symbol_overrides"]["BTCUSDT"].update({**TEST_SYMBOL_RULES, **symbol_values})
+    return block
 
 
 def default_sessions() -> dict[str, dict[str, Any]]:
@@ -139,7 +152,9 @@ class Harness:
     def __init__(self, root: Path | None = None, *, cfg: dict[str, Any] | None = None,
                  clock: Clock | None = None, market: FakeMarket | None = None,
                  journal: list[dict[str, Any]] | None = None,
-                 bias: dict[str, Any] | None = None):
+                 bias: dict[str, Any] | None = None,
+                 rules: dict[str, Any] | None = None,
+                 shared_rules: dict[str, Any] | None = None):
         if root is None:
             self._tmp = tempfile.TemporaryDirectory()
             root = Path(self._tmp.name)
@@ -149,6 +164,9 @@ class Harness:
         self.market = market or FakeMarket(self.clock)
         self.journal = journal if journal is not None else []
         self.bias = bias
+        # TM - #ORB-RULES - ORB Rule Set: sua self.rules trong test co hieu luc ngay
+        self.rules = rules if rules is not None else scaled_rules(self.cfg)
+        self.shared_rules = shared_rules if shared_rules is not None else {}
         self.wakes = 0
         self.log = orb_runtime.EventLog(self.root / "logs", now_fn=self.clock, echo=False)
         self.sessions = orb_runtime.SessionStore(self.root / "sessions.json",
@@ -161,7 +179,8 @@ class Harness:
             get_bias=lambda symbol, day: self.bias,
             journal_rows=self._journal_rows,
             skips_dir=self.root / "journal" / "orb_skips",
-            news_file=self.root / "news_days.json", tz=SERVER_TZ, now_fn=self.clock)
+            news_file=self.root / "news_days.json", tz=SERVER_TZ, now_fn=self.clock,
+            rules_fn=lambda: self.rules, shared_rules_fn=lambda _symbol: self.shared_rules)
         self.sched = orb_runtime.OrbScheduler(self.svc, self.market.fetch)
         self.svc.notify = self._wake
         self.sessions.listeners.append(self._wake)
@@ -176,7 +195,8 @@ class Harness:
     def restart(self) -> "Harness":
         """Dung lai service + scheduler tren CUNG thu muc va thi truong (gia lap restart)."""
         return Harness(self.root, cfg=self.cfg, clock=self.clock, market=self.market,
-                       journal=self.journal, bias=self.bias)
+                       journal=self.journal, bias=self.bias, rules=self.rules,
+                       shared_rules=self.shared_rules)
 
     def close(self) -> None:
         if getattr(self, "_tmp", None) is not None:
