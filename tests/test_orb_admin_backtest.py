@@ -15,7 +15,8 @@ from datetime import date
 from pathlib import Path
 
 from orb_support import (ATR_BAR_HALF, INSIDE_HALF, M5_MS, M15_MS, H1_MS, OR_HALF, P,
-                         FakeMarket, Clock, Harness, default_sessions, ms, orb_cfg)
+                         FakeMarket, Clock, Harness, default_sessions, ms, orb_cfg,
+                         scaled_rules)
 
 import admin_orb
 import orb_backtest
@@ -75,13 +76,33 @@ class AdminHandleTest(unittest.TestCase):
             **self.h.session("ny"), "overrides": {"risk_usd": 50}}})
         self.assertEqual(status, 400)
         self.assertIn("overrides", body["errors"])
+        # TM - #ORB-RULES - ORB Rule Set: tp_r la rule ORB -> form phien khong sua duoc
         status, body = self.handle({"action": "save", "original_id": "ny", "session": {
             **self.h.session("ny"), "overrides": {"tp_r": "2", "entry_mode": "retest"}}})
+        self.assertEqual(status, 400)
+        self.assertIn("Rule ORB", body["errors"]["overrides"])
+        status, body = self.handle({"action": "save", "original_id": "ny", "session": {
+            **self.h.session("ny"), "overrides": {"entry_mode": "retest"}}})
         self.assertEqual(status, 200, body)
-        self.assertEqual(self.h.session("ny")["overrides"], {"tp_r": 2.0, "entry_mode": "retest"})
+        self.assertEqual(self.h.session("ny")["overrides"], {"entry_mode": "retest"})
         params = self.h.svc.params(self.h.session("ny"))
-        self.assertEqual((params["tp_r"], params["entry_mode"]), (2.0, "retest"))
+        self.assertEqual((params["tp_r"], params["entry_mode"]), (1.5, "retest"))
+
+    def test_session_form_keeps_rule_overrides(self):
+        """Rule ORB cua phien (dat qua muc Rule ORB) khong mat khi luu form phien."""
+        self.h.sessions.save({**self.h.session("ny"), "overrides": {"tp_r": 2.0}},
+                             original_id="ny")
+        form = {**self.h.session("ny"), "overrides": {"entry_mode": "retest"}}
+        status, body = self.handle({"action": "save", "original_id": "ny", "session": form})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.h.session("ny")["overrides"], {"entry_mode": "retest", "tp_r": 2.0})
+        params = self.h.svc.params(self.h.session("ny"))
+        self.assertEqual((params["tp_r"], params["rule_sources"]["tp_r"]), (2.0, "session"))
         self.assertEqual(self.h.svc.params(self.h.session("ldn"))["tp_r"], 1.5)
+        # gui lai dung gia tri dang luu thi khong coi la sua rule
+        status, _ = self.handle({"action": "save", "original_id": "ny", "session": {
+            **form, "overrides": {"entry_mode": "retest", "tp_r": 2}}})
+        self.assertEqual(status, 200)
 
     def test_bad_action_and_unknown_session(self):
         self.assertEqual(self.handle({"action": "boom", "session_id": "ny"})[0], 400)
@@ -143,7 +164,8 @@ class SimulateTest(unittest.TestCase):
         cls.result = orb_backtest.simulate(
             build_bars(skip_or_on=NY_0930), sessions(), orb_cfg(),
             from_day=date(2026, 9, 28), to_day=date(2026, 9, 30),
-            split_day=date(2026, 9, 29), initial_equity=100, now_ms=AFTER)
+            split_day=date(2026, 9, 29), initial_equity=100, now_ms=AFTER,
+            rules=scaled_rules())
         cls.trades = [t for t in cls.result["trades"] if t["session_id"] == "ny"]
 
     def test_tc23_sl_and_tp_same_bar_is_loss(self):
@@ -163,8 +185,9 @@ class SimulateTest(unittest.TestCase):
         win = self.trades[1]
         self.assertEqual((win["or_date"], win["exit_reason"]), ("2026-09-29", "tp"))
         self.assertGreater(win["pnl_usd"], 0)
-        self.assertEqual(win["qty"], 0.001)              # ha tu 0.007 vi margin > 20 USD
-        self.assertTrue(win["margin_capped"])
+        # TM - #ORB-RULES - ORB Rule Set: 20 USD x100 / 100100 -> 0.019 (BR-ORB-15)
+        self.assertEqual(win["qty"], 0.019)
+        self.assertFalse(win["margin_capped"])
         self.assertTrue(win["executable"])
         self.assertLessEqual(win["margin"], 20)
         self.assertAlmostEqual(win["pnl_usd"],
@@ -200,13 +223,16 @@ class SimulateTest(unittest.TestCase):
         # min ratio 0.7 -> OR NY (0.6) bi loc too_narrow, khong co lenh
         res = orb_backtest.simulate(build_bars(), sessions(), orb_cfg(),
                                     from_day=date(2026, 9, 28), to_day=date(2026, 9, 29),
-                                    overrides={"min_or_atr_ratio": 0.7}, now_ms=AFTER)
+                                    rules_override={"min_or_atr_ratio": 0.65,
+                                                    "max_or_atr_ratio": 0.9},
+                                    now_ms=AFTER, rules=scaled_rules())
         self.assertEqual(res["summary"]["trades"], 0)
         self.assertEqual(res["summary"]["counters"]["filtered_too_narrow"], 2)
         # ngay tin -> bo qua
         res = orb_backtest.simulate(build_bars(), sessions(), orb_cfg(),
                                     from_day=date(2026, 9, 28), to_day=date(2026, 9, 29),
-                                    news_days=["2026-09-29"], now_ms=AFTER)
+                                    news_days=["2026-09-29"], now_ms=AFTER,
+                                    rules=scaled_rules())
         self.assertEqual(res["summary"]["trades"], 1)
         self.assertGreaterEqual(res["summary"]["counters"]["filtered_news_day"], 1)
         with self.assertRaises(ValueError):
@@ -265,7 +291,8 @@ class BacktestManagerTest(unittest.TestCase):
                 "split_day": None, "overrides": None, "initial_equity": 100.0, **extra}
 
     def test_execute_writes_result_and_csv(self):
-        out = self.mgr.execute("r1", self.request(), sessions(), orb_cfg(), [])
+        out = self.mgr.execute("r1", self.request(), sessions(), orb_cfg(), [],
+                               rules=scaled_rules())
         self.assertEqual(out["status"], "done", out.get("error"))
         self.assertEqual(out["summary"]["trades"], 2)
         self.assertNotIn("trades", out)                   # trade chi nam trong CSV

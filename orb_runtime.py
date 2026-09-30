@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import orb
+import orb_rules  # TM - #ORB-RULES - ORB Rule Set
 from orb import H1_MS, M5_MS, M15_MS, iso_utc, iso_vn
 
 UTC = timezone.utc
@@ -126,6 +127,9 @@ class SessionStore:
         self.log = log
         self.now_fn = now_fn
         self.listeners: list[Callable[[], None]] = []
+        # TM - #ORB-RULES - ORB Rule Set: kiem them khi luu phien (vd min < max OR/ATR,
+        # time_exit <= cua so). Moi ham tra {field: loi}; rong = hop le.
+        self.validators: list[Callable[[dict[str, Any]], dict[str, str]]] = []
         self._lock = threading.RLock()
         self._doc: dict[str, Any] | None = None
         self._stamp: int | None = None
@@ -213,6 +217,11 @@ class SessionStore:
                         {"session_id": f"khong tim thay phien '{original_id}'"})
             clean = orb.validate_session(
                 payload, existing_ids=[s["session_id"] for s in sessions], original=original)
+            errors: dict[str, str] = {}
+            for check in self.validators:
+                errors.update(check(clean) or {})
+            if errors:
+                raise orb.SessionValidationError(errors)
             if original is None:
                 sessions.append(clean)
                 action, changes = "create", {k: {"from": None, "to": v} for k, v in clean.items()}
@@ -401,7 +410,9 @@ class OrbService:
                  get_bias: Callable[[str, str], dict[str, Any] | None],
                  journal_rows: Callable[[list[str]], list[dict[str, Any]]],
                  skips_dir: Path, news_file: Path | None, tz: Any,
-                 now_fn: Callable[[], int] = now_ms):
+                 now_fn: Callable[[], int] = now_ms,
+                 rules_fn: Callable[[], dict[str, Any]] | None = None,
+                 shared_rules_fn: Callable[[str], dict[str, Any]] | None = None):
         self.cfg = cfg
         self.symbol = str(cfg.get("symbol") or "BTCUSDT").upper()
         self.delay_ms = int((cfg.get("scheduler") or {}).get("candle_close_delay_seconds", 20)) * 1000
@@ -417,13 +428,120 @@ class OrbService:
         self.tz = tz
         self.now = now_fn
         self.notify: Callable[[], None] = lambda: None
-        orb.effective_params(cfg)      # config sai thi bao ngay luc khoi dong
+        # TM - #ORB-RULES - ORB Rule Set: khoi `orb` cua rules.json va rule chung cua
+        # cap (chi lay max_margin_per_trade). Doc lai moi lan dung -> sua co hieu luc ngay.
+        seed_block = orb_rules.migrate(cfg, self.symbol)[0]
+        self.rules_fn = rules_fn or (lambda: seed_block)
+        self.shared_rules_fn = shared_rules_fn or (lambda _symbol: {})
+        orb.effective_params(cfg, rules=seed_block)   # config sai thi bao ngay luc khoi dong
+        sessions.validators.append(self._validate_session_rules)
 
     # ---------------------------------------------------------- tien ich
 
     def params(self, session: dict[str, Any] | None = None,
-               overrides: dict[str, Any] | None = None) -> dict[str, Any]:
-        return orb.effective_params(self.cfg, session, overrides)
+               overrides: dict[str, Any] | None = None,
+               rules_override: dict[str, Any] | None = None) -> dict[str, Any]:
+        return orb.effective_params(self.cfg, session, overrides, rules=self.rules_block(),
+                                    rules_override=rules_override)
+
+    # TM - #ORB-RULES - ORB Rule Set ------------------------------------------
+
+    def rules_block(self) -> dict[str, Any]:
+        return orb_rules.normalize_block(self.rules_fn())
+
+    def enabled(self) -> bool:
+        """Cong tac orb.enabled (BR-ORB-17)."""
+        return bool(self.rules_block()["enabled"])
+
+    @staticmethod
+    def session_rule_values(session: dict[str, Any] | None) -> dict[str, Any]:
+        """Override rule ORB cua phien (nhom SESSION_FIELDS)."""
+        if not session:
+            return {}
+        flat = orb.normalize_overrides(session.get("overrides"), orb.SESSION_OVERRIDE_KEYS)
+        return {k: v for k, v in flat.items() if k in orb.RULE_PARAM_KEYS}
+
+    def rules_for(self, session: dict[str, Any] | None = None, symbol: str | None = None,
+                  override: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Bo rule ORB da giai cho cap (+ phien) - mot ham duy nhat cho check_trade,
+        log_trade, check_orb_signal, get_today_status va backtest."""
+        return orb_rules.resolve(self.rules_block(), symbol or self.symbol,
+                                 session_values=self.session_rule_values(session),
+                                 override=override,
+                                 session_id=(session or {}).get("session_id"))
+
+    def costs(self) -> dict[str, float]:
+        raw = self.cfg.get("costs") or {}
+        return {"taker_fee_pct": float(raw.get("taker_fee_pct") or 0),
+                "slippage_pct": float(raw.get("slippage_pct") or 0)}
+
+    def window_minutes(self, session: dict[str, Any]) -> int | None:
+        value = session.get("trade_window_minutes") or \
+            (self.cfg.get("defaults") or {}).get("trade_window_minutes")
+        return int(value) if value else None
+
+    def _validate_session_rules(self, session: dict[str, Any]) -> dict[str, str]:
+        errors = orb_rules.consistency(self.rules_for(session)["values"],
+                                       self.window_minutes(session))
+        return {"overrides": "; ".join(errors)} if errors else {}
+
+    def market_snapshot(self, at: int | None = None) -> dict[str, Any]:
+        """ATR H1 va gia gan nhat (nen da dong) - de tinh canh bao rule_infeasible."""
+        now = self.now() if at is None else at
+        atr_value = None
+        try:
+            atr_value, _missing = self._atr(now, self.params())
+        except Exception as exc:
+            print(f"BAMCP orb: khong tinh duoc ATR hien tai - {exc}", file=sys.stderr)
+        price = None
+        for tf in ("5m", "15m", "1h"):
+            try:
+                bars, _fetched = self.load_live(self.symbol, tf)
+            except Exception:
+                continue
+            closed = [b for b in bars if b["open_time"] + TF_MS[tf] <= now]
+            if closed:
+                price = float(closed[-1]["close"])
+                break
+        return {"symbol": self.symbol, "atr_h1": round(atr_value, 2) if atr_value else None,
+                "price": price, "at_utc": iso_utc(now)}
+
+    def day_stats(self, day: date) -> dict[str, Any]:
+        """So lenh + PnL rong ORB theo or_date (BR-ORB-09: tu nhat ky)."""
+        return orb_rules.day_stats(self._orb_rows(day))
+
+    def _score(self, session: dict[str, Any], day: date, *, symbol: str, side: str,
+               entry: float, stop: float, target: float, margin_usd: float,
+               trade_type: str) -> dict[str, Any]:
+        stats = self.day_stats(day)
+        shared = self.shared_rules_fn(symbol) or {}
+        return orb_rules.score(
+            symbol=symbol, side=side, entry=entry, stop=stop, target=target,
+            margin_usd=margin_usd, trade_type=trade_type,
+            resolved=self.rules_for(session, symbol),
+            max_margin_per_trade=shared.get("max_margin_per_trade"),
+            day_trades=stats["trades"], day_pnl=stats["pnl"], or_date=day.isoformat(),
+            costs=self.costs())
+
+    def score_trade(self, session_id: str, or_date: str = "", *, side: str, entry: float,
+                    stop: float, target: float, margin_usd: float, trade_type: str = "scalp",
+                    symbol: str | None = None, at: int | None = None) -> dict[str, Any]:
+        """Cham mot lenh ORB: rule ORB (BR-ORB-02) + quy tac phien (orb_checks).
+        check_trade, log_trade va check_orb_signal deu di qua day (BR-ORB-10)."""
+        checks = self.orb_checks(session_id, or_date, at=at)
+        session = self.resolve(session_id, include_disabled=True)[0]
+        sym = str(symbol or self.symbol).strip().upper()
+        verdict = self._score(session, orb.parse_date(checks["or_date"]), symbol=sym,
+                              side=side, entry=entry, stop=stop, target=target,
+                              margin_usd=margin_usd, trade_type=trade_type)
+        rule_only = list(verdict["rule_violations"])
+        if sym != self.symbol:
+            rule_only.insert(0, f"ORB chi chay tren {self.symbol}, lenh nay la {sym}")
+        verdict["rule_violations"] = rule_only + checks["violations"]
+        verdict["orb_rule_violations"] = rule_only
+        verdict["would_pass"] = not verdict["rule_violations"]
+        verdict["orb_checks"] = checks
+        return verdict
 
     def resolve(self, session_id: str = "", include_disabled: bool = False) -> list[dict[str, Any]]:
         if session_id:
@@ -574,16 +692,26 @@ class OrbService:
                params: dict[str, Any] | None = None) -> dict[str, Any]:
         params = params or self.params(session)
         rows = self._orb_rows(day)
+        stats = orb_rules.day_stats(rows)
         mine = sum(1 for r in rows if r.get("session_id") == session["session_id"])
         cap_session = int(params["max_trades"])
-        cap_day = int(params["max_orb_trades_per_day"])
+        # TM - #ORB-RULES - ORB Rule Set: quota ngay = orb.max_trades_per_day (BR-ORB-05).
+        # Chua dat -> coi nhu het quota (fail closed, BR-ORB-04).
+        cap_day = params.get("max_trades_per_day")
+        stop = params.get("daily_stop_loss")
+        stop_hit = stop is not None and stats["pnl"] <= float(stop)
         status = "ok"
         if mine >= cap_session:
             status = "session_limit_reached"
-        elif len(rows) >= cap_day:
+        elif cap_day is None or len(rows) >= int(cap_day):
             status = "day_limit_reached"
+        sources = params.get("rule_sources") or {}
         return {"session_trades": mine, "max_trades": cap_session,
-                "day_trades": len(rows), "max_orb_trades_per_day": cap_day,
+                "day_trades": len(rows),
+                "max_orb_trades_per_day": int(cap_day) if cap_day is not None else None,
+                "max_trades_per_day_source": sources.get("max_trades_per_day"),
+                "day_pnl": stats["pnl"], "daily_stop_loss": stop,
+                "orb_daily_stop_hit": stop_hit,
                 "counted_by": "or_date", "status": status}
 
     def _taken(self, session: dict[str, Any], day: date, as_of: int,
@@ -632,7 +760,8 @@ class OrbService:
             "trigger_candle": None,
             "plan": None,
             # pass | ly do chan; None = chua xet toi (vd chua co tin hieu thi chua xet bias)
-            "filters": {"range": None, "bias": None, "news": None, "daily_limit": None},
+            "filters": {"range": None, "bias": None, "news": None, "daily_limit": None,
+                        "rules": None},
             "bias": None,
             "limits": None,
             "window_ends_utc": iso_utc(t["window_end"]),
@@ -640,6 +769,14 @@ class OrbService:
             "data_status": "ok",
             "warnings": [],
         }
+        if risk_usd not in (None, 0, ""):
+            out["warnings"].append("risk_usd_ignored: size ORB = orb.margin_usd x orb.leverage "
+                                   "(BR-ORB-15), risk_usd khong con anh huong qty")
+        # TM - #ORB-RULES - ORB Rule Set: cong tac orb.enabled (BR-ORB-17)
+        if not self.enabled():
+            out.update(data_status="orb_disabled", blocked_by=["orb_disabled"],
+                       note="ORB dang tat (orb.enabled = false) - bat lai o trang /admin/orb.")
+            return out
         status = rng["status"]
         if status in ("set", "data_missing"):
             flag = rng.get("range_flag")
@@ -783,8 +920,33 @@ class OrbService:
             sign = 1 if plan["direction"] == "long" else -1
             plan["move_from_entry_r"] = round(
                 sign * (prefix[-1]["close"] - plan["entry"]) / plan["r_distance"], 2)
+        if plan:
+            # TM - #ORB-RULES - ORB Rule Set: cham plan bang dung ham cua check_trade
+            # (BR-ORB-10). rule_check.would_pass = ket luan cua check_trade voi dung bo so.
+            margin = plan.get("margin")
+            verdict = self.score_trade(
+                sid, day.isoformat(), side=plan["direction"], entry=plan["entry"],
+                stop=plan["sl"], target=plan["tp"],
+                margin_usd=float(margin if margin is not None else params.get("margin_usd") or 0),
+                at=as_of)
+            plan["rule_check"] = {
+                "would_pass": verdict["would_pass"],
+                "rule_violations": verdict["rule_violations"],
+                "rule_set": "orb",
+                "limits_applied": verdict["limits_applied"],
+            }
+            rules_fail = bool(verdict["orb_rule_violations"])
+            out["filters"]["rules"] = "fail" if rules_fail else "pass"
+            if rules_fail:
+                blocked.append("rules")
+            if plan.get("qty") is None:
+                blocked.append("no_sizing")
         if blocked:
             out["blocked_by"] = blocked
+            if "rules" in blocked and plan:
+                # AC-10: van tra plan de thay rule_check, danh dau khong vao duoc
+                plan["blocked_by"] = list(blocked)
+                out["plan"] = plan
         else:
             out["plan"] = plan
         return out
@@ -900,12 +1062,12 @@ class OrbService:
         if limits["session_trades"] >= limits["max_trades"]:
             violations.append(f"vuot max_trades cua phien ({limits['session_trades']}/"
                               f"{limits['max_trades']})")
-        if limits["day_trades"] >= limits["max_orb_trades_per_day"]:
-            violations.append(f"vuot max_orb_trades_per_day ({limits['day_trades']}/"
-                              f"{limits['max_orb_trades_per_day']})")
+        # TM - #ORB-RULES - ORB Rule Set: quota ngay va daily stop ORB nam trong rule
+        # ORB (score_trade) - khong lap lai o day.
         return {
             "session_id": session["session_id"],
             "or_date": day.isoformat(),
+            "orb_enabled": self.enabled(),
             "in_window": in_window,
             "window_utc": {"from": iso_utc(t["or_end"]), "to": iso_utc(t["window_end"])},
             "window_vn": {"from": iso_vn(t["or_end"]), "to": iso_vn(t["window_end"])},
@@ -921,7 +1083,9 @@ class OrbService:
 
     def job_status(self, session: dict[str, Any]) -> dict[str, Any]:
         job = self.states.job(session["session_id"])
-        if not session["enabled"]:
+        if not self.enabled():
+            status = "orb_disabled"          # TM - #ORB-RULES - ORB Rule Set
+        elif not session["enabled"]:
             status = "paused"
         elif job.get("status") == "error":
             status = "error"
@@ -1008,6 +1172,8 @@ class OrbScheduler:
 
     def jobs(self, now: int) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
+        if not self.svc.enabled():
+            return out                       # TM - #ORB-RULES - ORB Rule Set: orb.enabled = false
         for session in self.svc.sessions.all(include_disabled=False):
             sid = session["session_id"]
             try:
@@ -1057,8 +1223,11 @@ class OrbScheduler:
         return self.svc.states.update(sid, key, apply)
 
     def _stop_orphans(self, now: int) -> None:
-        """Phien bi tat hoac xoa ma watch con chay -> go ngay."""
-        enabled = {s["session_id"] for s in self.svc.sessions.all(include_disabled=False)}
+        """Phien bi tat hoac xoa ma watch con chay -> go ngay. Tat ca ORB
+        (orb.enabled = false) thi go moi watch."""
+        orb_off = not self.svc.enabled()     # TM - #ORB-RULES - ORB Rule Set
+        enabled = set() if orb_off else {
+            s["session_id"] for s in self.svc.sessions.all(include_disabled=False)}
         known = set(self.svc.sessions.ids())
         for sid in self.svc.states.session_dirs():
             if sid in enabled:
@@ -1067,7 +1236,8 @@ class OrbScheduler:
                 state = self.svc.states.get(sid, key)
                 if not state or not (state.get("watch") or {}).get("active"):
                     continue
-                reason = "disabled" if sid in known else "deleted"
+                reason = ("orb_disabled" if orb_off
+                          else "disabled" if sid in known else "deleted")
                 self.svc.states.update(sid, key, lambda st: _stop_watch(st, reason, now))
                 self.log("watch", action="stop", session_id=sid, or_date=key, stop_reason=reason)
 

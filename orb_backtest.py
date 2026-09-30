@@ -1,6 +1,7 @@
 """Backtest ORB tren M5 lich su.
 
 # TM - #ORB - ORB Enhancement
+# TM - #ORB-RULES - ORB Rule Set
 
 Engine (simulate) la ham thuan: cung chuoi nen + cung config -> cung ket qua.
 Lop BacktestManager lo phan I/O: tai M5 lich su neu thieu, chay engine trong
@@ -16,10 +17,14 @@ Gia dinh mo phong (ghi ra trong ket qua de doc lai khong phai doan):
   - Doi SL ve hoa von: co hieu luc tu nen SAU nen cham nguong.
   - Time exit: dong cua o gia dong cua cua nen M5 cham moc time exit.
   - Truot gia lam xau MOI lan khop (vao va ra); phi taker tinh ca hai chieu.
-  - Size = risk_usd / khoang cach SL, lam tron xuong qty_step; vuot max_margin
-    thi ha qty; qty = 0 hoac duoi min notional -> lenh khong vao duoc.
+  - Size = orb.margin_usd x orb.leverage / entry, lam tron xuong qty_step
+    (BR-ORB-15); qty = 0 hoac duoi min notional -> lenh khong vao duoc.
+  - Lenh truot rule ORB (max_stop_points / min_take_profit_points / min_rr / an
+    toan thanh ly / max_margin_per_trade) bi loai - dem trong rejected_by_rule
+    (BR-ORB-14). Nguoi dung se cho tin hieu sau nhu khi chay live.
   - Moi phien toi da max_trades lenh/ngay (lenh sau chi xet sau khi lenh truoc
-    dong); tat ca phien toi da max_orb_trades_per_day lenh theo or_date.
+    dong); tat ca phien toi da orb.max_trades_per_day lenh theo or_date, va dung
+    vao lenh moi trong ngay khi PnL ORB da dong <= orb.daily_stop_loss.
   - Bo loc bias KHONG ap dung (bias la nhan dinh tay moi ngay, khong co lich su).
 """
 
@@ -37,6 +42,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import orb
+import orb_rules  # TM - #ORB-RULES - ORB Rule Set
 from orb import H1_MS, M5_MS, iso_utc
 
 UTC = timezone.utc
@@ -134,9 +140,43 @@ def _walk(market: Market, start_idx: int, direction: str, entry_fill: float, sl:
             "bar": last, "be_moved": be_active}
 
 
+# TM - #ORB-RULES - ORB Rule Set: loi cham lenh -> khoa dem trong rejected_by_rule
+RULE_KEYS = (("chua dat rule ORB", "missing_rule"),
+             ("orb.max_stop_points", "max_stop_points"),
+             ("orb.min_take_profit_points", "min_take_profit_points"),
+             ("orb.min_rr", "min_rr"),
+             ("vung an toan thanh ly", "liq_safety"),
+             ("max_margin_per_trade", "max_margin_per_trade"),
+             ("orb.max_trades_per_day", "max_trades_per_day"),
+             ("orb.daily_stop_loss", "daily_stop_loss"))
+
+
+def _rule_keys(violations: list[str]) -> list[str]:
+    keys = []
+    for text in violations:
+        key = next((k for needle, k in RULE_KEYS if needle in text), "other")
+        if key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _score(params: dict[str, Any], ctx: dict[str, Any], direction: str, entry: float,
+           sl: float, tp: float, margin: float, or_date: str) -> list[str]:
+    """Cham rule ORB cho mot lenh (quota/daily stop xet sau, theo ca ngay)."""
+    resolved = {"symbol": ctx["symbol"], "enabled": True,
+                "values": {k: params[k] for k in orb_rules.FIELDS if k in params},
+                "sources": params.get("rule_sources") or {}}
+    verdict = orb_rules.score(
+        symbol=ctx["symbol"], side=direction, entry=entry, stop=sl, target=tp,
+        margin_usd=margin, trade_type="scalp", resolved=resolved,
+        max_margin_per_trade=ctx.get("max_margin_per_trade"), day_trades=0, day_pnl=0.0,
+        or_date=or_date, costs=ctx["costs"])
+    return verdict["rule_violations"]
+
+
 def _trade(market: Market, session: dict[str, Any], day: date, params: dict[str, Any],
            rng: dict[str, Any], window: list[dict[str, Any]], event: dict[str, Any],
-           counters: Counter) -> dict[str, Any] | None:
+           counters: Counter, ctx: dict[str, Any]) -> dict[str, Any] | None:
     trigger = window[event["trigger_index"]]
     trigger_close = trigger["open_time"] + M5_MS
     direction = event["direction"]
@@ -174,21 +214,20 @@ def _trade(market: Market, session: dict[str, Any], day: date, params: dict[str,
     exit_fill = _fill(out["exit_ref"], direction, "exit", slip)
     sign = 1 if direction == "long" else -1
 
-    # Size nhu live (orb.size_position), roi ha qty neu vuot max_margin
-    step = float(params["qty_step"])
-    leverage = float(params["max_leverage"])
-    sizing, _warnings = orb.size_position(entry_ref, r_distance, float(params["risk_usd"]), params)
-    qty = sizing["qty"]
-    margin_capped = False
-    if qty * entry_ref / leverage > float(params["max_margin_usd"]):
-        qty = orb.floor_step(float(params["max_margin_usd"]) * leverage / entry_ref, step)
-        margin_capped = True
+    # TM - #ORB-RULES - ORB Rule Set: size nhu live - margin_usd x leverage (BR-ORB-15)
+    sizing, _warnings = orb.size_position(entry_ref, r_distance, params)
+    leverage = float(params.get("leverage") or 1)
+    qty = sizing["qty"] or 0.0
     notional = qty * entry_ref
     reason = None
-    if qty <= 0:
+    if sizing["qty"] is None:
+        reason = "no_sizing"
+    elif qty <= 0:
         reason = "qty_below_step"
     elif notional < float(params["min_notional_usd"]):
         reason = "below_min_notional"
+    violations = _score(params, ctx, direction, round(entry_ref, 2), round(sl, 2),
+                        round(tp, 2), round(notional / leverage, 2), day.isoformat())
 
     r_ideal = (sign * (exit_fill - entry_fill) - (entry_fill + exit_fill) * fee_rate) / r_distance
     row: dict[str, Any] = {
@@ -208,9 +247,13 @@ def _trade(market: Market, session: dict[str, Any], day: date, params: dict[str,
         "qty": qty,
         "notional": round(notional, 2),
         "margin": round(notional / leverage, 2),
-        "margin_capped": margin_capped,
+        "margin_capped": False,          # BR-ORB-15: size co dinh, khong con ha qty
         "executable": reason is None,
         "not_executable_reason": reason,
+        "rule_violations": violations,
+        "rule_keys": _rule_keys(violations),
+        "rule_rejected": False,
+        "day_rejected": None,
         "exit_ms": out["bar"]["open_time"] + M5_MS,
         "exit_utc": iso_utc(out["bar"]["open_time"] + M5_MS),
         "exit_reason": out["reason"],
@@ -240,7 +283,8 @@ def _trade(market: Market, session: dict[str, Any], day: date, params: dict[str,
 
 def _session_day(market: Market, session: dict[str, Any], day: date,
                  params: dict[str, Any], news: set[str], now_ms: int,
-                 counters: Counter, gaps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                 counters: Counter, gaps: list[dict[str, Any]],
+                 ctx: dict[str, Any]) -> list[dict[str, Any]]:
     ok, _reason = orb.trade_day_status(session, day)
     if not ok:
         counters["no_session"] += 1
@@ -282,9 +326,10 @@ def _session_day(market: Market, session: dict[str, Any], day: date,
 
     def row_for(n: int, event: dict[str, Any]) -> dict[str, Any] | None:
         if n not in rows:
-            rows[n] = _trade(market, session, day, params, rng, window, event, counters)
+            rows[n] = _trade(market, session, day, params, rng, window, event, counters, ctx)
             if rows[n] is not None:
-                rows[n].update(day_cap=int(params["max_orb_trades_per_day"]),
+                rows[n].update(day_cap=params.get("max_trades_per_day"),
+                               day_stop=params.get("daily_stop_loss"),
                                real=False, ideal=False)
         return rows[n]
 
@@ -302,6 +347,12 @@ def _session_day(market: Market, session: dict[str, Any], day: date,
                 continue
             row = row_for(n, event)
             if row is None:
+                continue
+            if row["rule_violations"]:
+                # TM - #ORB-RULES - ORB Rule Set: truot rule ORB -> khong vao, cho tin hieu sau
+                if mode == "real":
+                    row["real"] = True
+                    row["rule_rejected"] = True
                 continue
             if mode == "real" and not row["executable"]:
                 row["real"] = True     # van ghi ra CSV de thay vi sao bo
@@ -384,23 +435,64 @@ def ideal_metrics(trades: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _cap_per_day(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+def _cap_per_day(rows: list[dict[str, Any]], use_stop: bool = False
+                 ) -> tuple[list[dict[str, Any]], Counter, dict[str, dict[str, Any]]]:
+    """TM - #ORB-RULES - ORB Rule Set: ap orb.max_trades_per_day va (luot `real`)
+    orb.daily_stop_loss theo or_date, dung thu tu vao lenh - giong live: daily stop
+    so PnL cac lenh ORB DA DONG truoc luc vao lenh moi."""
     per_day: Counter = Counter()
-    kept, dropped = [], 0
+    kept: list[dict[str, Any]] = []
+    dropped: Counter = Counter()
+    stopped: dict[str, dict[str, Any]] = {}
     for row in sorted(rows, key=lambda r: (r["entry_ms"], r["session_id"])):
-        if per_day[row["or_date"]] >= row["day_cap"]:
-            dropped += 1
+        day = row["or_date"]
+        stop = row.get("day_stop")
+        if use_stop and stop is not None:
+            realized = sum(k["pnl_usd"] for k in kept
+                           if k["or_date"] == day and k["exit_ms"] <= row["entry_ms"])
+            if round(realized, 2) <= float(stop):
+                dropped["daily_stop_loss"] += 1
+                row["day_rejected"] = "daily_stop_loss"
+                info = stopped.setdefault(day, {"or_date": day, "pnl_at_stop_usd": round(realized, 4),
+                                                "daily_stop_loss": float(stop), "blocked_signals": 0})
+                info["blocked_signals"] += 1
+                continue
+        cap = row.get("day_cap")
+        if cap is None or per_day[day] >= int(cap):
+            dropped["max_trades_per_day"] += 1
+            if use_stop:
+                row["day_rejected"] = "max_trades_per_day"
             continue
-        per_day[row["or_date"]] += 1
+        per_day[day] += 1
         kept.append(row)
-    return kept, dropped
+    if use_stop:
+        # Ngay cham daily stop du khong con tin hieu nao sau do
+        by_day: dict[str, list[dict[str, Any]]] = {}
+        for row in kept:
+            by_day.setdefault(row["or_date"], []).append(row)
+        for day, day_rows in by_day.items():
+            stop = day_rows[0].get("day_stop")
+            if stop is None or day in stopped:
+                continue
+            running = 0.0
+            for row in sorted(day_rows, key=lambda r: r["exit_ms"]):
+                running += row["pnl_usd"]
+                if round(running, 2) <= float(stop):
+                    stopped[day] = {"or_date": day, "pnl_at_stop_usd": round(running, 4),
+                                    "daily_stop_loss": float(stop), "blocked_signals": 0}
+                    break
+    return kept, dropped, stopped
 
 
 def simulate(bars: list[dict[str, Any]], sessions: list[dict[str, Any]],
              cfg: dict[str, Any], *, from_day: date, to_day: date,
              split_day: date | None = None, overrides: dict[str, Any] | None = None,
              news_days: list[str] | tuple[str, ...] = (), initial_equity: float = 100.0,
-             now_ms: int | None = None) -> dict[str, Any]:
+             now_ms: int | None = None, rules: dict[str, Any] | None = None,
+             rules_override: dict[str, Any] | None = None,
+             max_margin_per_trade: float | None = None) -> dict[str, Any]:
+    """TM - #ORB-RULES - ORB Rule Set: `rules` = khoi orb cua rules.json (None ->
+    migrate tu cfg), `rules_override` = thu bo so khac ma khong sua rules.json."""
     if to_day < from_day:
         raise ValueError("to_date phai sau from_date")
     if not sessions:
@@ -414,18 +506,48 @@ def simulate(bars: list[dict[str, Any]], sessions: list[dict[str, Any]],
     gaps: list[dict[str, Any]] = []
     signals: list[dict[str, Any]] = []
     params_by_session: dict[str, dict[str, Any]] = {}
+    symbol = str(cfg.get("symbol") or "BTCUSDT").upper()
+    block = orb_rules.normalize_block(rules) if rules is not None \
+        else orb_rules.migrate(cfg, symbol)[0]
+    override = {k: orb_rules.coerce(k, v) for k, v in (rules_override or {}).items()
+                if v is not None}
+    costs = cfg.get("costs") or {}
+    ctx = {"symbol": symbol, "max_margin_per_trade": max_margin_per_trade,
+           "costs": {"taker_fee_pct": float(costs.get("taker_fee_pct") or 0),
+                     "slippage_pct": float(costs.get("slippage_pct") or 0)}}
+    rules_used: dict[str, Any] = {"symbol": symbol, "orb": block, "rules_override": override,
+                                  "max_margin_per_trade": max_margin_per_trade,
+                                  "by_session": {}}
     for session in sessions:
-        params = orb.effective_params(cfg, session, overrides)
+        params = orb.effective_params(cfg, session, overrides, rules=block,
+                                      rules_override=override)
         params_by_session[session["session_id"]] = params
+        resolved = orb_rules.resolve(block, symbol,
+                                     session_values={k: v for k, v in orb.normalize_overrides(
+                                         session.get("overrides"),
+                                         orb.SESSION_OVERRIDE_KEYS).items()
+                                         if k in orb.RULE_PARAM_KEYS},
+                                     override=override, session_id=session["session_id"])
+        rules_used["by_session"][session["session_id"]] = {
+            "values": resolved["values"], "sources": resolved["sources"],
+            "missing": resolved["missing"]}
         day = from_day
         while day <= to_day:
             signals.extend(_session_day(market, session, day, params, news, now_ms,
-                                        counters, gaps))
+                                        counters, gaps, ctx))
             day += timedelta(days=1)
 
-    trades, dropped = _cap_per_day([r for r in signals if r["real"] and r["executable"]])
-    counters["day_limit_skipped"] = dropped
-    ideal, _ = _cap_per_day([r for r in signals if r["ideal"]])
+    trades, dropped, stopped = _cap_per_day(
+        [r for r in signals if r["real"] and r["executable"] and not r["rule_rejected"]],
+        use_stop=True)
+    counters["day_limit_skipped"] = dropped["max_trades_per_day"]
+    counters["daily_stop_skipped"] = dropped["daily_stop_loss"]
+    ideal, _, _ = _cap_per_day([r for r in signals if r["ideal"]])
+    rejected_by_rule: Counter = Counter()
+    for row in signals:
+        if row["rule_rejected"]:
+            rejected_by_rule.update(row["rule_keys"])
+    rejected_by_rule.update(dropped)
 
     equity = float(initial_equity)
     for row in sorted(trades, key=lambda r: (r["exit_ms"], r["entry_ms"], r["session_id"])):
@@ -457,6 +579,10 @@ def simulate(bars: list[dict[str, Any]], sessions: list[dict[str, Any]],
                        for sid in params_by_session},
     }
     summary["counters"] = dict(sorted(counters.items()))
+    summary["rejected_by_rule"] = dict(sorted(rejected_by_rule.items()))
+    for row in signals:
+        row["rule_violations"] = "; ".join(row["rule_violations"])
+        row.pop("rule_keys", None)
     return {
         "period": {"from": from_day.isoformat(), "to": to_day.isoformat(),
                    "split_date": split_iso,
@@ -465,6 +591,9 @@ def simulate(bars: list[dict[str, Any]], sessions: list[dict[str, Any]],
                    "last_bar_utc": iso_utc(bars[-1]["open_time"]) if bars else None},
         "initial_equity": float(initial_equity),
         "params_by_session": params_by_session,
+        "rules_used": rules_used,
+        "rejected_by_rule": summary["rejected_by_rule"],
+        "stopped_days": [stopped[d] for d in sorted(stopped)],
         "summary": summary,
         "data_gaps": gaps[:50],
         "data_gaps_total": len(gaps),
@@ -477,6 +606,8 @@ def simulate(bars: list[dict[str, Any]], sessions: list[dict[str, Any]],
             "doi SL ve hoa von co hieu luc tu nen sau",
             "khong ap bo loc bias",
             "equity cua in_sample / out_of_sample / by_session deu bat dau tu initial_equity",
+            "size = orb.margin_usd x orb.leverage / entry; lenh truot rule ORB bi loai",
+            "orb.daily_stop_loss so PnL cac lenh ORB da dong truoc luc vao lenh moi",
         ],
     }
 
@@ -487,7 +618,8 @@ TRADE_COLUMNS = ("session_id", "or_date", "sample", "counted", "counted_ideal",
                  "direction", "variant",
                  "signal_state", "trigger_utc", "entry_utc", "entry_ref", "entry_fill",
                  "sl", "tp", "r_distance", "qty", "notional", "margin", "margin_capped",
-                 "executable", "not_executable_reason", "exit_utc", "exit_reason",
+                 "executable", "not_executable_reason", "rule_rejected", "rule_violations",
+                 "day_rejected", "exit_utc", "exit_reason",
                  "exit_ref", "exit_fill", "sl_tp_same_bar", "be_moved", "pnl_usd",
                  "fees_usd", "slippage_usd", "r_multiple", "r_ideal", "equity_after",
                  "or_high", "or_low", "or_atr_ratio")
@@ -552,7 +684,8 @@ class BacktestManager:
         return [bars[k] for k in sorted(bars)], report
 
     def execute(self, run_id: str, request: dict[str, Any], sessions: list[dict[str, Any]],
-                cfg: dict[str, Any], news_days: list[str]) -> dict[str, Any]:
+                cfg: dict[str, Any], news_days: list[str], rules: dict[str, Any] | None = None,
+                max_margin_per_trade: float | None = None) -> dict[str, Any]:
         started = time.perf_counter()
         folder = self._dir(run_id)
         try:
@@ -561,7 +694,9 @@ class BacktestManager:
             result = simulate(bars, sessions, cfg, from_day=from_day, to_day=to_day,
                               split_day=request.get("split_day"),
                               overrides=request.get("overrides"), news_days=news_days,
-                              initial_equity=request["initial_equity"], now_ms=self.now())
+                              initial_equity=request["initial_equity"], now_ms=self.now(),
+                              rules=rules, rules_override=request.get("rules_override"),
+                              max_margin_per_trade=max_margin_per_trade)
             trades = result.pop("trades")
             self._write_csv(folder, trades, request["initial_equity"])
             elapsed = round(time.perf_counter() - started, 2)
@@ -616,7 +751,8 @@ class BacktestManager:
 
     async def run(self, request: dict[str, Any], sessions: list[dict[str, Any]],
                   cfg: dict[str, Any], news_days: list[str],
-                  wait_seconds: float = 55.0) -> dict[str, Any]:
+                  wait_seconds: float = 55.0, rules: dict[str, Any] | None = None,
+                  max_margin_per_trade: float | None = None) -> dict[str, Any]:
         stamp = datetime.fromtimestamp(self.now() / 1000, UTC).strftime("%Y%m%dT%H%M%SZ")
         run_id = f"{stamp}-{secrets.token_hex(3)}"
         _write_json(self._dir(run_id) / "result.json", {
@@ -626,7 +762,8 @@ class BacktestManager:
         self.log("backtest", run_id=run_id, status="started", request=_jsonable(request),
                  sessions=[s["session_id"] for s in sessions])
         task = asyncio.create_task(asyncio.to_thread(
-            self.execute, run_id, request, sessions, cfg, news_days))
+            self.execute, run_id, request, sessions, cfg, news_days, rules,
+            max_margin_per_trade))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         done, _pending = await asyncio.wait({task}, timeout=wait_seconds)

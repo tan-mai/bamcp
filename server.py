@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import copy
 import json
 import os
 import secrets
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -32,6 +34,7 @@ import orb           # module cuc bo: logic ORB thuan (OR, tin hieu, sizing)
 import orb_backtest  # module cuc bo: backtest ORB tren M5 lich su
 import orb_history   # module cuc bo: M5 lich su tu data.binance.vision
 import orb_runtime   # module cuc bo: session store, state theo ngay, scheduler ORB
+import orb_rules     # TM - #ORB-RULES - ORB Rule Set: bo rule ORB rieng (logic thuan)
 from orb import iso_utc, iso_vn
 
 # Nap .env neu co, de chay local khong phai export tay moi lan mo terminal.
@@ -263,6 +266,10 @@ _RULE_BOUNDS: dict[str, tuple[float | None, float | None]] = {
     "swing_max_stop_points": (0, None),
 }
 
+# TM - #ORB-RULES - ORB Rule Set: rules.json co the bi ghi tu nhieu duong (tool,
+# admin, migrate lan dau) - khoa de khong mat thay doi / khong migrate hai lan.
+_RULES_LOCK = threading.RLock()
+
 
 def _rules_doc() -> dict[str, Any]:
     """Doc nguyen file rules.json, chuan hoa thanh ba khoi: values / symbols / history.
@@ -298,8 +305,28 @@ def _rules_doc() -> dict[str, Any]:
     if not isinstance(history, list):
         history = []
 
+    # TM - #ORB-RULES - ORB Rule Set: khoi `orb` (bo rule ORB rieng). Chua co thi
+    # migrate MOT LAN tu config.yaml, ghi lai ngay kem mot dong history (BR muc 6).
+    if not isinstance(stored.get("orb"), dict):
+        with _RULES_LOCK:
+            again = _read_json(RULES_FILE, None)
+            if isinstance(again, dict) and isinstance(again.get("orb"), dict):
+                return _rules_doc()
+            orb_cfg = CFG.get("orb") or {}
+            block, row = orb_rules.migrate(
+                orb_cfg, str(orb_cfg.get("symbol") or DEFAULT_SYMBOL).upper(), at=_now_iso())
+            history = history + [row]
+            stored = {**stored, "values": values, "symbols": symbols,
+                      "updated_at": _now_iso(), "history": history, "orb": block}
+            _write_json(RULES_FILE, stored)
+            print("BAMCP: da tao khoi orb trong rules.json (migrate tu config.yaml)",
+                  file=sys.stderr)
+
     return {"values": {**RULES_SEED, **values}, "symbols": symbols,
-            "history": history}
+            "history": history,
+            # TM - #ORB-RULES - ORB Rule Set
+            "stored_values": values,
+            "orb": orb_rules.normalize_block(stored["orb"])}
 
 
 def _load_rules(symbol: str = "") -> dict[str, Any]:
@@ -361,7 +388,7 @@ def _changed_today(history: list[dict[str, Any]], day: str) -> list[dict[str, An
 
 
 def _apply_rule_changes(changes: dict[str, Any], reason: str,
-                        symbol: str = "") -> dict[str, Any]:
+                        symbol: str = "", source: str = "mcp") -> dict[str, Any]:
     """Duong DUY NHAT de doi rule. Ca tool update_rules lan trang admin deu di qua day.
 
     Co mot cua thi lich su khong bao gio thung: khong co cach nao doi rule ma
@@ -388,26 +415,30 @@ def _apply_rule_changes(changes: dict[str, Any], reason: str,
         return {"updated": False, "reason": "gia tri moi trung gia tri cu",
                 "scope": sym or "chung", "symbol": sym or None, "rules": current}
 
-    doc = _rules_doc()
-    history = doc["history"]
-    entry: dict[str, Any] = {"at": _now_iso(), "changes": diff, "reason": reason}
-    if sym:
-        entry["symbol"] = sym
-    history.append(entry)
+    with _RULES_LOCK:
+        doc = _rules_doc()
+        history = doc["history"]
+        entry: dict[str, Any] = {"at": _now_iso(), "changes": diff, "reason": reason,
+                                 # TM - #ORB-RULES - ORB Rule Set: nguon admin / mcp (BR-ORB-13)
+                                 "source": source}
+        if sym:
+            entry["symbol"] = sym
+        history.append(entry)
 
-    values = doc["values"]
-    symbols = doc["symbols"]
-    if sym:
-        symbols[sym] = {**symbols.get(sym, {}), **clean}
-    else:
-        values = {**values, **clean}
+        values = doc["values"]
+        symbols = doc["symbols"]
+        if sym:
+            symbols[sym] = {**symbols.get(sym, {}), **clean}
+        else:
+            values = {**values, **clean}
 
-    _write_json(RULES_FILE, {
-        "values": values,
-        "symbols": symbols,
-        "updated_at": _now_iso(),
-        "history": history,
-    })
+        _write_json(RULES_FILE, {
+            "values": values,
+            "symbols": symbols,
+            "updated_at": _now_iso(),
+            "history": history,
+            "orb": doc["orb"],      # TM - #ORB-RULES - ORB Rule Set: giu khoi orb
+        })
     return {
         "updated": True,
         "scope": sym or "chung",
@@ -417,6 +448,219 @@ def _apply_rule_changes(changes: dict[str, Any], reason: str,
         "rules": {**values, **symbols.get(sym, {})} if sym else values,
         "changed_today": len(_changed_today(history, _today())),
     }
+
+
+# ---------------------------------------------------------------- rule ORB
+# TM - #ORB-RULES - ORB Rule Set
+#
+# Khoi `orb` cua rules.json: bo rule rieng cho lenh ORB, tach khoi rule
+# scalp/swing (BR-ORB-01). Ba lop, xet tung truong: override cua phien (chi nhom
+# orb_rules.SESSION_FIELDS, luu trong session store) > symbol_overrides.<SYM> >
+# defaults. Moi thay doi di qua _apply_orb_rule_changes - tool
+# update_rules(orb=true) lan trang /admin/orb - nen history khong bao gio thung.
+
+ORB_RULE_SOURCES = ("mcp", "admin")
+
+
+def _orb_rule_symbol(symbol: str) -> str:
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return ""
+    # Cap ORB dang chay luon hop le; cap khac thi phai dang duoc theo doi
+    return sym if sym == ORB_SYMBOL else _resolve_symbol(sym)
+
+
+def _orb_session_values(session_values: dict[str, dict[str, Any]] | None,
+                        session: dict[str, Any]) -> dict[str, Any]:
+    """Override rule cua phien: ban dang xem truoc (neu co) hoac ban dang luu."""
+    sid = session["session_id"]
+    if session_values and sid in session_values:
+        return session_values[sid]
+    return orb_runtime.OrbService.session_rule_values(session)
+
+
+def _orb_consistency(block: dict[str, Any], symbol: str = "",
+                     session_values: dict[str, dict[str, Any]] | None = None) -> list[str]:
+    """Rang buoc giua cac truong (min < max OR/ATR, time_exit <= cua so phien) tren
+    moi to hop se dung that: tung cap co override + cap ORB x tung phien."""
+    errors: list[str] = []
+    symbols = {ORB_SYMBOL, *block["symbol_overrides"], *([symbol] if symbol else [])}
+    for sym in sorted(symbols):
+        for err in orb_rules.consistency(orb_rules.resolve(block, sym)["values"]):
+            errors.append(f"{sym}: {err}")
+    if ORB_SESSIONS is not None and ORB_SVC is not None:
+        for session in ORB_SESSIONS.all(include_disabled=True):
+            resolved = orb_rules.resolve(block, ORB_SYMBOL,
+                                         session_values=_orb_session_values(session_values, session))
+            for err in orb_rules.consistency(resolved["values"], ORB_SVC.window_minutes(session)):
+                errors.append(f"phien {session['session_id']}: {err}")
+    return list(dict.fromkeys(errors))
+
+
+def _orb_warnings(block: dict[str, Any] | None = None,
+                  session_values: dict[str, dict[str, Any]] | None = None,
+                  snapshot: dict[str, Any] | None = None) -> list[str]:
+    """Canh bao rule_infeasible / liq_unsafe theo ATR H1 + gia hien tai (BR-ORB-11):
+    cho cap ORB, roi tung phien dang bat co override rule (tien to [session_id])."""
+    if ORB_SVC is None:
+        return []
+    block = block if block is not None else ORB_SVC.rules_block()
+    snap = snapshot or ORB_SVC.market_snapshot()
+    atr, price, costs = snap.get("atr_h1"), snap.get("price"), ORB_SVC.costs()
+    if not atr:
+        return []
+    out = orb_rules.infeasible(orb_rules.resolve(block, ORB_SYMBOL)["values"], atr, price, costs)
+    for session in ORB_SESSIONS.all(include_disabled=False):
+        values = _orb_session_values(session_values, session)
+        if not values:
+            continue
+        resolved = orb_rules.resolve(block, ORB_SYMBOL, session_values=values)["values"]
+        for warning in orb_rules.infeasible(resolved, atr, price, costs):
+            if warning not in out:
+                out.append(f"[{session['session_id']}] {warning}")
+    return out
+
+
+def _orb_rule_path(layer: str, field: str, symbol: str, session_id: str) -> str:
+    if field == "enabled":
+        return "orb.enabled"
+    if layer == "symbol":
+        return f"orb.symbol_overrides.{symbol}.{field}"
+    if layer == "session":
+        return f"orb.sessions.{session_id}.{field}"
+    return f"orb.defaults.{field}"
+
+
+def _apply_orb_rule_changes(changes: dict[str, Any], reason: str, symbol: str = "",
+                            session_id: str = "", source: str = "mcp",
+                            dry_run: bool = False) -> dict[str, Any]:
+    """Duong DUY NHAT de doi rule ORB (BR-ORB-13): update_rules(orb=true) va /admin/orb.
+
+    symbol bo trong + session_id bo trong -> orb.defaults (va cong tac orb.enabled)
+    symbol                                -> orb.symbol_overrides.<SYMBOL>
+    session_id                            -> override cua phien (chi SESSION_FIELDS)
+    Gia tri None / "" = bo override o lop do (ke thua lop duoi). Moi truong doi la
+    mot dong history. dry_run = chi xem truoc (bo rule da giai + canh bao), khong ghi.
+    """
+    if source not in ORB_RULE_SOURCES:
+        raise ValueError(f"source phai la mot trong {list(ORB_RULE_SOURCES)}")
+    reason = (reason or "").strip()
+    if not reason and not dry_run:
+        raise ValueError("reason la bat buoc - ghi ro vi sao doi rule ORB")
+    if not isinstance(changes, dict) or not changes:
+        raise ValueError("changes rong, khong co gi de doi")
+    sid = (session_id or "").strip().lower()
+    sym = _orb_rule_symbol(symbol)
+    if sid and sym:
+        raise ValueError("chon mot pham vi: symbol HOAC session_id, khong ca hai")
+    layer = "session" if sid else "symbol" if sym else "defaults"
+    session = None
+    if sid:
+        if ORB_SESSIONS is None:
+            raise ValueError("module ORB dang tat - khong co phien de dat override")
+        session = ORB_SESSIONS.get(sid)
+        if not session:
+            raise ValueError(f"khong co phien '{sid}'. Dang co: {ORB_SESSIONS.ids()}")
+
+    with _RULES_LOCK:
+        doc = _rules_doc()
+        block = copy.deepcopy(doc["orb"])
+        if session is not None:
+            current = orb_runtime.OrbService.session_rule_values(session)
+        elif sym:
+            current = dict(block["symbol_overrides"].get(sym, {}))
+        else:
+            current = dict(block["defaults"])
+        layer_values = dict(current)
+        enabled = block["enabled"]
+        for key, raw in changes.items():
+            key = str(key).strip()
+            if key == "enabled":
+                if layer != "defaults":
+                    raise ValueError("orb.enabled la cong tac chung - doi khong kem "
+                                     "symbol / session_id")
+                enabled = orb_rules.coerce_bool("enabled", raw)
+                continue
+            if key not in orb_rules.FIELDS:
+                raise ValueError(f"truong ORB khong ho tro: {key}. Cho phep: "
+                                 f"{['enabled', *orb_rules.FIELDS]}")
+            if layer == "session" and key not in orb_rules.SESSION_FIELDS:
+                raise ValueError(f"orb.{key} khong dat theo phien duoc (chi theo cap hoac "
+                                 f"defaults). Phien chi ghi de: {list(orb_rules.SESSION_FIELDS)}")
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
+                if layer == "defaults" and key in orb_rules.DEFAULTS:
+                    raise ValueError(f"orb.defaults.{key} khong xoa duoc - truong nay "
+                                     "phai luon co gia tri mac dinh")
+                layer_values.pop(key, None)
+                continue
+            layer_values[key] = orb_rules.coerce(key, raw)
+
+        diff: dict[str, dict[str, Any]] = {}
+        if enabled != block["enabled"]:
+            diff["enabled"] = {"from": block["enabled"], "to": enabled}
+        for key in orb_rules.FIELDS:
+            if current.get(key) != layer_values.get(key):
+                diff[key] = {"from": current.get(key), "to": layer_values.get(key)}
+
+        block["enabled"] = enabled
+        if layer == "defaults":
+            block["defaults"] = layer_values
+        elif layer == "symbol":
+            if layer_values:
+                block["symbol_overrides"][sym] = layer_values
+            else:
+                block["symbol_overrides"].pop(sym, None)
+        preview_sessions = {sid: layer_values} if sid else None
+        errors = _orb_consistency(block, sym, preview_sessions)
+        if errors:
+            raise ValueError("rule ORB khong hop le: " + "; ".join(errors))
+
+        resolved = orb_rules.resolve(block, sym or ORB_SYMBOL,
+                                     session_values=layer_values if sid else None,
+                                     session_id=sid or None)
+        base = {"layer": layer, "symbol": sym or None, "session_id": sid or None,
+                "changes": diff, "resolved": resolved,
+                "warnings": _orb_warnings(block, preview_sessions)}
+        if dry_run:
+            return {"updated": False, "dry_run": True, **base}
+        if not diff:
+            return {"updated": False, "reason": "gia tri moi trung gia tri cu", **base}
+
+        at = _now_iso()
+        rows = []
+        for field, change in diff.items():
+            row: dict[str, Any] = {
+                "at": at, "scope": "orb", "layer": layer, "field": field,
+                "from": change["from"], "to": change["to"],
+                "changes": {_orb_rule_path(layer, field, sym, sid): change},
+                "reason": reason, "source": source}
+            if sym:
+                row["symbol"] = sym
+            if sid:
+                row["session_id"] = sid
+            rows.append(row)
+        if session is not None:
+            # Override rule cua phien nam trong session store (cung cho voi tham so
+            # ky thuat cua phien); validator cua OrbService kiem them min < max.
+            flat = orb.normalize_overrides(session.get("overrides"), orb.SESSION_OVERRIDE_KEYS)
+            flat = {k: v for k, v in flat.items() if k not in orb.RULE_PARAM_KEYS}
+            ORB_SESSIONS.save({**session, "overrides": {**flat, **layer_values}},
+                              original_id=sid)
+        history = doc["history"] + rows
+        _write_json(RULES_FILE, {
+            "values": doc["stored_values"],
+            "symbols": doc["symbols"],
+            "updated_at": at,
+            "history": history,
+            "orb": block,
+        })
+    ORB_LOG("rules_change", scope="orb", layer=layer, symbol=sym or None,
+            session_id=sid or None, fields=list(diff), source=source)
+    if ORB_SCHEDULER is not None:
+        ORB_SCHEDULER.wake()       # vd bat/tat orb.enabled -> lich watch doi ngay
+    return {"updated": True, **base, "reason": reason, "source": source,
+            "history_rows": len(rows),
+            "changed_today": len(_changed_today(history, _today()))}
 
 
 # ---------------------------------------------------------------- klines
@@ -839,6 +1083,45 @@ def _journal_rows(days: list[str]) -> list[dict[str, Any]]:
     return rows
 
 
+def _is_orb(row: dict[str, Any]) -> bool:
+    return str(row.get("strategy") or "").upper() == "ORB"
+
+
+def _orb_today(day: str) -> dict[str, Any]:
+    """Quota + daily stop ORB rieng cua mot ngay (BR-ORB-05/06/09).
+
+    TM - #ORB-RULES - ORB Rule Set. Dem tu nhat ky theo or_date: journal chia
+    theo ngay cua server con or_date theo ngay cua phien, nen doc ca cac file
+    quanh ngay do (cung cach voi OrbService._orb_rows).
+    """
+    resolved = orb_rules.resolve(_rules_doc()["orb"], ORB_SYMBOL)
+    values = resolved["values"]
+    d = orb.parse_date(day)
+    rows = [r for r in _journal_rows([(d + timedelta(days=k)).isoformat() for k in (-1, 0, 1, 2)])
+            if _is_orb(r) and str(r.get("or_date") or "") == day]
+    stats = orb_rules.day_stats(rows)
+    cap, stop = values.get("max_trades_per_day"), values.get("daily_stop_loss")
+    remaining = max(0, int(cap) - stats["trades"]) if cap is not None else 0
+    stop_hit = stop is not None and stats["pnl"] <= float(stop)
+    missing = orb_rules.missing_errors(resolved, orb_rules.SCORE_FIELDS)
+    enabled = bool(ORB_ENABLED and resolved["enabled"])
+    return {
+        "symbol": ORB_SYMBOL,
+        "or_date": day,
+        "counted_by": "or_date",
+        "enabled": enabled,
+        "module_enabled": ORB_ENABLED,
+        "trades_taken": stats["trades"],
+        "trades_remaining": remaining,
+        "realized_pnl": stats["pnl"],
+        "daily_stop_hit": stop_hit,
+        "can_trade": bool(enabled and not missing and remaining > 0 and not stop_hit),
+        "missing_rules": missing,
+        "rules": values,
+        "sources": resolved["sources"],
+    }
+
+
 async def _orb_fetch(symbol: str, timeframe: str, limit: int | None,
                      source: str) -> dict[str, Any]:
     """Keo mot khung cho scheduler ORB. Dung chung FETCH_LOCK voi fetcher nen
@@ -868,7 +1151,9 @@ if ORB_ENABLED:
         cfg=ORB_CFG, sessions=ORB_SESSIONS,
         states=orb_runtime.StateStore(ORB_STATE_DIR), log=ORB_LOG,
         load_live=_orb_load_live, load_history=ORB_HISTORY.load, get_bias=_orb_bias,
-        journal_rows=_journal_rows, skips_dir=ORB_SKIPS_DIR, news_file=ORB_NEWS_FILE, tz=TZ)
+        journal_rows=_journal_rows, skips_dir=ORB_SKIPS_DIR, news_file=ORB_NEWS_FILE, tz=TZ,
+        # TM - #ORB-RULES - ORB Rule Set: rule ORB doc lai tu rules.json moi lan dung
+        rules_fn=lambda: _rules_doc()["orb"], shared_rules_fn=_load_rules)
     ORB_SCHEDULER = orb_runtime.OrbScheduler(
         ORB_SVC, fetch=_orb_fetch, history_update=_orb_history_update,
         history_ready=lambda: bool(ORB_HISTORY.files(ORB_SYMBOL)))
@@ -1251,7 +1536,18 @@ def get_rules(symbol: str = "", history_limit: int = 10) -> dict[str, Any]:
         "scope": {
             "chung_moi_cap": list(GLOBAL_RULE_KEYS),
             "rieng_tung_cap": list(SYMBOL_RULE_KEYS),
+            # TM - #ORB-RULES - ORB Rule Set
+            "orb": {
+                "defaults": ["enabled", *orb_rules.FIELDS],
+                "symbol_overrides": list(orb_rules.FIELDS),
+                "session": list(orb_rules.SESSION_FIELDS),
+                "note": ("lenh strategy=ORB cham bang bo rule nay, khong dung rule "
+                         "scalp/swing; chi max_margin_per_trade la dung chung"),
+            },
         },
+        # TM - #ORB-RULES - ORB Rule Set: bo rule ORB luu va ban da giai cho cap duoc hoi
+        "orb": doc["orb"],
+        "orb_resolved": orb_rules.resolve(doc["orb"], sym or ORB_SYMBOL),
         # Cap chua dat rieng thi an theo bo nay
         "defaults_for_symbols": {k: doc["values"][k] for k in SYMBOL_RULE_KEYS},
         "symbol_overrides": doc["symbols"],
@@ -1264,8 +1560,9 @@ def get_rules(symbol: str = "", history_limit: int = 10) -> dict[str, Any]:
 
 
 @mcp.tool()
-def update_rules(changes: dict[str, float], reason: str,
-                 symbol: str = "") -> dict[str, Any]:
+def update_rules(changes: dict[str, Any], reason: str,
+                 symbol: str = "", orb: bool = False,
+                 session_id: str = "") -> dict[str, Any]:
     """Doi quy dinh giao dich. Co hieu luc NGAY cho moi lan goi tool sau do.
 
     changes: chi dien rule muon doi, vd {"max_trades_per_day": 2}.
@@ -1279,7 +1576,22 @@ def update_rules(changes: dict[str, float], reason: str,
 
     Doi rule chung ma van dien symbol thi tool bao loi - khong am tham ghi nham
     pham vi.
+
+    orb = true: doi bo rule ORB rieng (khoi `orb` trong rules.json), vd
+      {"min_rr": 2} + symbol="BTCUSDT". Bo trong symbol = orb.defaults (va cong
+      tac {"enabled": false}); session_id = override cua phien (chi min/max_or_atr_ratio,
+      tp_r, buffer_pct, move_sl_to_be_at_r, time_exit_minutes, use_bias_filter,
+      allow_reversal, skip_news_days). Gia tri null = bo override (ke thua lop duoi).
+      Truong: max_stop_points, min_take_profit_points, min_rr, max_trades_per_day
+      (nguyen >= 0), daily_stop_loss (<= 0), margin_usd, leverage, maint_margin_pct,
+      liq_safety_pct + cac truong phien o tren. Moi truong doi la mot dong history.
     """
+    # TM - #ORB-RULES - ORB Rule Set: tham so `orb` che module orb trong ham nay
+    if orb:
+        return _apply_orb_rule_changes(changes, reason, symbol=symbol,
+                                       session_id=session_id, source="mcp")
+    if session_id:
+        raise ValueError("session_id chi dung voi orb = true (override rule ORB cua phien)")
     return _apply_rule_changes(changes, reason, symbol)
 
 
@@ -1294,8 +1606,12 @@ async def get_today_status(date: str = "", symbol: str = "", strategy: str = "",
     symbol: dien ten cap de khoi 'rules' tra ve dung nguong SL/TP/swing cua cap
       do. Bo trong = rule chung + gia tri mac dinh.
     strategy / session_id: loc them nhat ky theo chien luoc (ORB/WYCKOFF/OTHER)
-      va phien ORB - ket qua o khoi 'filtered'. Quota va daily stop VAN tinh tren
-      toan bo lenh trong ngay, khong tach theo strategy.
+      va phien ORB - ket qua o khoi 'filtered'.
+
+    Lenh ORB co quota + daily stop RIENG (rules.orb): trades_taken / realized_pnl /
+    daily_stop_hit / can_trade chi tinh lenh KHONG phai ORB; phan ORB o
+    orb_trades_taken / orb_trades_remaining / orb_realized_pnl / orb_daily_stop_hit /
+    can_trade_orb (dem theo or_date).
 
     Khi account.enabled = true, khoi 'exchange' chua so THAT lay tu san va
     'can_trade' duoc tinh theo so that do, khong phai theo nhat ky tu khai.
@@ -1308,11 +1624,17 @@ async def get_today_status(date: str = "", symbol: str = "", strategy: str = "",
     rules = _load_rules(sym)
     trades = _read_json(JOURNAL_DIR / f"{day}.json", [])
     closed = [t for t in trades if t.get("pnl") is not None]
-    journal_pnl = round(sum(float(t["pnl"]) for t in closed), 2)
+    # TM - #ORB-RULES - ORB Rule Set: phan chung loai tru lenh ORB (BR-ORB-09)
+    general = [t for t in trades if not _is_orb(t)]
+    orb_in_journal = [t for t in trades if _is_orb(t)]
+    orb_journal_pnl = round(sum(float(t["pnl"]) for t in orb_in_journal
+                                if t.get("pnl") is not None), 2)
+    journal_pnl = round(sum(float(t["pnl"]) for t in general if t.get("pnl") is not None), 2)
     edits = _changed_today(_rules_history(), day)
+    orb_today = _orb_today(day)
 
     # Mac dinh: chi co nhat ky tu khai
-    trades_counted = len(trades)
+    trades_counted = len(general)
     pnl_counted = journal_pnl
     source = "journal"
     exchange_block: dict[str, Any] | None = None
@@ -1339,8 +1661,11 @@ async def get_today_status(date: str = "", symbol: str = "", strategy: str = "",
             }
             # San la nguon su that. Lenh quen log van tinh vao quota.
             # Vi the mang tu hom truoc sang khong tinh - da tinh vao quota hom do roi.
-            trades_counted = max(len(trades), counts["opened_today"])
-            pnl_counted = data["totals"]["net"]
+            # TM - #ORB-RULES - ORB Rule Set: san khong biet lenh nao la ORB -> tru
+            # phan ORB theo nhat ky ra khoi so san
+            trades_counted = max(len(general), counts["opened_today"] - len(orb_in_journal), 0)
+            pnl_counted = (round(float(data["totals"]["net"]) - orb_journal_pnl, 2)
+                           if orb_journal_pnl else data["totals"]["net"])
             source = "exchange"
         except Exception as exc:
             # Mat ket noi san khong duoc lam hong buoc kiem tra ky luat
@@ -1376,13 +1701,22 @@ async def get_today_status(date: str = "", symbol: str = "", strategy: str = "",
         "journal_pnl": journal_pnl,
         "daily_stop_hit": stop_hit,
         "can_trade": remaining > 0 and not stop_hit,
-        "rules": rules,
+        # TM - #ORB-RULES - ORB Rule Set: quota + daily stop ORB rieng, theo or_date
+        "orb_trades_taken": orb_today["trades_taken"],
+        "orb_trades_remaining": orb_today["trades_remaining"],
+        "orb_realized_pnl": orb_today["realized_pnl"],
+        "orb_daily_stop_hit": orb_today["daily_stop_hit"],
+        "can_trade_orb": orb_today["can_trade"],
+        "orb_status": orb_today,
+        "rules": {**rules, "orb": orb_today["rules"]},
         # Quota va daily stop khong tach theo cap: chi mot tai khoan, mot ngan sach
         "rules_scope": {
             "chung_moi_cap": list(GLOBAL_RULE_KEYS),
             "rieng_tung_cap": list(SYMBOL_RULE_KEYS),
+            "orb": list(orb_rules.FIELDS),
             "note": ("quota lenh/ngay va daily_stop_loss dung chung cho tat ca "
-                     "cac cap; SL/TP/nguong swing thi theo tung cap"),
+                     "cac cap; SL/TP/nguong swing thi theo tung cap. Lenh ORB co "
+                     "quota/daily stop rieng (rules.orb), khong tinh vao phan chung"),
         },
         # Rule bi doi trong chinh ngay dang giao dich la tin hieu dang de y
         "rules_changed_today": edits,
@@ -1423,27 +1757,22 @@ def log_trade(
       session_id (bat buoc), variant (breakout | retest | reversal),
       or_date (ngay cua phien, bo trong = phien dang chay),
       or_high / or_low (bo trong = lay OR he thong da tinh).
-      Kiem tra them trade window, max_trades cua phien, max_orb_trades_per_day,
-      range bi loc, phien da skip. Ghi xong thi watch cua phien dung (taken).
+      Cham bang bo rule ORB rieng (rules.orb, rule_set = "orb") cung ham voi
+      check_trade, kem trade window, max_trades cua phien, range bi loc, phien da
+      skip. Ghi xong thi watch cua phien dung (taken).
     """
     day = date or _today()
     sym = _resolve_symbol(symbol)
     # TM - #ORB - ORB Enhancement: kiem tra truoc khi ghi de input sai khong de lai dong rac
     tag = _strategy_fields(strategy, variant, session_id, or_date, or_high, or_low)
-    orb_checks = _orb_trade_checks(tag, sym)
     path = JOURNAL_DIR / f"{day}.json"
     trades = _read_json(path, [])
-    realized = round(sum(float(t["pnl"]) for t in trades if t.get("pnl") is not None), 2)
-    rules = _load_rules(sym)
-
-    verdict = _evaluate_trade(
-        symbol=sym, side=side, entry=entry, stop=stop, target=target,
-        margin_usd=margin_usd, trade_type=trade_type, trades=trades,
-        rules=rules, realized=realized,
-    )
+    # TM - #ORB-RULES - ORB Rule Set: cung mot ham cham voi check_trade (BR-ORB-10)
+    verdict, orb_checks, rules = _score_trade(
+        tag, sym, side=side, entry=entry, stop=stop, target=target,
+        margin_usd=margin_usd, trade_type=trade_type, trades=trades)
     violations = verdict["rule_violations"]
     if orb_checks:
-        violations = violations + orb_checks["violations"]
         tag["or_date"] = orb_checks["or_date"]
         rng = orb_checks["opening_range"]
         tag["or_high"] = tag["or_high"] if tag["or_high"] is not None else rng.get("high")
@@ -1473,6 +1802,8 @@ def log_trade(
         "rule_violations": violations,
         # TM - #ORB - ORB Enhancement
         **tag,
+        # TM - #ORB-RULES - ORB Rule Set
+        **({"rule_set": "orb"} if orb_checks else {}),
     }
     trades.append(trade)
     _write_json(path, trades)
@@ -1525,15 +1856,41 @@ def _strategy_fields(strategy: str, variant: str, session_id: str, or_date: str,
     }
 
 
-def _orb_trade_checks(tag: dict[str, Any], symbol: str) -> dict[str, Any] | None:
-    """Quy tac ORB (BR-11) cho log_trade / check_trade. None neu khong phai ORB."""
-    # TM - #ORB - ORB Enhancement
-    if tag.get("strategy") != "ORB":
-        return None
-    checks = _orb().orb_checks(tag["session_id"], tag.get("or_date") or "")
-    if symbol != ORB_SYMBOL:
-        checks["violations"].append(f"ORB chi chay tren {ORB_SYMBOL}, lenh nay la {symbol}")
-    return checks
+def _score_trade(tag: dict[str, Any], symbol: str, *, side: str, entry: float,
+                 stop: float, target: float, margin_usd: float, trade_type: str,
+                 trades: list[dict[str, Any]]
+                 ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
+    """Chon bo rule theo strategy va cham - MOT ham cho check_trade va log_trade.
+
+    TM - #ORB-RULES - ORB Rule Set (BR-ORB-02, BR-ORB-10):
+      strategy = ORB -> rule ORB rieng (rules.orb) + quy tac phien, qua
+                        OrbService.score_trade (check_orb_signal dung cung ham do).
+      con lai        -> rule scalp/swing cua cap; quota va daily stop chung chi
+                        dem lenh KHONG phai ORB (BR-ORB-09).
+    Tra ve (verdict, orb_checks | None, bo rule chup vao nhat ky).
+    """
+    if tag.get("strategy") == "ORB":
+        svc = _orb()
+        verdict = svc.score_trade(tag["session_id"], tag.get("or_date") or "", side=side,
+                                  entry=entry, stop=stop, target=target,
+                                  margin_usd=margin_usd, trade_type=trade_type, symbol=symbol)
+        checks = verdict.pop("orb_checks")
+        verdict.pop("would_pass", None)
+        session = svc.resolve(tag["session_id"], include_disabled=True)[0]
+        resolved = svc.rules_for(session, symbol)
+        rules = {"rule_set": "orb", "values": resolved["values"],
+                 "sources": resolved["sources"],
+                 "max_margin_per_trade": verdict["limits_applied"]["max_margin_per_trade"]}
+        return verdict, checks, rules
+    general = [t for t in trades if not _is_orb(t)]
+    realized = round(sum(float(t["pnl"]) for t in general if t.get("pnl") is not None), 2)
+    rules = _load_rules(symbol)
+    verdict = _evaluate_trade(
+        symbol=symbol, side=side, entry=entry, stop=stop, target=target,
+        margin_usd=margin_usd, trade_type=trade_type, trades=general,
+        rules=rules, realized=realized,
+    )
+    return verdict, None, rules
 
 
 @mcp.tool()
@@ -1549,22 +1906,22 @@ def check_trade(side: str, entry: float, stop: float, target: float,
     symbol: bo trong = cap mac dinh. Nguong diem (SL toi da, TP toi thieu,
       nguong swing) lay theo dung cap nay, nen cham cung mot bo so tren hai cap
       khac nhau co the ra hai ket qua khac nhau - do la co y.
-    strategy = ORB (can session_id): cham them trade window, max_trades cua phien,
-      max_orb_trades_per_day, range bi loc, phien da skip - xem khoi 'orb_checks'.
+    strategy = ORB (can session_id): cham bang bo rule ORB rieng (rules.orb):
+      limits_applied lay tu rule ORB, rule_set = "orb", kiem them min_rr,
+      orb.daily_stop_loss, orb.max_trades_per_day (dem theo or_date) va SL trong
+      vung an toan thanh ly; trade_type bi bo qua (khong co swing / demote). Kem
+      trade window, max_trades cua phien, range bi loc, phien da skip - khoi
+      'orb_checks'. Chi max_margin_per_trade lay tu rule chung.
     """
     day = date or _today()
     sym = _resolve_symbol(symbol)
     # TM - #ORB - ORB Enhancement
     tag = _strategy_fields(strategy, "", session_id, or_date, 0.0, 0.0)
-    orb_checks = _orb_trade_checks(tag, sym)
     trades = _read_json(JOURNAL_DIR / f"{day}.json", [])
-    realized = round(sum(float(t["pnl"]) for t in trades if t.get("pnl") is not None), 2)
-
-    verdict = _evaluate_trade(
-        symbol=sym, side=side, entry=entry, stop=stop, target=target,
-        margin_usd=margin_usd, trade_type=trade_type, trades=trades,
-        rules=_load_rules(sym), realized=realized,
-    )
+    # TM - #ORB-RULES - ORB Rule Set: cung mot ham cham voi log_trade (BR-ORB-10)
+    verdict, orb_checks, _rules = _score_trade(
+        tag, sym, side=side, entry=entry, stop=stop, target=target,
+        margin_usd=margin_usd, trade_type=trade_type, trades=trades)
     out = {
         "date": day,
         "would_pass": not verdict["rule_violations"],
@@ -1572,9 +1929,7 @@ def check_trade(side: str, entry: float, stop: float, target: float,
         **verdict,
     }
     if orb_checks:
-        # TM - #ORB - ORB Enhancement: gop vi pham ORB vao cung danh sach
-        out["rule_violations"] = verdict["rule_violations"] + orb_checks["violations"]
-        out["would_pass"] = not out["rule_violations"]
+        # TM - #ORB - ORB Enhancement
         out["strategy"] = "ORB"
         out["orb_checks"] = orb_checks
     return out
@@ -2081,7 +2436,11 @@ def check_orb_signal(session_id: str = "", as_of: str = "",
 
     session_id: bo trong = moi phien dang bat.
     as_of: thoi diem UTC (ISO) de xem lai qua khu. Bo trong = bay gio.
-    risk_usd: > 0 thi ghi de risk.risk_usd trong config cho lan tinh nay.
+    risk_usd: KHONG con dung (BR-ORB-15) - qty = orb.margin_usd x orb.leverage / entry.
+      Truyen vao chi nhan lai mot dong warnings.
+    plan.rule_check: ket qua cham plan bang rule ORB (cung ham voi check_trade);
+      plan truot rule hoac cham daily stop ORB -> filters.rules = fail, blocked_by
+      chua "rules". orb.enabled = false -> data_status = orb_disabled.
     state: WAITING_OPEN, FORMING, RANGE_SET, BREAKOUT_LONG/SHORT,
       FAILED_BREAKOUT_LONG/SHORT, FILTERED, EXPIRED, SKIPPED, TAKEN.
     Chi doc du lieu da co - khong keo M5 (scheduler lo viec do, BR-03).
@@ -2092,8 +2451,6 @@ def check_orb_signal(session_id: str = "", as_of: str = "",
     at = orb.parse_utc(as_of) if as_of else now
     if at > now + 1000:
         raise ValueError(f"as_of o tuong lai ({iso_utc(at)} > {iso_utc(now)})")
-    if risk_usd and float(risk_usd) <= 0:
-        raise ValueError("risk_usd phai > 0")
     rows = []
     for session in svc.resolve(session_id, include_disabled=bool(session_id)):
         rows.append(svc.signal(session, svc.default_day(session, at), at,
@@ -2117,13 +2474,18 @@ def skip_orb_session(session_id: str, reason: str) -> dict[str, Any]:
 @mcp.tool()
 async def backtest_orb(from_date: str, to_date: str, session_ids: list[str] | None = None,
                        split_date: str = "", overrides: dict[str, Any] | None = None,
-                       initial_equity: float = 100.0) -> dict[str, Any]:
+                       initial_equity: float = 100.0,
+                       rules_override: dict[str, Any] | None = None) -> dict[str, Any]:
     """Backtest ORB tren M5 lich su, tra ve ban tom tat (khong tra du lieu tho).
 
     from_date / to_date: YYYY-MM-DD (ngay cua phien).
     session_ids: bo trong = moi phien dang bat.
     split_date: moc chia in-sample / out-of-sample (mac dinh 70% dau la in-sample).
     overrides: ghi de tham so, vd {"entry_mode": "retest", "tp_r": 2}.
+    rules_override: thu bo rule ORB khac ma khong sua rules.json, vd
+      {"min_take_profit_points": 900, "max_or_atr_ratio": 1.2} (BR-ORB-14).
+    Moi lenh gia lap duoc cham bang rule ORB hien hanh: ket qua co rules_used,
+    rejected_by_rule (dem theo rule) va stopped_days (ngay cham daily stop ORB).
     Lan dau phai tai M5 lich su nen co the > 60 giay: khi do tra status=running
     kem run_id, goi get_backtest_result(run_id) sau.
     """
@@ -2148,11 +2510,24 @@ async def backtest_orb(from_date: str, to_date: str, session_ids: list[str] | No
         sessions = svc.resolve()
     if not sessions:
         raise ValueError("khong co phien ORB nao dang bat de backtest")
+    # TM - #ORB-RULES - ORB Rule Set: rules_override chi ap cho lan chay nay
+    if rules_override is not None and not isinstance(rules_override, dict):
+        raise ValueError("rules_override phai la object {truong: gia tri}")
+    ro = {str(k).strip(): orb_rules.coerce(str(k).strip(), v)
+          for k, v in (rules_override or {}).items()} or None
     for session in sessions:
-        svc.params(session, flat)          # overrides sai thi bao ngay, truoc khi tai du lieu
+        svc.params(session, flat, rules_override=ro)   # sai thi bao ngay, truoc khi tai du lieu
+        errors = orb_rules.consistency(svc.rules_for(session, override=ro)["values"],
+                                       svc.window_minutes(session))
+        if errors:
+            raise ValueError(f"rules_override khong hop le cho phien {session['session_id']}: "
+                             + "; ".join(errors))
     request = {"from_day": from_day, "to_day": to_day, "split_day": split_day,
-               "overrides": flat, "initial_equity": float(initial_equity)}
-    return await ORB_BACKTEST.run(request, sessions, ORB_CFG, svc.news_days())
+               "overrides": flat, "initial_equity": float(initial_equity),
+               "rules_override": ro}
+    return await ORB_BACKTEST.run(
+        request, sessions, ORB_CFG, svc.news_days(), rules=svc.rules_block(),
+        max_margin_per_trade=_load_rules(ORB_SYMBOL).get("max_margin_per_trade"))
 
 
 @mcp.tool()
@@ -2168,20 +2543,47 @@ def get_backtest_result(run_id: str) -> dict[str, Any]:
 @mcp.tool()
 def get_orb_config() -> dict[str, Any]:
     """Cau hinh ORB dang ap dung (read-only): tham so chung, tham so da giai cho tung
-    phien (sau override), duong dan du lieu. Doi tham so chung o config.yaml,
-    doi phien o trang admin."""
+    phien (sau override), duong dan du lieu.
+
+    Rule ORB (quota, SL/TP/R:R, daily stop, sizing, min/max_or_atr_ratio, tham so
+    chien luoc) nam trong rules.json - khoi orb_rules / orb_resolved; moi phien co
+    'rules' voi {value, source} (session / symbol / defaults). Sua o /admin/orb
+    hoac update_rules(orb=true). Tham so ky thuat (khung, ATR, scheduler, phi)
+    van o config.yaml. warnings: field yaml cu bi bo qua (deprecated) va cau hinh
+    khong bao gio dat (rule_infeasible / liq_unsafe) theo ATR H1 hien tai."""
     svc = _orb()
     sessions = svc.resolve(include_disabled=True)
+    # TM - #ORB-RULES - ORB Rule Set
+    block = svc.rules_block()
+    base = svc.rules_for()
+    snapshot = svc.market_snapshot()
+
+    def session_rules(session: dict[str, Any]) -> dict[str, Any]:
+        resolved = svc.rules_for(session)
+        return {f: {"value": resolved["values"].get(f), "source": resolved["sources"].get(f)}
+                for f in orb_rules.SESSION_FIELDS}
+
     return {
         **_orb_as_of(),
-        "enabled": ORB_ENABLED,
+        "enabled": bool(ORB_ENABLED and block["enabled"]),
+        "module_enabled": ORB_ENABLED,
+        "orb_rules_enabled": block["enabled"],
         "config": ORB_CFG,
+        "orb_rules": block,
+        "orb_resolved": base,
+        "max_orb_trades_per_day": base["values"].get("max_trades_per_day"),
+        "max_orb_trades_per_day_source": (
+            f"rules.json orb ({base['sources'].get('max_trades_per_day') or 'chua dat'})"),
         "effective_defaults": svc.params(),
         "sessions": [{"session_id": s["session_id"], "enabled": s["enabled"],
-                      "overrides": s["overrides"], "params": svc.params(s)}
+                      "overrides": s["overrides"], "params": svc.params(s),
+                      "rules": session_rules(s)}
                      for s in sessions],
+        "market": snapshot,
+        "warnings": orb_rules.deprecated_fields(ORB_CFG) + _orb_warnings(block, snapshot=snapshot),
         "news_days": svc.news_days(),
         "paths": {"sessions": str(ORB_SESSIONS_FILE), "news_days": str(ORB_NEWS_FILE),
+                  "rules": str(RULES_FILE),
                   "m5_history": str(ORB_HISTORY_DIR), "backtests": str(ORB_BACKTEST_DIR),
                   "state": str(ORB_STATE_DIR), "logs": str(ORB_LOG_DIR),
                   "skips": str(ORB_SKIPS_DIR)},
@@ -2342,7 +2744,7 @@ async def http_admin_save(request):
         # gan ten cap - nhin lai van biet siet cap nao.
         rules_touched = False
         for numeric, sym in batches:
-            result = _apply_rule_changes(numeric, reason, symbol=sym)
+            result = _apply_rule_changes(numeric, reason, symbol=sym, source="admin")
             if not result["updated"]:
                 continue
             rules_touched = True
@@ -2439,6 +2841,80 @@ async def http_admin_test(request):
 # TM - #ORB - ORB Enhancement: trang quan ly phien ORB (BR-12)
 ADMIN_ORB_PATH = ADMIN_PATH.rstrip("/") + "/orb"
 ADMIN_ORB_ACTION_PATH = ADMIN_ORB_PATH + "/sessions"
+# TM - #ORB-RULES - ORB Rule Set: phan "Rule ORB" + news days tren trang /admin/orb
+ADMIN_ORB_RULES_PATH = ADMIN_ORB_PATH + "/rules"
+
+
+def _news_entries() -> list[dict[str, str]]:
+    """File news days: [{date, note}]. Dang cu (list chuoi / {"dates": [...]}) van doc duoc."""
+    raw = _read_json(ORB_NEWS_FILE, [])
+    if isinstance(raw, dict):
+        raw = raw.get("dates") or raw.get("days") or []
+    out: dict[str, dict[str, str]] = {}
+    for item in raw if isinstance(raw, list) else []:
+        if isinstance(item, dict):
+            day, note = str(item.get("date") or "")[:10], str(item.get("note") or "")
+        else:
+            day, note = str(item)[:10], ""
+        if day:
+            out[day] = {"date": day, "note": note}
+    return [out[k] for k in sorted(out)]
+
+
+def _news_change(action: str, day: str, note: str = "") -> dict[str, Any]:
+    day = orb.parse_date(day).isoformat()
+    with _RULES_LOCK:
+        entries = {e["date"]: e for e in _news_entries()}
+        if action == "news_add":
+            entries[day] = {"date": day, "note": str(note or "").strip()[:200]}
+        elif day in entries:
+            entries.pop(day)
+        else:
+            raise ValueError(f"ngay {day} khong co trong danh sach news days")
+        _write_json(ORB_NEWS_FILE, [entries[k] for k in sorted(entries)])
+    ORB_LOG("news_days", action=action, date=day)
+    if ORB_SCHEDULER is not None:
+        ORB_SCHEDULER.wake()
+    return {"ok": True, "date": day, "news_days": _news_entries()}
+
+
+def _orb_rules_view() -> dict[str, Any]:
+    """Du lieu cho phan Rule ORB: gia tri tung lop + ban da giai + trang thai hom nay."""
+    svc = _orb()
+    doc = _rules_doc()
+    block = doc["orb"]
+    symbols = sorted({ORB_SYMBOL, *block["symbol_overrides"]})
+    scopes = [{"key": "defaults", "label": "orb.defaults (moi cap)", "layer": "defaults",
+               "values": block["defaults"],
+               "resolved": orb_rules.resolve({**block, "symbol_overrides": {}}, ORB_SYMBOL)}]
+    for sym in symbols:
+        scopes.append({"key": f"symbol:{sym}", "label": f"Cap {sym}", "layer": "symbol",
+                       "symbol": sym, "values": block["symbol_overrides"].get(sym, {}),
+                       "resolved": orb_rules.resolve(block, sym)})
+    for session in ORB_SESSIONS.all(include_disabled=True):
+        sid = session["session_id"]
+        scopes.append({"key": f"session:{sid}", "label": f"Phien {sid} ({session['name']})",
+                       "layer": "session", "session_id": sid,
+                       "values": svc.session_rule_values(session),
+                       "resolved": svc.rules_for(session)})
+    today = _orb_today(_today())
+    snapshot = svc.market_snapshot()
+    history = [h for h in doc["history"] if h.get("scope") == "orb"][-30:]
+    return {
+        "enabled": block["enabled"],
+        "symbol": ORB_SYMBOL,
+        "scopes": scopes,
+        "fields": {k: {**v, "session": k in orb_rules.SESSION_FIELDS,
+                       "required_default": k in orb_rules.DEFAULTS}
+                   for k, v in orb_rules.FIELDS.items()},
+        "status": today,
+        "market": snapshot,
+        "warnings": orb_rules.deprecated_fields(ORB_CFG) + _orb_warnings(block, snapshot=snapshot),
+        "history": list(reversed(history)),
+        "news_days": _news_entries(),
+        "news_file": str(ORB_NEWS_FILE),
+        "rules_file": str(RULES_FILE),
+    }
 
 
 def _orb_admin_page() -> str:
@@ -2453,7 +2929,38 @@ def _orb_admin_page() -> str:
         global_params=svc.params(),
         setup_required=not STORE.has_auth(),
         now_ms=svc.now(),
+        # TM - #ORB-RULES - ORB Rule Set
+        rules_view=_orb_rules_view(),
+        rules_path=ADMIN_ORB_RULES_PATH,
     )
+
+
+def _orb_rules_action(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    """POST /admin/orb/rules: preview | save | news_add | news_delete."""
+    action = str(payload.get("action") or "")
+    try:
+        if action in ("news_add", "news_delete"):
+            return 200, _news_change(action, str(payload.get("date") or ""),
+                                     str(payload.get("note") or ""))
+        if action not in ("preview", "save"):
+            return 400, {"error": f"action khong ho tro: {action!r}"}
+        scope = str(payload.get("scope") or "defaults")
+        kind, _, name = scope.partition(":")
+        if kind not in ("defaults", "symbol", "session"):
+            return 400, {"error": f"scope khong hop le: {scope!r}"}
+        changes = payload.get("changes")
+        if not isinstance(changes, dict):
+            return 400, {"error": "changes phai la object"}
+        result = _apply_orb_rule_changes(
+            changes, str(payload.get("reason") or ""),
+            symbol=name if kind == "symbol" else "",
+            session_id=name if kind == "session" else "",
+            source="admin", dry_run=action == "preview")
+        return 200, {"ok": True, **result}
+    except orb.SessionValidationError as exc:
+        return 400, {"error": str(exc), "errors": exc.errors}
+    except ValueError as exc:
+        return 400, {"error": str(exc)}
 
 
 @mcp.custom_route(ADMIN_ORB_PATH, methods=["GET"])
@@ -2482,6 +2989,23 @@ async def http_admin_orb_sessions(request):
     status, body = await asyncio.to_thread(
         admin_orb.handle, payload, sessions=ORB_SESSIONS, now_ms=ORB_SVC.now(),
         params_for=ORB_SVC.params)
+    return JSONResponse(body, status_code=status)
+
+
+@mcp.custom_route(ADMIN_ORB_RULES_PATH, methods=["POST"])
+async def http_admin_orb_rules(request):
+    """TM - #ORB-RULES - ORB Rule Set: luu rule ORB / news days tu trang admin."""
+    if not ORB_ENABLED:
+        return JSONResponse({"error": "ORB dang tat"}, status_code=404)
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "body khong phai JSON"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "body phai la object"}, status_code=400)
+    if not _setup_ok(payload):
+        return JSONResponse({"error": "Setup token sai"}, status_code=403)
+    status, body = await asyncio.to_thread(_orb_rules_action, payload)
     return JSONResponse(body, status_code=status)
 
 
@@ -2567,7 +3091,9 @@ def build_app():
             public_paths=(SRV["health_path"],),
             setup_paths=(ADMIN_PATH, ADMIN_SAVE_PATH, ADMIN_TEST_PATH, ADMIN_SYMBOL_PATH,
                          # TM - #ORB - ORB Enhancement
-                         ADMIN_ORB_PATH, ADMIN_ORB_ACTION_PATH),
+                         ADMIN_ORB_PATH, ADMIN_ORB_ACTION_PATH,
+                         # TM - #ORB-RULES - ORB Rule Set
+                         ADMIN_ORB_RULES_PATH),
         )
 
     inner = app.router.lifespan_context
@@ -2632,6 +3158,10 @@ if __name__ == "__main__":
         print(f"BAMCP ORB: symbol={ORB_SYMBOL} sessions={ORB_SESSIONS.ids()} "
               f"admin={ADMIN_ORB_PATH} m5_history={'co' if ORB_HISTORY.files(ORB_SYMBOL) else 'chua tai'}",
               file=sys.stderr)
+        # TM - #ORB-RULES - ORB Rule Set: field yaml cu bi bo qua (BR-ORB-18)
+        for warning in orb_rules.deprecated_fields(ORB_CFG):
+            print(f"CANH BAO: {warning}", file=sys.stderr)
+            ORB_LOG("deprecated", warning=warning)
     else:
         print("BAMCP ORB: tat (orb.enabled = false)", file=sys.stderr)
 

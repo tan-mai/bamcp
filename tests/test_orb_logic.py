@@ -11,6 +11,7 @@ from datetime import date
 from orb_support import M5_MS, P, bar, default_sessions, ms, orb_cfg
 
 import orb
+import orb_rules
 
 
 def params(**overrides):
@@ -172,9 +173,22 @@ class ParamsTest(unittest.TestCase):
 
     def test_missing_config_key_fails_fast(self):
         cfg = orb_cfg()
-        del cfg["exit"]["tp_r"]
+        del cfg["exit"]["sl_mode"]
         with self.assertRaises(ValueError):
             orb.effective_params(cfg)
+
+    # TM - #ORB-RULES - ORB Rule Set
+    def test_rule_params_come_from_rule_set_not_yaml(self):
+        cfg = orb_cfg()
+        cfg["exit"] = {**cfg["exit"], "tp_r": 9.0}     # yaml cu bi bo qua (BR-ORB-18)
+        block = orb_rules.migrate(orb_cfg())[0]
+        block["defaults"]["tp_r"] = 2.0
+        p = orb.effective_params(cfg, rules=block)
+        self.assertEqual((p["tp_r"], p["rule_sources"]["tp_r"]), (2.0, "defaults"))
+        del block["defaults"]["tp_r"]
+        with self.assertRaises(ValueError) as ctx:
+            orb.effective_params(cfg, rules=block)
+        self.assertIn("chua dat rule ORB cho BTCUSDT.tp_r", str(ctx.exception))
 
 
 def m5(i, o, h, low, c):
@@ -264,14 +278,16 @@ class ScanSignalsTest(unittest.TestCase):
 
 
 class SizingTest(unittest.TestCase):
-    def test_tc18_sizing_example(self):
-        sizing, warnings = orb.size_position(100000, 500, 1, params())
-        self.assertEqual(sizing["qty"], 0.002)
-        self.assertEqual(sizing["notional"], 200)
-        self.assertEqual(sizing["margin"], 20)
-        self.assertEqual(sizing["leverage"], 10)
-        self.assertEqual(sizing["fee_est_usd"], 0.28)
-        self.assertEqual(sizing["fee_in_r"], 0.28)
+    # TM - #ORB-RULES - ORB Rule Set: size = margin_usd x leverage / entry (BR-ORB-15)
+    def test_ac14_sizing_margin_x_leverage(self):
+        sizing, warnings = orb.size_position(83500, 300, params())
+        self.assertEqual(sizing["qty"], 0.023)              # 20 x 100 / 83500 = 0.02395
+        self.assertEqual(sizing["notional"], 1920.5)
+        self.assertEqual(sizing["margin"], 19.2)             # 1920.5 / 100, lam tron 2 so
+        self.assertEqual((sizing["margin_usd"], sizing["leverage"]), (20.0, 100.0))
+        self.assertEqual(sizing["sizing"], "margin_x_leverage")
+        self.assertEqual(sizing["fee_est_usd"], 2.69)       # 1920.5 x 2 x 0.07%
+        self.assertEqual(sizing["risk_actual_usd"], 6.9)
         self.assertEqual(warnings, [])
 
     def test_tc18_plan_matches(self):
@@ -279,24 +295,29 @@ class SizingTest(unittest.TestCase):
                                         or_low=99500, params=params(), trigger_close_ms=T0,
                                         risk_usd=1)
         self.assertEqual((plan["sl"], plan["tp"], plan["r_distance"]), (99500, 100750, 500))
-        self.assertEqual((plan["qty"], plan["notional"], plan["margin"]), (0.002, 200, 20))
+        # risk_usd khong con anh huong size
+        self.assertEqual((plan["qty"], plan["notional"], plan["margin"]), (0.02, 2000, 20))
+        self.assertEqual(plan["risk_usd"], 10)
         self.assertEqual(plan["time_exit_utc"], "2026-09-29T16:45:00Z")
 
     def test_tc19_below_min_notional_warns_and_keeps_size(self):
-        sizing, warnings = orb.size_position(60000, 600, 0.9, params())
+        p = {**params(), "margin_usd": 0.6, "leverage": 100.0}
+        sizing, warnings = orb.size_position(60000, 600, p)
         self.assertEqual(sizing["qty"], 0.001)              # khong tu tang size
         self.assertEqual(sizing["notional"], 60)
         self.assertTrue(any(w.startswith("below_min_notional") for w in warnings))
 
     def test_qty_below_step(self):
-        sizing, warnings = orb.size_position(100000, 500, 0.4, params())
+        p = {**params(), "margin_usd": 0.4, "leverage": 100.0}
+        sizing, warnings = orb.size_position(100000, 500, p)
         self.assertEqual(sizing["qty"], 0)
         self.assertTrue(any(w.startswith("qty_below_step") for w in warnings))
 
-    def test_margin_over_max_warns(self):
-        sizing, warnings = orb.size_position(100000, 100, 1, params())
-        self.assertEqual(sizing["qty"], 0.01)
-        self.assertTrue(any(w.startswith("margin_exceeds_max") for w in warnings))
+    def test_missing_sizing_rule_gives_no_qty(self):
+        p = {k: v for k, v in params().items() if k != "margin_usd"}
+        sizing, warnings = orb.size_position(100000, 500, p)
+        self.assertIsNone(sizing["qty"])
+        self.assertTrue(any(w.startswith("no_sizing") for w in warnings))
 
     def test_sl_mid(self):
         plan, _ = orb.build_plan(direction="long", entry=P + 40, or_high=OR_HIGH,
@@ -319,10 +340,16 @@ class RangeFilterTest(unittest.TestCase):
         self.assertEqual(orb.range_metrics(P + 70, P - 70, 100, p)["range_flag"], "too_wide")
         ok = orb.range_metrics(P + 30, P - 30, 100, p)
         self.assertEqual((ok["range_flag"], ok["size"], ok["size_atr_ratio"]), ("ok", 60, 0.6))
-        # bien 0.3 va 1.2 van hop le
+        # TM - #ORB-RULES - ORB Rule Set: bien 0.3 va 0.7 (BR-ORB-16) van hop le
         self.assertEqual(orb.range_metrics(P + 15, P - 15, 100, p)["range_flag"], "ok")
-        self.assertEqual(orb.range_metrics(P + 60, P - 60, 100, p)["range_flag"], "ok")
+        self.assertEqual(orb.range_metrics(P + 35, P - 35, 100, p)["range_flag"], "ok")
+        self.assertEqual(orb.range_metrics(P + 36, P - 36, 100, p)["range_flag"], "too_wide")
         self.assertIsNone(orb.range_metrics(P + 30, P - 30, None, p)["range_flag"])
+
+    def test_ac16_or_atr_0748_is_too_wide(self):
+        # OR 345.9 / ATR 462.42 = 0.748 > 0.7
+        m = orb.range_metrics(83845.9, 83500.0, 462.42, params())
+        self.assertEqual(m["range_flag"], "too_wide")
 
     def test_atr_wilder_flat(self):
         bars = [bar(i * 3600_000, P, P + 50, P - 50, P) for i in range(200)]
