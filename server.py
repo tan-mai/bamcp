@@ -28,6 +28,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import JSONResponse
 
 import admin       # module cuc bo: trang cai dat
+import admin_gann  # TM - #GANN-TW - Gann Time Windows: trang admin Gann
 import exchanges   # module cuc bo: adapter doc tai khoan san
 import gann_backtest  # TM - #GANN-TW - Gann Time Windows: backtest walk-forward
 import gann_pivots  # TM - #GANN-TW - Gann Time Windows: pivot swing chart & trang thai song
@@ -1332,10 +1333,11 @@ def _evaluate_trade(*, symbol: str, side: str, entry: float, stop: float,
 # ------------------------------------------------- Gann time windows (pivot)
 
 # TM - #GANN-TW - Gann Time Windows
-GANN_CFG: dict[str, Any] = CFG.get("time_windows") or {}
-GANN_ENABLED = bool(GANN_CFG.get("enabled"))
-GANN_PIVOT_CFG: dict[str, Any] = GANN_CFG.get("pivots") or {}
-GANN_PATHS: dict[str, Any] = GANN_CFG.get("paths") or {}
+# Ban goc tu config.yaml. enabled va paths chi doc tu day (doi thi restart);
+# cac khoi con lai sua duoc tren trang admin - doc qua _gann_cfg().
+GANN_YAML: dict[str, Any] = CFG.get("time_windows") or {}
+GANN_ENABLED = bool(GANN_YAML.get("enabled"))
+GANN_PATHS: dict[str, Any] = GANN_YAML.get("paths") or {}
 # Chi hai khung nay co pivot. Khung nho hon khong co y nghia Gann o day: cua so
 # thoi gian do bang ngay, ma mot nen 4h thi khong dinh duoc moc ngay nao ca.
 GANN_TIMEFRAMES = ("1w", "1d")
@@ -1345,7 +1347,12 @@ GANN_EVENTS_FILE = DATA_ROOT / str(
     GANN_PATHS.get("events") or "time_windows/events.json")
 GANN_BACKTEST_DIR = DATA_ROOT / str(
     GANN_PATHS.get("backtests") or "time_windows/backtests")
-GANN_BACKTEST_CFG: dict[str, Any] = GANN_CFG.get("backtest") or {}
+GANN_CONFIG_FILE = DATA_ROOT / str(
+    GANN_PATHS.get("config") or "time_windows/config.json")
+# Khoi config sua duoc tren trang admin. Moi khoi thay CA KHOI, khong tron tung
+# truong: cai dang thay tren trang la dung cai dang chay, khong co gi lan tu yaml.
+GANN_EDITABLE = ("symbols", "pivots", "projections", "scoring", "backtest", "context")
+_GANN_CFG_CACHE: dict[str, Any] = {"mtime": None, "cfg": None, "warning": None}
 # Tien to run_id, de get_backtest_result biet doc ket qua o dau (ORB hay Gann)
 GANN_RUN_PREFIX = "tw-"
 GANN_BACKTEST_TASKS: set[asyncio.Task] = set()
@@ -1360,6 +1367,37 @@ GANN_OMIT = GANN_INTERNAL + ("timeframe", "time_ms", "confirmed_at_ms",
                              "major_until_ms")
 
 
+def _gann_cfg() -> dict[str, Any]:
+    """Config time_windows dang hieu luc: config.yaml, de tung khoi bang file admin.
+
+    Doc lai khi file doi (theo mtime) - day la cho 9.5 "sua tren admin, lan goi
+    sau phan anh ngay, khong restart". KHONG sua dict tra ve: no la ban dung
+    chung, can sua thi deepcopy.
+    """
+    try:
+        mtime = GANN_CONFIG_FILE.stat().st_mtime_ns
+    except OSError:
+        mtime = None
+    if _GANN_CFG_CACHE["cfg"] is not None and _GANN_CFG_CACHE["mtime"] == mtime:
+        return _GANN_CFG_CACHE["cfg"]
+    cfg = copy.deepcopy(GANN_YAML)
+    warning = None
+    if mtime is not None:
+        try:
+            override = _read_json(GANN_CONFIG_FILE, {})
+        except Exception as exc:
+            # File hong thi chay bang config.yaml va bao ra, khong lam sap tool
+            override = {}
+            warning = f"{GANN_CONFIG_FILE.name} loi ({type(exc).__name__}) - dang dung config.yaml"
+            print(f"CANH BAO: {warning}", file=sys.stderr)
+        if isinstance(override, dict):
+            for key in GANN_EDITABLE:
+                if key in override:
+                    cfg[key] = override[key]
+    _GANN_CFG_CACHE.update(mtime=mtime, cfg=cfg, warning=warning)
+    return cfg
+
+
 def _gann_require() -> None:
     if not GANN_ENABLED:
         raise ValueError(
@@ -1370,7 +1408,7 @@ def _gann_require() -> None:
 def _gann_symbols() -> list[str]:
     """Cap duoc tinh pivot: danh sach trong config, giao voi cap dang bat."""
     active = _symbols()
-    wanted = [str(s).upper() for s in (GANN_CFG.get("symbols") or [])]
+    wanted = [str(s).upper() for s in (_gann_cfg().get("symbols") or [])]
     if not wanted:
         return active
     return [s for s in wanted if s in active]
@@ -1419,7 +1457,7 @@ def _gann_fingerprint(symbol: str) -> dict[str, Any]:
     manual = _gann_manual(symbol, "1d") + _gann_manual(symbol, "1w")
     return {
         "last_closed": last,
-        "config": json.dumps(GANN_PIVOT_CFG, sort_keys=True, default=str),
+        "config": json.dumps(_gann_cfg().get("pivots") or {}, sort_keys=True, default=str),
         "manual": json.dumps(manual, sort_keys=True, default=str),
         "timezone": str(TZ),
     }
@@ -1455,7 +1493,7 @@ def _gann_compute(symbol: str) -> dict[str, Any]:
             continue
         dates = [_bar_date(b) for b in closed]
         records, notes = gann_pivots.build(
-            closed, dates, tf, GANN_PIVOT_CFG, _tf_ms(tf),
+            closed, dates, tf, _gann_cfg().get("pivots") or {}, _tf_ms(tf),
             manual=_gann_manual(symbol, tf),
             major_pivots=majors)
         warnings.extend(f"{tf}: {n}" for n in notes)
@@ -1547,7 +1585,7 @@ def _gann_compact_hit(hit: dict[str, Any]) -> dict[str, Any]:
 
 def _gann_config_version() -> str:
     """Dau tay cua config time_windows, de doc ket qua cu con biet no sinh ra tu dau."""
-    raw = json.dumps(GANN_CFG, sort_keys=True, default=str).encode("utf-8")
+    raw = json.dumps(_gann_cfg(), sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:12]
 
 
@@ -1597,7 +1635,8 @@ def _gann_window_pivots(symbol: str, as_of_ms: int
 
 
 def _gann_margin_ms() -> int:
-    return int(GANN_PIVOT_CFG.get("major_merge_days") or 3) * 86_400_000
+    pivots = _gann_cfg().get("pivots") or {}
+    return int(pivots.get("major_merge_days") or 3) * 86_400_000
 
 
 # TM - #GANN-TW - Gann Time Windows
@@ -1623,7 +1662,8 @@ def _gann_backtest_execute(run_id: str, request: dict[str, Any]) -> dict[str, An
         last = max(i for i, d in enumerate(dates) if d <= end.isoformat())
         days = [date.fromisoformat(d) for d in dates[first:last + 1]]
 
-        cfg = copy.deepcopy(GANN_CFG)
+        cfg = copy.deepcopy(request["cfg"])
+        backtest_cfg = cfg.get("backtest") or {}
         events = request["events"]
         tolerance = int((cfg.get("projections") or {}).get("tolerance_days") or 0)
         excluded = [False] * len(days)
@@ -1654,11 +1694,11 @@ def _gann_backtest_execute(run_id: str, request: dict[str, Any]) -> dict[str, An
         # Tinh ket qua tren CA chuoi nen roi moi cat: ATR va volume can lich su
         # truoc ngay start.
         outcomes = gann_backtest.outcome_metrics(bars, dates, pivot_dates,
-                                                 GANN_BACKTEST_CFG)[first:last + 1]
+                                                 backtest_cfg)[first:last + 1]
 
         report = gann_backtest.run(
             scored, outcomes, cfg, int(request["permutations"]), int(request["seed"]),
-            int(GANN_BACKTEST_CFG.get("shift_days") or 30), excluded)
+            int(backtest_cfg.get("shift_days") or 30), excluded)
         win_runs = report.pop("_window_runs")
         in_window = [False] * len(days)
         for a, b in win_runs:
@@ -2039,7 +2079,70 @@ def get_context(symbol: str = "", timeframes: list[str] | None = None) -> dict[s
             result[tf.lower()] = _build_context(sym, tf.lower())
         except Exception as exc:
             result[tf.lower()] = {"error": str(exc)}
-    return {"symbol": sym, "generated_at": _now_iso(), "contexts": result}
+    # TM - #GANN-TW - Gann Time Windows: swing_state / time_windows_next_7d
+    return {"symbol": sym, "generated_at": _now_iso(), "contexts": result,
+            **_gann_context(sym)}
+
+
+# TM - #GANN-TW - Gann Time Windows
+def _gann_context(sym: str) -> dict[str, Any]:
+    """Hai field Gann gon cho get_context (FR-4.1). Tat co thi tra {} - field bien mat.
+
+    swing_state: cac truong chinh cua get_swing_state 1d, bo mang nhip hoi.
+    time_windows_next_7d: chi khi context.time_windows bat - xem config.
+    Loi o day khong duoc lam hong get_context: bao trong field, khong nem ra.
+    """
+    if not GANN_ENABLED:
+        return {}
+    ctx = _gann_cfg().get("context") or {}
+    if not ctx.get("include_in_get_context") or sym not in _gann_symbols():
+        return {}
+    out: dict[str, Any] = {}
+    try:
+        state = _gann_swing_state(sym, "1d")
+        leg = state.get("current_leg") or {}
+        pivot = leg.get("from_pivot") or {}
+        out["swing_state"] = {
+            "timeframe": "1d",
+            "trend": state["trend"],
+            "current_leg": {
+                "direction": leg.get("direction"), "bars": leg.get("bars"),
+                "amplitude_pct": leg.get("amplitude_pct"),
+                "from": f"{pivot.get('type')} {pivot.get('date')} {pivot.get('price')}",
+            } if leg else None,
+            "max_correction_bars": state["max_correction_bars"],
+            "max_correction_depth": state["max_correction_depth"],
+            "time_overbalanced": state["time_overbalanced"],
+            "price_overbalanced": state["price_overbalanced"],
+            "note": state["note"],
+        }
+    except Exception as exc:
+        out["swing_state"] = {"error": str(exc)}
+    if ctx.get("time_windows"):
+        try:
+            data = _gann_time_windows(sym, int(ctx.get("horizon_days") or 7), 0, "",
+                                      int(ctx.get("max_windows") or 3))
+            cap = max(1, int(ctx.get("max_hits") or 3))
+            out["time_windows_next_7d"] = {
+                "windows": [{**{k: w[k] for k in ("from", "to", "peak", "score")},
+                             "hits": [_gann_hit_text(h) for h in w["hits"][:cap]]}
+                            for w in data["windows"]],
+                "note": "Gia thuyet ve THOI DIEM, khong noi huong gia. Chua kiem chung.",
+            }
+        except Exception as exc:
+            out["time_windows_next_7d"] = {"error": str(exc)}
+    return out
+
+
+def _gann_hit_text(hit: dict[str, Any]) -> str:
+    """Mot hit thanh mot dong chu - get_context can gon hon get_time_windows."""
+    label = {"cycle": f"cycle {hit.get('days')}d",
+             "anniversary": f"anniversary {hit.get('years')}y",
+             "swing_duration": f"swing x{hit.get('ratio')} ({hit.get('days')}d)",
+             "range_square": f"range_square {hit.get('days')}d"}.get(
+        hit.get("type"), f"{hit.get('type')} {hit.get('name') or ''}".strip())
+    source = f" <- {hit['pivot']}" if hit.get("pivot") else ""
+    return f"{label}{source} ({hit.get('score')})"
 
 
 @mcp.tool()
@@ -3244,7 +3347,11 @@ def get_swing_state(symbol: str = "", timeframe: str = "1d") -> dict[str, Any]:
     Doc 'note' truoc, no gom ca ket luan trong mot cau.
     """
     _gann_require()
-    sym = _resolve_symbol(symbol)
+    return _gann_swing_state(_resolve_symbol(symbol), timeframe)
+
+
+def _gann_swing_state(sym: str, timeframe: str) -> dict[str, Any]:
+    """Than cua get_swing_state - get_context dung chung."""
     pivots, doc = _gann_frame(sym, timeframe)
     tf = timeframe.strip().lower()
     try:
@@ -3293,13 +3400,19 @@ def get_time_windows(symbol: str = "", horizon_days: int = 30, min_score: float 
     cua so nao de de xuat vao lenh.
     """
     _gann_require()
-    sym = _resolve_symbol(symbol)
+    return _gann_time_windows(_resolve_symbol(symbol), horizon_days, min_score, as_of,
+                              max_windows)
+
+
+def _gann_time_windows(sym: str, horizon_days: int = 30, min_score: float = 0,
+                       as_of: str = "", max_windows: int = 5) -> dict[str, Any]:
+    """Than cua get_time_windows - get_context dung chung."""
     day, as_of_ms = _gann_as_of(as_of)
     horizon = max(1, min(int(horizon_days or 30), 365))
     pivots, warnings = _gann_window_pivots(sym, as_of_ms)
     events, event_warnings = _gann_events()
     result = gann_windows.build(
-        pivots, day, horizon, GANN_CFG, events, sym,
+        pivots, day, horizon, _gann_cfg(), events, sym,
         min_score=float(min_score or 0) or None,
         max_windows=max(1, min(int(max_windows or 5), 20)))
     for window in result["windows"]:
@@ -3309,7 +3422,8 @@ def get_time_windows(symbol: str = "", horizon_days: int = 30, min_score: float 
         **result,
         "pivots_used": len(pivots),
         "config_version": _gann_config_version(),
-        "warnings": warnings + event_warnings,
+        "warnings": warnings + event_warnings
+        + ([_GANN_CFG_CACHE["warning"]] if _GANN_CFG_CACHE.get("warning") else []),
     }
 
 
@@ -3355,7 +3469,8 @@ async def backtest_time_windows(symbol: str = "", start: str = "", end: str = ""
         raise ValueError(f"{sym} chi co {len(closed)} nen 1d - can backfill_klines truoc")
     dates = [_bar_date(b) for b in closed]
 
-    warmup = int(GANN_BACKTEST_CFG.get("warmup_days") or 120)
+    cfg_snapshot = copy.deepcopy(_gann_cfg())
+    warmup = int((cfg_snapshot.get("backtest") or {}).get("warmup_days") or 120)
     first_day = date.fromisoformat(dates[0]) + timedelta(days=warmup)
     last_day = date.fromisoformat(dates[-1])
     try:
@@ -3375,6 +3490,7 @@ async def backtest_time_windows(symbol: str = "", start: str = "", end: str = ""
         "permutations": perms, "seed": int(seed), "exclude_events": bool(exclude_events),
         "records_1d": records_1d, "records_1w": records_1w, "bars": closed,
         "dates": dates, "events": events, "config_version": _gann_config_version(),
+        "cfg": cfg_snapshot,
     }
     stamp = datetime.now(TZ).strftime("%Y%m%dT%H%M%S")
     run_id = f"{GANN_RUN_PREFIX}{stamp}-{secrets.token_hex(3)}"
@@ -3500,6 +3616,8 @@ async def http_admin(request):
         symbol_rule_keys=SYMBOL_RULE_KEYS,
         # TM - #ORB - ORB Enhancement
         orb_path=ADMIN_ORB_PATH if ORB_ENABLED else "",
+        # TM - #GANN-TW - Gann Time Windows
+        gann_path=ADMIN_GANN_PATH if GANN_ENABLED else "",
     )
     return HTMLResponse(page, headers={"Cache-Control": "no-store"})
 
@@ -3839,6 +3957,344 @@ async def http_admin_orb_rules(request):
     return JSONResponse(body, status_code=status)
 
 
+# ---------------------------------------------------------------- admin Gann
+
+# TM - #GANN-TW - Gann Time Windows
+ADMIN_GANN_PATH = ADMIN_PATH.rstrip("/") + "/gann"
+ADMIN_GANN_ACTION_PATH = ADMIN_GANN_PATH + "/action"
+_GANN_ADMIN_LOCK = threading.Lock()
+GANN_LEVELS = ("major", "intermediate", "minor")
+
+
+def _gann_num(value: Any, name: str, low: float = 0.0, high: float | None = None,
+              integer: bool = False) -> float | int:
+    """Ep kieu + kiem khoang cho mot so trong config. Sai thi bao ten truong."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} phai la so, dang la {value!r}")
+    if integer and int(value) != value:
+        raise ValueError(f"{name} phai la so nguyen, dang la {value!r}")
+    if value < low or (high is not None and value > high):
+        raise ValueError(f"{name} = {value} nam ngoai khoang [{low}, {high if high is not None else 'vo cung'}]")
+    return int(value) if integer else float(value)
+
+
+def _gann_per_tf(value: Any, name: str, **limits: Any) -> None:
+    """Truong dang mot so, hoac {1d: so, 1w: so}."""
+    if isinstance(value, dict):
+        for tf, item in value.items():
+            if tf not in GANN_TIMEFRAMES:
+                raise ValueError(f"{name}: khung {tf!r} khong co pivot (chi {list(GANN_TIMEFRAMES)})")
+            _gann_num(item, f"{name}.{tf}", **limits)
+    else:
+        _gann_num(value, name, **limits)
+
+
+def _gann_validate_section(section: str, value: Any) -> Any:
+    """Kiem mot khoi config truoc khi ghi. Sai thi ValueError noi ro truong nao.
+
+    Kiem tung truong co nghia, roi chay thu: mot khoi sai cau truc ma lot qua
+    thi moi lan goi tool sau do deu vo - tot hon la bao ngay tren trang admin.
+    """
+    if section == "symbols":
+        if not isinstance(value, list) or not all(isinstance(s, str) and s.strip() for s in value):
+            raise ValueError("symbols phai la list ten cap, vd [\"BTCUSDT\", \"ETHUSDT\"]")
+        return [s.strip().upper() for s in value]
+    if not isinstance(value, dict):
+        raise ValueError(f"khoi {section} phai la object {{...}}")
+
+    if section == "pivots":
+        _gann_per_tf(value.get("swing_bars", 2), "swing_bars", low=1, high=10, integer=True)
+        _gann_num(value.get("atr_period", 14), "atr_period", low=1, high=200, integer=True)
+        _gann_per_tf(value.get("min_move_pct", 0), "min_move_pct", high=100)
+        _gann_per_tf(value.get("min_move_atr", 0), "min_move_atr", high=100)
+        _gann_num(value.get("intermediate_move_pct", 0), "intermediate_move_pct", high=100)
+        _gann_num(value.get("major_merge_days", 3), "major_merge_days", high=30, integer=True)
+    elif section == "projections":
+        _gann_num(value.get("tolerance_days", 0), "tolerance_days", high=15, integer=True)
+        for key in ("max_pivot_age_days", "level_weights"):
+            block = value.get(key) or {}
+            if not isinstance(block, dict):
+                raise ValueError(f"{key} phai la object {{major: .., intermediate: .., minor: ..}}")
+            for level, item in block.items():
+                if level not in GANN_LEVELS:
+                    raise ValueError(f"{key}: bac {level!r} khong ton tai")
+                _gann_num(item, f"{key}.{level}", integer=key == "max_pivot_age_days")
+        for kind in gann_windows.PROJECTION_TYPES:
+            block = value.get(kind)
+            if block is None:
+                continue
+            if not isinstance(block, dict):
+                raise ValueError(f"{kind} phai la object")
+            if "enabled" in block and not isinstance(block["enabled"], bool):
+                raise ValueError(f"{kind}.enabled phai la true/false")
+            if "weight" in block:
+                _gann_num(block["weight"], f"{kind}.weight", high=100)
+        days = (value.get("cycle") or {}).get("days") or {}
+        if not isinstance(days, dict):
+            raise ValueError("cycle.days phai la object {so_ngay: trong_so}")
+        for step, weight in days.items():
+            try:
+                count = int(step)
+            except (TypeError, ValueError):
+                raise ValueError(f"cycle.days: {step!r} khong phai so ngay") from None
+            if count <= 0 or count > 3650:
+                raise ValueError(f"cycle.days: {count} ngay nam ngoai [1, 3650]")
+            _gann_num(weight, f"cycle.days.{step}", high=100)
+        anniversary = value.get("anniversary") or {}
+        bad = [x for x in anniversary.get("levels") or [] if x not in GANN_LEVELS]
+        if bad:
+            raise ValueError(f"anniversary.levels co bac khong ton tai: {bad}")
+        if "max_years" in anniversary:
+            _gann_num(anniversary["max_years"], "anniversary.max_years", low=1, high=30, integer=True)
+        for text in (value.get("seasonal") or {}).get("dates") or []:
+            try:
+                datetime.strptime(f"2024-{text}", "%Y-%m-%d")
+            except (TypeError, ValueError):
+                raise ValueError(f"seasonal.dates: {text!r} khong phai 'MM-DD'") from None
+        swing = value.get("swing_duration") or {}
+        for ratio in swing.get("ratios") or []:
+            _gann_num(ratio, "swing_duration.ratios", low=0.01, high=20)
+        if "legs" in swing:
+            _gann_num(swing["legs"], "swing_duration.legs", low=1, high=20, integer=True)
+        for sym, scale in ((value.get("range_square") or {}).get("scale_factor") or {}).items():
+            _gann_num(scale, f"range_square.scale_factor.{sym}", low=1e-9)
+    elif section == "scoring":
+        _gann_num(value.get("min_score", 0), "min_score", high=1000)
+        _gann_num(value.get("merge_gap_days", 0), "merge_gap_days", high=30, integer=True)
+        _gann_num(value.get("max_hits_per_window", 8), "max_hits_per_window", low=1, high=50,
+                  integer=True)
+    elif section == "backtest":
+        _gann_num(value.get("atr_period", 20), "atr_period", low=1, high=200, integer=True)
+        _gann_num(value.get("volume_lookback", 20), "volume_lookback", low=2, high=200, integer=True)
+        _gann_num(value.get("pivot_near_days", 2), "pivot_near_days", high=30, integer=True)
+        _gann_num(value.get("shift_days", 30), "shift_days", low=1, high=365, integer=True)
+        _gann_num(value.get("warmup_days", 120), "warmup_days", high=2000, integer=True)
+    elif section == "context":
+        for flag in ("include_in_get_context", "time_windows"):
+            if flag in value and not isinstance(value[flag], bool):
+                raise ValueError(f"context.{flag} phai la true/false")
+        _gann_num(value.get("horizon_days", 7), "horizon_days", low=1, high=60, integer=True)
+        _gann_num(value.get("max_windows", 3), "max_windows", low=1, high=10, integer=True)
+        _gann_num(value.get("max_hits", 3), "max_hits", low=1, high=10, integer=True)
+
+    # Chay thu voi khoi moi tren du lieu gia: loi cau truc nao lot qua thi lo o day
+    trial = {**copy.deepcopy(_gann_cfg()), section: value}
+    day = date(2025, 1, 1)
+    fake = [{"type": "low", "date": "2024-10-01", "level": "major", "price": 100.0,
+             "duration_bars": 10, "span_days": 1, "timeframe": "1d"}]
+    gann_windows.build(fake, day, 30, trial, [], "BTCUSDT", min_score=0.01)
+    if section == "pivots":
+        bars = [{"open_time": i * 86_400_000, "open": 100.0 + i % 7, "high": 102.0 + i % 7,
+                 "low": 98.0 + i % 7, "close": 100.0 + i % 7, "volume": 1.0,
+                 "close_time": (i + 1) * 86_400_000 - 1} for i in range(60)]
+        gann_pivots.build(bars, [f"d{i}" for i in range(60)], "1d", value, 86_400_000)
+    return value
+
+
+def _gann_admin_view() -> dict[str, Any]:
+    """Du lieu cho trang admin Gann. Loi cua tung cap nam trong dong cua cap do."""
+    symbols = []
+    for sym in _gann_symbols():
+        row: dict[str, Any] = {"symbol": sym}
+        try:
+            doc = _gann_doc(sym)
+            row["computed_at"] = doc.get("computed_at")
+            recent = []
+            for tf, keep in (("1d", 20), ("1w", 10)):
+                live = gann_pivots.live_pivots((doc["timeframes"].get(tf) or {}).get("pivots") or [])
+                row[f"pivots_{tf}"] = len(live)
+                for p in live[-keep:]:
+                    recent.append({"timeframe": tf, "type": p["type"],
+                                   "date": _bar_date({"open_time": p["time_ms"]}),
+                                   "price": p["price"], "level": p.get("level"),
+                                   "move_pct": p.get("move_pct"), "source": p.get("source")})
+            recent.sort(key=lambda p: (p["date"], p["timeframe"]), reverse=True)
+            row["recent"] = recent
+            state = _gann_swing_state(sym, "1d")
+            row["trend"], row["note"] = state.get("trend"), state.get("note")
+        except Exception as exc:
+            row["error"] = str(exc)
+        symbols.append(row)
+
+    override = {}
+    try:
+        override = _read_json(GANN_CONFIG_FILE, {}) if GANN_CONFIG_FILE.exists() else {}
+    except Exception:
+        override = {}
+    current = _gann_cfg()
+    config = {section: {"value": current.get(section),
+                        "overridden": isinstance(override, dict) and section in override}
+              for section in GANN_EDITABLE}
+
+    latest = None
+    if GANN_BACKTEST_DIR.exists():
+        for folder in sorted((p for p in GANN_BACKTEST_DIR.iterdir() if p.is_dir()),
+                             reverse=True):
+            try:
+                latest = _read_json(folder / "result.json", None)
+            except Exception:
+                latest = None
+            if latest:
+                break
+
+    manual = _read_json(GANN_MANUAL_FILE, {}) if GANN_MANUAL_FILE.exists() else {}
+    events, _ = _gann_events()
+    return {
+        "symbols": symbols,
+        "manual": manual if isinstance(manual, dict) else {},
+        "manual_file": str(GANN_MANUAL_FILE),
+        "events": events,
+        "events_file": str(GANN_EVENTS_FILE),
+        "config": config,
+        "config_file": str(GANN_CONFIG_FILE),
+        "config_version": _gann_config_version(),
+        "config_warning": _GANN_CFG_CACHE.get("warning"),
+        "backtest": latest,
+    }
+
+
+def _gann_admin_action(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    """POST /admin/gann/action. Moi thao tac ghi file theo kieu tam + rename."""
+    action = str(payload.get("action") or "")
+    try:
+        with _GANN_ADMIN_LOCK:
+            if action in ("config_save", "config_reset"):
+                section = str(payload.get("section") or "")
+                if section not in GANN_EDITABLE:
+                    return 400, {"error": f"khoi {section!r} khong sua duoc tren trang nay"}
+                override = _read_json(GANN_CONFIG_FILE, {}) if GANN_CONFIG_FILE.exists() else {}
+                if not isinstance(override, dict):
+                    override = {}
+                if action == "config_save":
+                    override[section] = _gann_validate_section(section, payload.get("value"))
+                else:
+                    override.pop(section, None)
+                if override:
+                    _write_json(GANN_CONFIG_FILE, override)
+                elif GANN_CONFIG_FILE.exists():
+                    GANN_CONFIG_FILE.unlink()
+                return 200, {"ok": True, "config_version": _gann_config_version(),
+                             "note": "Co hieu luc ngay o lan goi tool ke tiep."}
+
+            if action in ("pivot_add", "pivot_delete"):
+                sym = _resolve_symbol(str(payload.get("symbol") or ""))
+                tf = str(payload.get("timeframe") or "").strip().lower()
+                if tf not in GANN_TIMEFRAMES:
+                    return 400, {"error": f"khung {tf!r} khong co pivot"}
+                doc = _read_json(GANN_MANUAL_FILE, {}) if GANN_MANUAL_FILE.exists() else {}
+                if not isinstance(doc, dict):
+                    doc = {}
+                rows = doc.setdefault(sym, {}).setdefault(tf, [])
+                if action == "pivot_add":
+                    op = str(payload.get("op") or "").strip().lower()
+                    kind = str(payload.get("type") or "").strip().lower()
+                    day = str(payload.get("date") or "").strip()
+                    if op not in ("pin", "exclude") or kind not in ("high", "low"):
+                        return 400, {"error": "op phai la pin/exclude, type phai la high/low"}
+                    try:
+                        date.fromisoformat(day)
+                    except ValueError:
+                        return 400, {"error": f"ngay {day!r} khong dung dang YYYY-MM-DD"}
+                    entry = {"action": op, "type": kind, "date": day}
+                    if op == "pin":
+                        level = str(payload.get("level") or "major").strip().lower()
+                        if level not in GANN_LEVELS:
+                            return 400, {"error": f"bac {level!r} khong ton tai"}
+                        entry["level"] = level
+                    note = str(payload.get("note") or "").strip()[:200]
+                    if note:
+                        entry["note"] = note
+                    # Cung (ngay, loai) thi thay the - khong de hai lenh mau thuan cung luc
+                    rows[:] = [r for r in rows if not (isinstance(r, dict)
+                               and r.get("date") == day and r.get("type") == kind)]
+                    rows.append(entry)
+                else:
+                    index = int(payload.get("index", -1))
+                    if not 0 <= index < len(rows):
+                        return 400, {"error": "khong co dong pivot thu cong nay (trang da cu?)"}
+                    rows.pop(index)
+                    if not rows:
+                        doc[sym].pop(tf, None)
+                    if not doc[sym]:
+                        doc.pop(sym, None)
+                _write_json(GANN_MANUAL_FILE, doc)
+                return 200, {"ok": True, "note": "Pivot tu tinh lai o lan goi ke tiep."}
+
+            if action in ("event_add", "event_delete"):
+                raw = _read_json(GANN_EVENTS_FILE, []) if GANN_EVENTS_FILE.exists() else []
+                rows = raw.get("events") if isinstance(raw, dict) else raw
+                rows = rows if isinstance(rows, list) else []
+                if action == "event_add":
+                    day = str(payload.get("date") or "").strip()
+                    name = str(payload.get("name") or "").strip()[:80]
+                    try:
+                        date.fromisoformat(day)
+                    except ValueError:
+                        return 400, {"error": f"ngay {day!r} khong dung dang YYYY-MM-DD"}
+                    if not name:
+                        return 400, {"error": "su kien can co ten"}
+                    weight = _gann_num(payload.get("weight", 1), "weight", high=100)
+                    symbols = [str(s).strip().upper() for s in payload.get("symbols") or []
+                               if str(s).strip()]
+                    rows.append({"date": day, "name": name, "weight": weight,
+                                 "symbols": symbols})
+                    rows.sort(key=lambda r: str(r.get("date") or ""))
+                else:
+                    # Danh sach tren trang la ban da loc (bo dong hong) - xoa theo
+                    # chinh danh sach do de chi so khop voi cai nguoi dung thay
+                    valid, _ = _gann_events()
+                    index = int(payload.get("index", -1))
+                    if not 0 <= index < len(valid):
+                        return 400, {"error": "khong co su kien nay (trang da cu?)"}
+                    target = valid[index]
+                    rows = [r for r in rows if r is not target and r != target]
+                _write_json(GANN_EVENTS_FILE, rows)
+                return 200, {"ok": True}
+
+        if action == "recompute":
+            sym = _resolve_symbol(str(payload.get("symbol") or ""))
+            doc = _gann_doc(sym, force=True)
+            counts = {tf: block.get("live", 0)
+                      for tf, block in (doc.get("timeframes") or {}).items()}
+            return 200, {"ok": True, "pivots": counts,
+                         "note": f"pivot 1w {counts.get('1w', 0)}, 1d {counts.get('1d', 0)}"}
+        return 400, {"error": f"action khong ho tro: {action!r}"}
+    except ValueError as exc:
+        return 400, {"error": str(exc)}
+
+
+@mcp.custom_route(ADMIN_GANN_PATH, methods=["GET"])
+async def http_admin_gann(request):
+    """TM - #GANN-TW - Gann Time Windows: trang quan ly pivot, su kien, config."""
+    from starlette.responses import HTMLResponse
+    if not GANN_ENABLED:
+        return HTMLResponse(
+            "<p>Gann time windows dang tat. Bat <code>time_windows.enabled</code> "
+            "trong config.yaml roi restart.</p>",
+            status_code=404, headers={"Cache-Control": "no-store"})
+    view = await asyncio.to_thread(_gann_admin_view)
+    page = admin_gann.render(view, action_path=ADMIN_GANN_ACTION_PATH,
+                             admin_path=ADMIN_PATH, setup_required=not STORE.has_auth())
+    return HTMLResponse(page, headers={"Cache-Control": "no-store"})
+
+
+@mcp.custom_route(ADMIN_GANN_ACTION_PATH, methods=["POST"])
+async def http_admin_gann_action(request):
+    """TM - #GANN-TW - Gann Time Windows: luu config / pivot thu cong / su kien."""
+    if not GANN_ENABLED:
+        return JSONResponse({"error": "Gann time windows dang tat"}, status_code=404)
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "body khong phai JSON"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "body phai la object"}, status_code=400)
+    if not _setup_ok(payload):
+        return JSONResponse({"error": "Setup token sai"}, status_code=403)
+    status, body = await asyncio.to_thread(_gann_admin_action, payload)
+    return JSONResponse(body, status_code=status)
+
+
 @mcp.custom_route(SRV.get("health_path", "/healthz"), methods=["GET"])
 async def http_health(request):
     """Public, khong can auth. Dung cho Docker HEALTHCHECK va proxy."""
@@ -3923,7 +4379,9 @@ def build_app():
                          # TM - #ORB - ORB Enhancement
                          ADMIN_ORB_PATH, ADMIN_ORB_ACTION_PATH,
                          # TM - #ORB-RULES - ORB Rule Set
-                         ADMIN_ORB_RULES_PATH),
+                         ADMIN_ORB_RULES_PATH,
+                         # TM - #GANN-TW - Gann Time Windows
+                         ADMIN_GANN_PATH, ADMIN_GANN_ACTION_PATH),
         )
 
     inner = app.router.lifespan_context

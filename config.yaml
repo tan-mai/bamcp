@@ -116,6 +116,19 @@ time_windows:
     shift_days: 30
     warmup_days: 120                 # start bo trong = ngay nen 1d dau tien + chung nay
 
+  # Hai field Gann trong get_context.
+  context:
+    include_in_get_context: true     # tat thi ca hai field bien mat khoi get_context
+    # Cua so 7 ngay. TAT mac dinh: BR dat dieu kien "chua dua vao get_context truoc
+    # khi co ket qua Phase 3", va backtest BTCUSDT 2020-2026 khong thay hieu ung
+    # (lift range_atr 0.92, p 0.95; ca o nguong chon loc hon cung khong). Bat thi
+    # moi lan phan tich deu keo theo mot gia thuyet chua kiem chung. Doi trong so,
+    # backtest lai, thay khac thi hay bat.
+    time_windows: false
+    horizon_days: 7
+    max_windows: 3
+    max_hits: 3                      # moi cua so toi da chung nay hit
+
 # So nen toi da giu theo tung khung. null = khong cat.
 # Khung nao khong khai thi dung klines.max_history nhu truoc.
 # D va W phai la null thi pivot Gann moi co du lich su tu 2019-09.
@@ -366,6 +379,12 @@ instructions: |
   Cua so chi noi "quanh ngay nay de co bien dong/dao chieu", KHONG noi huong gia.
   Trong so hien la so khoi diem CHUA KIEM CHUNG - khi nhac den cua so thi noi ro
   dieu do, cho den khi co ket qua backtest_time_windows.
+
+  backtest_time_windows kiem chung cua so tren lich su (walk-forward, khong
+  lookahead). Doc p_value (dich cua so +-shift_days) la so chinh; p_value_global
+  nho ma p_value lon nghia la hieu ung den tu che do bien dong, khong phai tu
+  thoi diem Gann - noi ro dieu do, dung bao la "co y nghia". suggested_weights
+  chi la de xuat, nguoi dung tu sua o trang /admin/gann.
 
   ORB - OPENING RANGE BREAKOUT (chi tren cap orb.symbol, mac dinh BTCUSDT):
   Lenh ORB co BO RULE RIENG (khoi 'orb' cua get_rules), khong dung max_stop_points /

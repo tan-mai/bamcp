@@ -80,6 +80,7 @@ PAGE = """<!doctype html>
 <h1>BAMCP — Cài đặt</h1>
 <p class="sub">Lưu vào <code>__SETTINGS_PATH__</code>, tồn tại qua mọi lần tạo lại container.</p>
 __ORB_LINK__
+__GANN_LINK__
 
 __SETUP_BANNER__
 
@@ -467,7 +468,7 @@ def render(state: dict[str, Any], *, settings_path: str, save_path: str,
            symbol_overrides: dict[str, list[str]],
            global_rule_keys: tuple[str, ...],
            symbol_rule_keys: tuple[str, ...],
-           orb_path: str = "") -> str:
+           orb_path: str = "", gann_path: str = "") -> str:
     """Dung HTML tu trang thai da duoc che giau. Khong nhan secret that.
 
     `rules` la rule chung + mac dinh; `symbol_rules` la gia tri da giai cho tung
@@ -533,6 +534,9 @@ def render(state: dict[str, Any], *, settings_path: str, save_path: str,
         # TM - #ORB - ORB Enhancement: loi vao trang quan ly phien ORB
         "__ORB_LINK__": (f'<p class="sub">Phiên ORB: <a href="{html.escape(orb_path)}">'
                          f'quản lý phiên giao dịch ORB</a></p>' if orb_path else ""),
+        # TM - #GANN-TW - Gann Time Windows: loi vao trang Gann
+        "__GANN_LINK__": (f'<p class="sub">Gann: <a href="{html.escape(gann_path)}">'
+                          f'pivot, cửa sổ thời gian, backtest</a></p>' if gann_path else ""),
     }
 
     page = PAGE
