@@ -1343,7 +1343,8 @@ GANN_INTERNAL = ("index", "level_locked")
 #   timeframe - da nam o envelope, khong lap lai tung dong
 #   time_ms / confirmed_at_ms - nen 1d/1w luon mo 07:00 nen ngay la du dinh danh;
 #     epoch ms van nam trong file cache cho Phase 2 tinh chieu thoi gian
-GANN_OMIT = GANN_INTERNAL + ("timeframe", "time_ms", "confirmed_at_ms")
+GANN_OMIT = GANN_INTERNAL + ("timeframe", "time_ms", "confirmed_at_ms",
+                             "known_ms", "retracted_ms", "major_from_ms")
 
 
 def _gann_require() -> None:
@@ -1440,16 +1441,19 @@ def _gann_compute(symbol: str) -> dict[str, Any]:
             frames[tf] = {"pivots": [], "bars": len(closed)}
             continue
         dates = [_bar_date(b) for b in closed]
-        pivots, notes = gann_pivots.build(
-            closed, dates, tf, GANN_PIVOT_CFG,
+        records, notes = gann_pivots.build(
+            closed, dates, tf, GANN_PIVOT_CFG, _tf_ms(tf),
             manual=_gann_manual(symbol, tf),
             major_pivots=majors)
         warnings.extend(f"{tf}: {n}" for n in notes)
         if tf == gann_pivots.MAJOR_TIMEFRAME:
-            majors = pivots
+            majors = records
+        # Luu CA pivot da bi bo (co retracted_ms): Phase 2/3 can biet "tai ngay X
+        # thi ban do pivot trong nhu the nao", ma pivot bi bo nam trong ban do do.
         frames[tf] = {
             "pivots": [{k: v for k, v in p.items() if k not in GANN_INTERNAL}
-                       for p in pivots],
+                       for p in records],
+            "live": len(gann_pivots.live_pivots(records)),
             "bars": len(closed),
             "first_bar_ms": closed[0]["open_time"],
             "last_bar_ms": closed[-1]["open_time"],
@@ -1476,15 +1480,22 @@ def _gann_doc(symbol: str, force: bool = False) -> dict[str, Any]:
     return doc
 
 
-def _gann_frame(symbol: str, timeframe: str,
-                force: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """(pivot cua mot khung, ca doc). Khung khong duoc ho tro thi bao loi ngay."""
+def _gann_records(symbol: str, timeframe: str,
+                  force: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """(record cua mot khung, ca doc). Khung khong duoc ho tro thi bao loi ngay."""
     tf = timeframe.strip().lower()
     if tf not in GANN_TIMEFRAMES:
         raise ValueError(
             f"timeframe khong co pivot Gann: {timeframe}. Cho phep: {list(GANN_TIMEFRAMES)}")
     doc = _gann_doc(symbol, force=force)
     return (doc["timeframes"].get(tf) or {}).get("pivots") or [], doc
+
+
+def _gann_frame(symbol: str, timeframe: str, as_of_ms: int | None = None,
+                force: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """(pivot con hieu luc tai as_of_ms, ca doc). as_of_ms None = hien tai."""
+    records, doc = _gann_records(symbol, timeframe, force=force)
+    return gann_pivots.live_pivots(records, as_of_ms), doc
 
 
 # ---------------------------------------------------------------- server
@@ -3033,7 +3044,8 @@ def recompute_pivots(symbol: str = "") -> dict[str, Any]:
             "symbol": sym,
             "path": str(_gann_pivot_path(sym)),
             "timeframes": {
-                tf: {"pivots": len(block.get("pivots") or []),
+                tf: {"pivots": block.get("live", 0),
+                     "da_bo": len(block.get("pivots") or []) - block.get("live", 0),
                      "bars": block.get("bars", 0),
                      "first_bar": _bar_time({"open_time": block.get("first_bar_ms") or 0}),
                      "last_bar": _bar_time({"open_time": block.get("last_bar_ms") or 0})}

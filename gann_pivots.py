@@ -155,84 +155,115 @@ def detect_pivots(bars: list[dict[str, Any]], swing_bars: int,
 
 # ---------------------------------------------------------- bien do & loc nhieu
 
-def annotate(pivots: list[dict[str, Any]], atr: list[float | None],
-             origin: float | None) -> None:
-    """Dien move_pct, move_atr, duration_bars - do so voi pivot nguoc chieu truoc.
+def _weakness(price: float, ref_price: float | None, span: float | None,
+              min_pct: float, min_atr: float) -> tuple[bool, float | None, float | None]:
+    """(co phai nhieu, move_pct, move_atr) cua mot buoc di tu ref_price den price.
 
-    Sua truc tiep tren list. Phai goi lai sau moi lan them/bo pivot, vi bo mot
-    pivot la doi moc do cua pivot ke tiep.
+    Nhieu = nho CA theo % VA theo ATR. Hai thuoc do bat hai thu khac nhau - %
+    bat bien do tuyet doi, ATR bat bien do so voi nhip thi truong luc do - nen
+    chi loai khi ca hai deu noi la khong dang ke.
     """
-    prev_price = origin
-    prev_index = 0
-    for pivot in pivots:
-        index = pivot["index"]
-        move = abs(pivot["price"] - prev_price) if prev_price else None
-        pivot["move_pct"] = (round(move / prev_price * 100, 2)
-                             if move is not None and prev_price else None)
-        span = atr[index] if 0 <= index < len(atr) else None
-        pivot["move_atr"] = round(move / span, 2) if move is not None and span else None
-        pivot["duration_bars"] = max(0, index - prev_index)
-        prev_price, prev_index = pivot["price"], index
+    if not ref_price:
+        return False, None, None
+    move = abs(price - ref_price)
+    pct = round(move / ref_price * 100, 2)
+    per_atr = round(move / span, 2) if span else None
+    if pct >= min_pct:
+        return False, pct, per_atr
+    return (per_atr is None or per_atr < min_atr), pct, per_atr
 
 
-def _is_weak(pivot: dict[str, Any], min_pct: float, min_atr: float) -> bool:
-    """Pivot nhieu: nho ca theo % VA theo ATR. Nho mot trong hai thi giu lai.
-
-    Hai thuoc do bat hai thu khac nhau - % bat bien do tuyet doi, ATR bat bien
-    do so voi nhip thi truong luc do - nen chi loai khi ca hai deu noi la khong
-    dang ke.
-    """
-    pct = pivot.get("move_pct")
-    if pct is None or pct >= min_pct:
-        return False
-    span = pivot.get("move_atr")
-    return span is None or span < min_atr
-
-
-def _merge_adjacent(pivots: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Hai pivot cung loai dung canh nhau thi giu cai cuc tri hon.
-
-    Xay ra sau khi bo mot pivot nhieu o giua. confirmed_at lay moc MUON hon cua
-    hai cai: pivot con lai chi thuc su duoc xac nhan khi nhip dao chieu thu hai
-    xay ra - lay moc som hon la tu cho minh biet truoc.
-    """
-    out: list[dict[str, Any]] = []
-    for pivot in pivots:
-        if out and out[-1]["type"] == pivot["type"]:
-            prev = out[-1]
-            if pivot["type"] == "high":
-                keep = pivot if pivot["price"] > prev["price"] else prev
-            else:
-                keep = pivot if pivot["price"] < prev["price"] else prev
-            keep = dict(keep)
-            keep["confirmed_at_ms"] = max(prev["confirmed_at_ms"],
-                                          pivot["confirmed_at_ms"])
-            out[-1] = keep
-            continue
-        out.append(pivot)
-    return out
+def _more_extreme(pivot: dict[str, Any], other: dict[str, Any]) -> bool:
+    if pivot["type"] == "high":
+        return pivot["price"] > other["price"]
+    return pivot["price"] < other["price"]
 
 
 def filter_noise(pivots: list[dict[str, Any]], atr: list[float | None],
-                 origin: float | None, min_pct: float,
-                 min_atr: float) -> list[dict[str, Any]]:
-    """Bo dan pivot nhieu, nho nhat truoc, den khi khong con cai nao nho.
+                 origin: float | None, min_pct: float, min_atr: float,
+                 span_ms: int) -> list[dict[str, Any]]:
+    """Loc nhieu bang mot luot DUY NHAT tu qua khu ve hien tai, co ghi lai lich su.
 
-    Phai lap chu khong quet mot luot: bo mot pivot xong thi hai pivot hai ben
-    gop lai thanh mot chan dai hon, va chan dai hon do co the lam pivot ke tiep
-    tu "du lon" thanh "nho".
+    Vi sao phai mot luot: cach hien nhien hon la lap lai "bo pivot nho nhat toan
+    cuc" cho den khi het, nhung lam vay thi mot pivot nhieu o nam 2026 co the xoa
+    mot pivot cua nam 2020 - va nhu the get_time_windows(as_of=2021) se khong con
+    bang voi viec chay tren du lieu cat den 2021. BR muc 3 cam dieu nay.
+
+    Vi loc nhieu BAT BUOC phai sua lai qua khu (bo mot nhip hoi gia thi hai dinh
+    hai ben gop lai thanh mot), moi pivot duoc ghi kem mot khoang hieu luc:
+      known_ms     - luc nen xac nhan DONG, tuc luc thuc su biet co pivot nay.
+                     Khong phai confirmed_at: nen xac nhan mo luc do nhung chi
+                     dong sau mot khung nua.
+      retracted_ms - luc biet pivot nay thuc ra la nhieu. None = con hieu luc.
+    Tra ve TAT CA pivot tung duoc nhan, ke ca da bi bo. Dung live_pivots() de lay
+    ban do tai mot thoi diem.
     """
-    out = [dict(p) for p in pivots]
-    # Moi vong bo it nhat mot pivot nen vong lap huu han; chan them cho chac.
-    for _ in range(len(out) + 1):
-        annotate(out, atr, origin)
-        weak = [(i, p) for i, p in enumerate(out) if _is_weak(p, min_pct, min_atr)]
-        if not weak:
+    live: list[dict[str, Any]] = []
+    history: list[dict[str, Any]] = []
+
+    for raw in pivots:
+        pivot = dict(raw)
+        known = int(pivot["confirmed_at_ms"]) + max(0, int(span_ms))
+        index = pivot["index"]
+        span = atr[index] if 0 <= index < len(atr) else None
+
+        while True:
+            if live and live[-1]["type"] == pivot["type"]:
+                # Cung loai dung canh nhau. Chi xay ra sau khi mot nhip hoi gia
+                # o giua da bi bo: chan song cu van dang chay, nen giu cuc tri
+                # hon. Thay the xong thi vong sau do bien do voi pivot nguoc
+                # chieu con lai - nho vay chuoi moc do khong bi dut.
+                if not _more_extreme(pivot, live[-1]):
+                    break                      # pivot moi yeu hon, bo luon
+                live.pop()["retracted_ms"] = known
+                continue
+
+            ref_price = live[-1]["price"] if live else origin
+            ref_index = live[-1]["index"] if live else 0
+            weak, pct, per_atr = _weakness(pivot["price"], ref_price, span,
+                                           min_pct, min_atr)
+            if weak:
+                # Nhip di tu pivot truoc den day qua nho de goi la buoc ngoat:
+                # bo pivot NAY, giu nguyen pivot truoc. Pivot truoc van la cuc
+                # tri dang dung - neu gia con di xa hon nua theo chieu cu thi
+                # chinh nhanh cung loai o tren se thay the no.
+                #
+                # Khong bo pivot truoc o day. Lam vay thi mot nhip hoi nho se
+                # xoa luon cai dinh that, va moc do bien do tut ve gia goc cua
+                # ca bo du lieu - moi pivot sau do do sai het.
+                break
+
+            pivot.update({
+                "move_pct": pct,
+                "move_atr": per_atr,
+                "duration_bars": max(0, index - ref_index),
+                "known_ms": known,
+                "retracted_ms": None,
+            })
+            live.append(pivot)
+            history.append(pivot)
             break
-        target = min(weak, key=lambda pair: pair[1]["move_pct"])[0]
-        out.pop(target)
-        out = _merge_adjacent(out)
-    annotate(out, atr, origin)
+
+    history.sort(key=lambda p: p["time_ms"])
+    return history
+
+
+def live_pivots(records: list[dict[str, Any]],
+                as_of_ms: int | None = None) -> list[dict[str, Any]]:
+    """Pivot con hieu luc tai mot thoi diem. as_of_ms None = hien tai.
+
+    Day la cho duy nhat quyet dinh "luc do biet gi": da biet (known_ms) va chua
+    bi bo (retracted_ms). Ket qua bang dung voi viec tinh lai tren du lieu cat
+    den as_of_ms, vi filter_noise chi di mot chieu.
+    """
+    out = []
+    for record in records:
+        if as_of_ms is not None and record.get("known_ms", 0) > as_of_ms:
+            continue
+        gone = record.get("retracted_ms")
+        if gone is not None and (as_of_ms is None or gone <= as_of_ms):
+            continue
+        out.append({**record, "level": effective_level(record, as_of_ms)})
     return out
 
 
@@ -244,12 +275,20 @@ def assign_levels(pivots: list[dict[str, Any]], timeframe: str,
                   merge_days: int = 3) -> None:
     """Xep bac major / intermediate / minor. Sua truc tiep tren list.
 
+    Pivot 1d trung mot pivot 1w thi duoc nang len major - nhung pivot 1w do co
+    the chi duoc xac nhan muon hon nhieu (nen tuan dong cham hon nen ngay). Nen
+    bac goc ghi vao `level`, con moc biet duoc viec nang len ghi rieng vao
+    `major_from_ms`: effective_level() moi quyet dinh bac tai mot thoi diem.
+    Khong lam vay thi backtest o nam 2021 se dung mot bac major ma luc do chua
+    ai biet.
+
     Pivot da bi ghim level bang tay (level_locked) thi khong doi.
     """
     if timeframe == MAJOR_TIMEFRAME:
         for pivot in pivots:
             if not pivot.get("level_locked"):
                 pivot["level"] = "major"
+                pivot["major_from_ms"] = pivot.get("known_ms")
         return
     window = max(0, int(merge_days)) * DAY_MS
     majors = major_pivots or []
@@ -257,28 +296,46 @@ def assign_levels(pivots: list[dict[str, Any]], timeframe: str,
         if pivot.get("level_locked"):
             continue
         move = pivot.get("move_pct") or 0.0
-        level = "intermediate" if move >= intermediate_move_pct else "minor"
+        pivot["level"] = "intermediate" if move >= intermediate_move_pct else "minor"
+        pivot["major_from_ms"] = None
         for major in majors:
             if (major["type"] == pivot["type"]
                     and abs(major["time_ms"] - pivot["time_ms"]) <= window):
-                level = "major"
+                pivot["major_from_ms"] = max(int(pivot.get("known_ms") or 0),
+                                             int(major.get("known_ms") or 0))
                 break
-        pivot["level"] = level
+
+
+def effective_level(pivot: dict[str, Any], as_of_ms: int | None = None) -> str:
+    """Bac cua pivot tai mot thoi diem. as_of_ms None = hien tai.
+
+    Pivot duoc nang len major ke tu major_from_ms; truoc do no van la bac goc.
+    """
+    moment = pivot.get("major_from_ms")
+    if moment is None:
+        return pivot.get("level") or "minor"
+    if as_of_ms is None or int(moment) <= as_of_ms:
+        return "major"
+    return pivot.get("level") or "minor"
 
 
 # ---------------------------------------------------------------- pivot thu cong
 
 def apply_manual(pivots: list[dict[str, Any]], entries: list[dict[str, Any]],
                  bars: list[dict[str, Any]], bar_dates: list[str],
-                 timeframe: str) -> tuple[list[dict[str, Any]], list[str]]:
-    """Ap pin/exclude tu nguoi dung. Tra ve (pivot moi, canh bao).
+                 timeframe: str,
+                 span_ms: int = 0) -> tuple[list[dict[str, Any]], list[str]]:
+    """Ap pin/exclude tu nguoi dung. Tra ve (danh sach record moi, canh bao).
 
     Khop theo (ngay cua nen, loai) - dung ngay, khong do gan dung: trang admin
     liet ke san ngay that cua tung pivot nen nguoi dung khong phai tu go.
 
-    - exclude: bo pivot do.
+    - exclude: danh dau retracted_ms = 0 chu khong xoa khoi list, de live_pivots
+      bo no o moi thoi diem. Day la nguoi dung noi "cai nay chua bao gio la
+      pivot", nen ap nguoc ve ca qua khu - khac voi retraction tu dong (co moc).
     - pin: pivot da co thi ep level; chua co thi them moi, gia lay tu high/low
-      that cua nen do chu khong lay so nguoi dung go.
+      THAT cua nen do chu khong lay so nguoi dung go. move_pct de None: mot pivot
+      dat bang tay khong co chan song nao do duoc.
     """
     out = [dict(p) for p in pivots]
     warnings: list[str] = []
@@ -294,12 +351,14 @@ def apply_manual(pivots: list[dict[str, Any]], entries: list[dict[str, Any]],
             continue
 
         match = next((p for p in out
-                      if p["type"] == kind and date_of.get(p["time_ms"]) == date), None)
+                      if p["type"] == kind and date_of.get(p["time_ms"]) == date
+                      and p.get("retracted_ms") is None), None)
         if action == "exclude":
             if match is None:
                 warnings.append(f"exclude {kind} {date}: khong co pivot nao o day")
                 continue
-            out.remove(match)
+            match["retracted_ms"] = 0
+            match["source"] = "manual"
             continue
 
         level = str(entry.get("level") or "major").strip().lower()
@@ -335,6 +394,12 @@ def apply_manual(pivots: list[dict[str, Any]], entries: list[dict[str, Any]],
             "level_locked": True,
             "index": index,
             "note": str(entry.get("note") or ""),
+            "move_pct": None,
+            "move_atr": None,
+            "duration_bars": None,
+            "known_ms": confirmed + max(0, int(span_ms)),
+            "retracted_ms": None,
+            "major_from_ms": None,
         })
 
     out.sort(key=lambda p: p["time_ms"])
@@ -344,10 +409,15 @@ def apply_manual(pivots: list[dict[str, Any]], entries: list[dict[str, Any]],
 # ---------------------------------------------------------------- tinh ca bo
 
 def build(bars: list[dict[str, Any]], bar_dates: list[str], timeframe: str,
-          cfg: dict[str, Any], manual: list[dict[str, Any]] | None = None,
+          cfg: dict[str, Any], span_ms: int,
+          manual: list[dict[str, Any]] | None = None,
           major_pivots: list[dict[str, Any]] | None = None
           ) -> tuple[list[dict[str, Any]], list[str]]:
     """Chay ca day: phat hien -> loc nhieu -> pivot thu cong -> xep bac.
+
+    Tra ve danh sach RECORD, tuc ca pivot da bi bo (co retracted_ms). Goi
+    live_pivots() de lay ban do tai mot thoi diem. major_pivots cung phai la
+    record, vi viec nang bac len major cung co moc thoi gian cua rieng no.
 
     Thu tu nay quan trong. Loc nhieu truoc pivot thu cong, de cai nguoi dung
     ghim khong bi chinh thuat toan loc vua bo di. Xep bac sau cung, vi bac phu
@@ -356,16 +426,17 @@ def build(bars: list[dict[str, Any]], bar_dates: list[str], timeframe: str,
     swing_bars = int(_per_tf(cfg.get("swing_bars"), timeframe, 2))
     atr = atr_series(bars, int(cfg.get("atr_period") or 14))
     pivots, origin = detect_pivots(bars, swing_bars, timeframe)
-    pivots = filter_noise(
+    records = filter_noise(
         pivots, atr, origin,
         float(_per_tf(cfg.get("min_move_pct"), timeframe, 0.0)),
-        float(_per_tf(cfg.get("min_move_atr"), timeframe, 0.0)))
-    pivots, warnings = apply_manual(pivots, manual or [], bars, bar_dates, timeframe)
-    annotate(pivots, atr, origin)
-    assign_levels(pivots, timeframe,
+        float(_per_tf(cfg.get("min_move_atr"), timeframe, 0.0)),
+        span_ms)
+    records, warnings = apply_manual(records, manual or [], bars, bar_dates,
+                                     timeframe, span_ms)
+    assign_levels(records, timeframe,
                   float(cfg.get("intermediate_move_pct") or 0.0),
                   major_pivots, int(cfg.get("major_merge_days") or 3))
-    return pivots, warnings
+    return records, warnings
 
 
 def _per_tf(value: Any, timeframe: str, default: Any) -> Any:
