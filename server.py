@@ -27,6 +27,7 @@ from starlette.responses import JSONResponse
 
 import admin       # module cuc bo: trang cai dat
 import exchanges   # module cuc bo: adapter doc tai khoan san
+import gann_pivots  # TM - #GANN-TW - Gann Time Windows: pivot swing chart & trang thai song
 import klines_coverage  # TM - #GANN-TW - Gann Time Windows: do phu & loc theo thoi gian
 import settings    # module cuc bo: luu credential xuong volume
 # TM - #ORB - ORB Enhancement
@@ -1322,6 +1323,168 @@ def _evaluate_trade(*, symbol: str, side: str, entry: float, stop: float,
         },
         "rule_violations": violations,
     }
+
+
+# ------------------------------------------------- Gann time windows (pivot)
+
+# TM - #GANN-TW - Gann Time Windows
+GANN_CFG: dict[str, Any] = CFG.get("time_windows") or {}
+GANN_ENABLED = bool(GANN_CFG.get("enabled"))
+GANN_PIVOT_CFG: dict[str, Any] = GANN_CFG.get("pivots") or {}
+GANN_PATHS: dict[str, Any] = GANN_CFG.get("paths") or {}
+# Chi hai khung nay co pivot. Khung nho hon khong co y nghia Gann o day: cua so
+# thoi gian do bang ngay, ma mot nen 4h thi khong dinh duoc moc ngay nao ca.
+GANN_TIMEFRAMES = ("1w", "1d")
+GANN_MANUAL_FILE = DATA_ROOT / str(
+    GANN_PATHS.get("manual_pivots") or "time_windows/manual_pivots.json")
+# Truong noi bo cua tang tinh toan, khong dua ra ngoai tool.
+GANN_INTERNAL = ("index", "level_locked")
+# Truong bo khi tra ra tool, de giu output duoi nguong 8 KB cua muc 7:
+#   timeframe - da nam o envelope, khong lap lai tung dong
+#   time_ms / confirmed_at_ms - nen 1d/1w luon mo 07:00 nen ngay la du dinh danh;
+#     epoch ms van nam trong file cache cho Phase 2 tinh chieu thoi gian
+GANN_OMIT = GANN_INTERNAL + ("timeframe", "time_ms", "confirmed_at_ms")
+
+
+def _gann_require() -> None:
+    if not GANN_ENABLED:
+        raise ValueError(
+            "Module Gann time windows dang tat. Bat time_windows.enabled trong "
+            "config roi restart.")
+
+
+def _gann_symbols() -> list[str]:
+    """Cap duoc tinh pivot: danh sach trong config, giao voi cap dang bat."""
+    active = _symbols()
+    wanted = [str(s).upper() for s in (GANN_CFG.get("symbols") or [])]
+    if not wanted:
+        return active
+    return [s for s in wanted if s in active]
+
+
+def _gann_pivot_path(symbol: str) -> Path:
+    tpl = str(GANN_PATHS.get("pivots") or "time_windows/pivots/{symbol}.json")
+    return DATA_ROOT / tpl.format(symbol=symbol.upper())
+
+
+def _bar_date(bar: dict[str, float]) -> str:
+    """Ngay cua nen theo gio VN. Nen D mo 07:00 nen phai doi qua TZ, khong cat chuoi."""
+    ts = bar.get("open_time", 0)
+    if not ts:
+        return ""
+    if ts > 10_000_000_000:
+        ts = ts / 1000
+    return datetime.fromtimestamp(ts, TZ).strftime("%Y-%m-%d")
+
+
+def _gann_manual(symbol: str, timeframe: str) -> list[dict[str, Any]]:
+    """Pivot thu cong cho mot cap/khung. File dang {symbol: {timeframe: [...]}}."""
+    doc = _read_json(GANN_MANUAL_FILE, {})
+    if not isinstance(doc, dict):
+        return []
+    block = doc.get(symbol.upper()) or {}
+    if not isinstance(block, dict):
+        return []
+    rows = block.get(timeframe) or []
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def _gann_fingerprint(symbol: str) -> dict[str, Any]:
+    """Dau tay cua moi thu lam doi ket qua pivot.
+
+    Cache chi dung lai khi ca bon thu nay y nguyen: nen moi dong, config doi,
+    pivot thu cong doi, hay mui gio doi - deu phai tinh lai.
+    """
+    last: dict[str, Any] = {}
+    for tf in GANN_TIMEFRAMES:
+        try:
+            closed, _ = _split_closed(_load_bars(symbol, tf), tf)
+            last[tf] = closed[-1]["open_time"] if closed else None
+        except Exception:
+            last[tf] = None
+    manual = _gann_manual(symbol, "1d") + _gann_manual(symbol, "1w")
+    return {
+        "last_closed": last,
+        "config": json.dumps(GANN_PIVOT_CFG, sort_keys=True, default=str),
+        "manual": json.dumps(manual, sort_keys=True, default=str),
+        "timezone": str(TZ),
+    }
+
+
+def _gann_public(pivot: dict[str, Any]) -> dict[str, Any]:
+    """Pivot dang tra ra ngoai: bo truong noi bo, them ngay cho nguoi doc."""
+    out = {k: v for k, v in pivot.items() if k not in GANN_OMIT}
+    out["date"] = _bar_date({"open_time": pivot["time_ms"]})
+    out["confirmed_date"] = _bar_date({"open_time": pivot["confirmed_at_ms"]})
+    # source chi ghi ra khi la pivot thu cong: "auto" lap lai 30 dong khong noi
+    # them dieu gi, con "manual" thi phai thay ngay.
+    if out.get("source") == "auto":
+        out.pop("source", None)
+    return out
+
+
+def _gann_compute(symbol: str) -> dict[str, Any]:
+    """Tinh lai pivot cho ca hai khung. 1w truoc, vi 1d can no de xep bac major."""
+    warnings: list[str] = []
+    frames: dict[str, Any] = {}
+    majors: list[dict[str, Any]] = []
+    for tf in GANN_TIMEFRAMES:
+        try:
+            closed, _ = _split_closed(_load_bars(symbol, tf), tf)
+        except Exception as exc:
+            warnings.append(f"{tf}: khong doc duoc nen - {exc}")
+            frames[tf] = {"pivots": [], "bars": 0}
+            continue
+        if len(closed) < 2:
+            warnings.append(f"{tf}: chi co {len(closed)} nen da dong, chua tinh duoc pivot")
+            frames[tf] = {"pivots": [], "bars": len(closed)}
+            continue
+        dates = [_bar_date(b) for b in closed]
+        pivots, notes = gann_pivots.build(
+            closed, dates, tf, GANN_PIVOT_CFG,
+            manual=_gann_manual(symbol, tf),
+            major_pivots=majors)
+        warnings.extend(f"{tf}: {n}" for n in notes)
+        if tf == gann_pivots.MAJOR_TIMEFRAME:
+            majors = pivots
+        frames[tf] = {
+            "pivots": [{k: v for k, v in p.items() if k not in GANN_INTERNAL}
+                       for p in pivots],
+            "bars": len(closed),
+            "first_bar_ms": closed[0]["open_time"],
+            "last_bar_ms": closed[-1]["open_time"],
+        }
+    return {
+        "symbol": symbol,
+        "computed_at": _now_iso(),
+        "fingerprint": _gann_fingerprint(symbol),
+        "timeframes": frames,
+        "warnings": warnings,
+    }
+
+
+def _gann_doc(symbol: str, force: bool = False) -> dict[str, Any]:
+    """Pivot tu cache, tinh lai khi can. Tinh lai mat vai giay nen khong lam bua."""
+    path = _gann_pivot_path(symbol)
+    if not force:
+        cached = _read_json(path, None)
+        if (isinstance(cached, dict)
+                and cached.get("fingerprint") == _gann_fingerprint(symbol)):
+            return cached
+    doc = _gann_compute(symbol)
+    _write_json(path, doc)
+    return doc
+
+
+def _gann_frame(symbol: str, timeframe: str,
+                force: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """(pivot cua mot khung, ca doc). Khung khong duoc ho tro thi bao loi ngay."""
+    tf = timeframe.strip().lower()
+    if tf not in GANN_TIMEFRAMES:
+        raise ValueError(
+            f"timeframe khong co pivot Gann: {timeframe}. Cho phep: {list(GANN_TIMEFRAMES)}")
+    doc = _gann_doc(symbol, force=force)
+    return (doc["timeframes"].get(tf) or {}).get("pivots") or [], doc
 
 
 # ---------------------------------------------------------------- server
@@ -2763,6 +2926,122 @@ def get_orb_config() -> dict[str, Any]:
         "note": ("Moi gio deu tinh theo timezone cua tung phien (tu xu ly DST), hien thi "
                  "UTC + gio VN. Phi va truot gia da tinh vao R."),
     }
+
+
+# -------------------------------------------------------- Gann time windows tools
+
+# TM - #GANN-TW - Gann Time Windows
+@mcp.tool()
+def get_pivots(symbol: str = "", timeframe: str = "1d", level: str = "",
+               since: str = "", limit: int = 30) -> dict[str, Any]:
+    """Pivot swing chart Gann - dinh/day da duoc xac nhan dao chieu.
+
+    timeframe: 1w (pivot major) hoac 1d.
+    level: major | intermediate | minor. Bo trong = tat ca.
+    since: 'YYYY-MM-DD', chi lay pivot tu ngay nay tro di.
+    Tra pivot MOI NHAT TRUOC.
+
+    Day KHONG phai swing fractal cua get_context: pivot o day chi duoc tinh la
+    pivot sau khi co du nen dao chieu, nen confirmed_at luon muon hon time. Do
+    la gia tri cua no - no la cai ma luc do thuc su da biet.
+    """
+    _gann_require()
+    sym = _resolve_symbol(symbol)
+    pivots, doc = _gann_frame(sym, timeframe)
+
+    want = level.strip().lower()
+    if want and want not in gann_pivots.LEVELS:
+        raise ValueError(f"level khong hop le: {level}. Cho phep: {list(gann_pivots.LEVELS)}")
+    since_ms = klines_coverage.parse_time_bound(since, TZ)
+
+    rows = [p for p in pivots
+            if (not want or p.get("level") == want)
+            and (since_ms is None or p["time_ms"] >= since_ms)]
+    rows.sort(key=lambda p: p["time_ms"], reverse=True)
+    total = len(rows)
+    cap = max(1, min(int(limit or 30), 200))
+    return {
+        "symbol": sym,
+        "timeframe": timeframe.strip().lower(),
+        "level": want or "all",
+        "computed_at": doc.get("computed_at"),
+        "matched": total,
+        "returned": min(total, cap),
+        "pivots": [_gann_public(p) for p in rows[:cap]],
+        "warnings": doc.get("warnings") or [],
+    }
+
+
+# TM - #GANN-TW - Gann Time Windows
+@mcp.tool()
+def get_swing_state(symbol: str = "", timeframe: str = "1d") -> dict[str, Any]:
+    """Xu huong, chan dang chay, va overbalance thoi gian/gia theo Gann.
+
+    time_overbalanced = nhip hoi hien tai DAI hon moi nhip hoi truoc trong cung
+    xu huong. price_overbalanced = SAU hon moi nhip truoc. Gann coi do la dau
+    hieu xu huong doi, khong phai mot nhip hoi binh thuong nua.
+
+    Dang chay cung chieu xu huong thi ca hai la false - khong co gi de so.
+    Doc 'note' truoc, no gom ca ket luan trong mot cau.
+    """
+    _gann_require()
+    sym = _resolve_symbol(symbol)
+    pivots, doc = _gann_frame(sym, timeframe)
+    tf = timeframe.strip().lower()
+    try:
+        closed, _ = _split_closed(_load_bars(sym, tf), tf)
+    except Exception as exc:
+        raise ValueError(f"khong doc duoc nen {tf} cua {sym}: {exc}") from exc
+
+    state = gann_pivots.swing_state(pivots, closed, tf)
+    # Doi epoch ms sang ngay, giong get_pivots: nen 1d/1w luon mo 07:00 nen ngay
+    # la du dinh danh, con epoch ms thi khong ai doc duoc bang mat.
+    leg = state.get("current_leg")
+    if leg:
+        pivot = leg["from_pivot"]
+        pivot["date"] = _bar_date({"open_time": pivot.pop("time_ms")})
+    for item in state.get("corrections_in_trend") or []:
+        item["from_date"] = _bar_date({"open_time": item.pop("from_ms")})
+        item["to_date"] = _bar_date({"open_time": item.pop("to_ms")})
+    return {
+        "symbol": sym,
+        "computed_at": doc.get("computed_at"),
+        "pivot_count": len(pivots),
+        "last_closed_bar": _bar_time(closed[-1]) if closed else None,
+        **state,
+        "warnings": doc.get("warnings") or [],
+    }
+
+
+# TM - #GANN-TW - Gann Time Windows
+@mcp.tool()
+def recompute_pivots(symbol: str = "") -> dict[str, Any]:
+    """Tinh lai pivot tu dau va ghi lai cache.
+
+    Binh thuong khong can goi: cache tu het hieu luc khi co nen moi dong, khi
+    doi config, hay khi doi pivot thu cong. Goi khi vua backfill them lich su cu,
+    hoac khi muon chac chan.
+
+    symbol bo trong = moi cap trong time_windows.symbols.
+    """
+    _gann_require()
+    targets = [_resolve_symbol(symbol)] if symbol else _gann_symbols()
+    rows = []
+    for sym in targets:
+        doc = _gann_doc(sym, force=True)
+        rows.append({
+            "symbol": sym,
+            "path": str(_gann_pivot_path(sym)),
+            "timeframes": {
+                tf: {"pivots": len(block.get("pivots") or []),
+                     "bars": block.get("bars", 0),
+                     "first_bar": _bar_time({"open_time": block.get("first_bar_ms") or 0}),
+                     "last_bar": _bar_time({"open_time": block.get("last_bar_ms") or 0})}
+                for tf, block in (doc.get("timeframes") or {}).items()
+            },
+            "warnings": doc.get("warnings") or [],
+        })
+    return {"recomputed_at": _now_iso(), "symbols": rows}
 
 
 # ---------------------------------------------------------------- admin

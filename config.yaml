@@ -55,6 +55,24 @@ fetcher:
   run_on_start: true
 
 # TM - #GANN-TW - Gann Time Windows
+# Pivot kieu swing chart Gann, trang thai song, va (cac phase sau) cua so thoi gian.
+# Du lieu doc tu file nen co san trong data_root - khoi nay khong goi Binance.
+# Pivot va cache la du lieu dan xuat: xoa di thi recompute_pivots tinh lai duoc.
+# Rieng manual_pivots la du lieu goc do nguoi dung nhap, khong tu sinh lai duoc.
+time_windows:
+  enabled: true
+  symbols: ["BTCUSDT", "ETHUSDT"]    # trong = moi cap dang bat
+  paths:                             # tuong doi so voi data_root
+    pivots: "time_windows/pivots/{symbol}.json"
+    manual_pivots: "time_windows/manual_pivots.json"
+  pivots:
+    swing_bars: {"1d": 2, "1w": 2}   # so nen nguoc chieu de xac nhan dao chieu
+    atr_period: 14
+    min_move_pct: {"1d": 5.0, "1w": 12.0}   # duoi CA HAI nguong thi coi la nhieu
+    min_move_atr: {"1d": 2.0, "1w": 2.0}
+    intermediate_move_pct: 12.0      # pivot 1d tu bien do nay tro len = intermediate
+    major_merge_days: 3              # pivot 1d trung pivot 1w trong khoang nay = major
+
 # So nen toi da giu theo tung khung. null = khong cat.
 # Khung nao khong khai thi dung klines.max_history nhu truoc.
 # D va W phai la null thi pivot Gann moi co du lich su tu 2019-09.
@@ -287,6 +305,18 @@ instructions: |
     thieu, dung ket luan nhu the day du.
   - position_id mang tien to cap: BTCUSDT-P1. Vi the gom rieng tung cap.
   - Quota lenh va daily_stop_loss van tinh gop tat ca cac cap.
+
+  PIVOT GANN VA OVERBALANCE (khung 1w va 1d):
+  get_pivots tra dinh/day DA DUOC XAC NHAN dao chieu - khac swing fractal trong
+  get_context: moi pivot co confirmed_at muon hon time, vi do la luc thuc su biet.
+  Dung no cho tieu chi swing "co swing high/low ro rang lam moc cho SL va TP":
+  lay pivot level major/intermediate lam moc, dung uoc chung bang mat.
+  get_swing_state cho xu huong (up/down/range doc tu chuoi pivot) va overbalance:
+  time_overbalanced = nhip hoi hien tai dai hon moi nhip hoi truoc trong cung xu
+  huong, price_overbalanced = sau hon moi nhip truoc. Gann coi do la dau hieu xu
+  huong doi. Doc 'note' truoc, no gom ket luan trong mot cau.
+  Day la cach DOC CAU TRUC, khong phai tin hieu vao lenh: khong duoc dung mot
+  minh overbalance de de xuat trade. Van phai qua check_trade nhu moi lenh khac.
 
   ORB - OPENING RANGE BREAKOUT (chi tren cap orb.symbol, mac dinh BTCUSDT):
   Lenh ORB co BO RULE RIENG (khoi 'orb' cua get_rules), khong dung max_stop_points /
