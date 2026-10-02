@@ -35,11 +35,11 @@ COPY orb.py orb_history.py orb_runtime.py orb_backtest.py admin_orb.py ./
 COPY orb_rules.py ./
 
 # TM - #GANN-TW - Gann Time Windows
-COPY klines_coverage.py gann_pivots.py gann_windows.py ./
+COPY klines_coverage.py gann_pivots.py gann_windows.py gann_backtest.py ./
 
 RUN mkdir -p /data/klines /data/bias /data/journal /data/journal/orb_skips \
              /data/orb/state /data/orb/logs /data/orb/history /data/orb/backtests \
-             /data/time_windows/pivots \
+             /data/time_windows/pivots /data/time_windows/backtests \
     && chown -R bamcp:bamcp /data /app
 
 USER bamcp

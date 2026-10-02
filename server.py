@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextlib
 import copy
+import csv
 import hashlib
 import json
 import os
@@ -28,6 +29,7 @@ from starlette.responses import JSONResponse
 
 import admin       # module cuc bo: trang cai dat
 import exchanges   # module cuc bo: adapter doc tai khoan san
+import gann_backtest  # TM - #GANN-TW - Gann Time Windows: backtest walk-forward
 import gann_pivots  # TM - #GANN-TW - Gann Time Windows: pivot swing chart & trang thai song
 import gann_windows  # TM - #GANN-TW - Gann Time Windows: chieu thoi gian & cua so
 import klines_coverage  # TM - #GANN-TW - Gann Time Windows: do phu & loc theo thoi gian
@@ -1341,6 +1343,12 @@ GANN_MANUAL_FILE = DATA_ROOT / str(
     GANN_PATHS.get("manual_pivots") or "time_windows/manual_pivots.json")
 GANN_EVENTS_FILE = DATA_ROOT / str(
     GANN_PATHS.get("events") or "time_windows/events.json")
+GANN_BACKTEST_DIR = DATA_ROOT / str(
+    GANN_PATHS.get("backtests") or "time_windows/backtests")
+GANN_BACKTEST_CFG: dict[str, Any] = GANN_CFG.get("backtest") or {}
+# Tien to run_id, de get_backtest_result biet doc ket qua o dau (ORB hay Gann)
+GANN_RUN_PREFIX = "tw-"
+GANN_BACKTEST_TASKS: set[asyncio.Task] = set()
 # Truong noi bo cua tang tinh toan, khong dua ra ngoai tool.
 GANN_INTERNAL = ("index", "level_locked")
 # Truong bo khi tra ra tool, de giu output duoi nguong 8 KB cua muc 7:
@@ -1567,11 +1575,7 @@ def _gann_window_pivots(symbol: str, as_of_ms: int
                         ) -> tuple[list[dict[str, Any]], list[str]]:
     """Pivot dem chu ky tu do, da biet tai as_of, moi buoc ngoat DUNG MOT LAN.
 
-    Nen 1d la goc: ngay cua no chinh xac, va pivot 1d trung pivot 1w da mang
-    san bac major. Pivot 1w chi duoc them khi trong tuan cua no khong co pivot
-    1d cung loai - vd lich su 1d ngan hon 1w. Lay ca hai khung khong loc thi
-    moi buoc ngoat lon bi dem hai lan (mot lan tu thu Hai cua tuan, mot lan tu
-    ngay that), diem cua no tu nhien gap doi.
+    Cach gop 1d/1w nam o gann_windows.merge_timeframes - backtest dung chung.
     """
     warnings: list[str] = []
     frames: dict[str, list[dict[str, Any]]] = {}
@@ -1584,19 +1588,149 @@ def _gann_window_pivots(symbol: str, as_of_ms: int
         warnings.extend(doc.get("warnings") or [])
         frames[tf] = pivots
 
-    daily = frames.get("1d") or []
-    margin = int(GANN_PIVOT_CFG.get("major_merge_days") or 3) * 86_400_000
-    out: list[dict[str, Any]] = [{**p, "span_days": 1} for p in daily]
-    for weekly in frames.get("1w") or []:
-        low = weekly["time_ms"] - margin
-        high = weekly["time_ms"] + gann_pivots.MAJOR_SPAN_MS + margin
-        if any(p["type"] == weekly["type"] and low <= p["time_ms"] < high for p in daily):
-            continue
-        out.append({**weekly, "span_days": 7})
+    out = gann_windows.merge_timeframes(
+        frames.get("1d") or [], frames.get("1w") or [], _gann_margin_ms(),
+        gann_pivots.MAJOR_SPAN_MS)
     for pivot in out:
         pivot["date"] = _bar_date({"open_time": pivot["time_ms"]})
-    out.sort(key=lambda p: p["time_ms"])
     return out, warnings
+
+
+def _gann_margin_ms() -> int:
+    return int(GANN_PIVOT_CFG.get("major_merge_days") or 3) * 86_400_000
+
+
+# TM - #GANN-TW - Gann Time Windows
+def _gann_end_of_day_ms(day: date) -> int:
+    end = datetime(day.year, day.month, day.day, tzinfo=TZ) + timedelta(
+        days=1, microseconds=-1)
+    return int(end.timestamp() * 1000)
+
+
+def _gann_backtest_execute(run_id: str, request: dict[str, Any]) -> dict[str, Any]:
+    """Chay backtest (dong bo, trong thread). Ghi result.json + daily.csv.
+
+    Moi du lieu dau vao (record pivot, nen, su kien) da duoc doc san o tool, de
+    thread nay chi doc trong bo nho - khong tranh ghi file cache voi tool khac.
+    """
+    started = time.perf_counter()
+    folder = GANN_BACKTEST_DIR / run_id
+    try:
+        bars, dates = request["bars"], request["dates"]
+        start, end = request["start"], request["end"]
+        index_of = {d: i for i, d in enumerate(dates)}
+        first = next(i for i, d in enumerate(dates) if d >= start.isoformat())
+        last = max(i for i, d in enumerate(dates) if d <= end.isoformat())
+        days = [date.fromisoformat(d) for d in dates[first:last + 1]]
+
+        cfg = copy.deepcopy(GANN_CFG)
+        events = request["events"]
+        tolerance = int((cfg.get("projections") or {}).get("tolerance_days") or 0)
+        excluded = [False] * len(days)
+        if request["exclude_events"]:
+            # Do rieng phan Gann: tat chieu su kien VA bo ngay quanh su kien khoi
+            # ca hai phia - neu khong, lift co the den tu CPI/FOMC chu khong tu Gann.
+            cfg.setdefault("projections", {}).setdefault("event", {})["enabled"] = False
+            near = set()
+            for item in events:
+                moment = gann_windows._as_date(item.get("date"))
+                if moment is None:
+                    continue
+                for k in range(-tolerance, tolerance + 1):
+                    near.add((moment + timedelta(days=k)).isoformat())
+            excluded = [d.isoformat() in near for d in days]
+            events = []
+
+        scored = gann_backtest.walk_forward(
+            request["records_1d"], request["records_1w"], days,
+            int(request["lead_days"]), _gann_end_of_day_ms, cfg, events,
+            request["symbol"], _gann_margin_ms(), gann_pivots.MAJOR_SPAN_MS)
+
+        final = gann_windows.merge_timeframes(
+            gann_pivots.live_pivots(request["records_1d"]),
+            gann_pivots.live_pivots(request["records_1w"]),
+            _gann_margin_ms(), gann_pivots.MAJOR_SPAN_MS)
+        pivot_dates = {p["date"] for p in final if p.get("level") in ("major", "intermediate")}
+        # Tinh ket qua tren CA chuoi nen roi moi cat: ATR va volume can lich su
+        # truoc ngay start.
+        outcomes = gann_backtest.outcome_metrics(bars, dates, pivot_dates,
+                                                 GANN_BACKTEST_CFG)[first:last + 1]
+
+        report = gann_backtest.run(
+            scored, outcomes, cfg, int(request["permutations"]), int(request["seed"]),
+            int(GANN_BACKTEST_CFG.get("shift_days") or 30), excluded)
+        win_runs = report.pop("_window_runs")
+        in_window = [False] * len(days)
+        for a, b in win_runs:
+            for i in range(a, b + 1):
+                in_window[i] = True
+
+        folder.mkdir(parents=True, exist_ok=True)
+        with (folder / "daily.csv").open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(("date", "score", "in_window", "excluded", "range_atr",
+                             "volume_z", "pivot_near", "types", "pivots_known"))
+            for i, row in enumerate(scored):
+                types = sorted({h["type"] for h in row["hits"]})
+                writer.writerow((row["date"].isoformat(), row["score"], int(in_window[i]),
+                                 int(excluded[i]), outcomes[i]["range_atr"],
+                                 outcomes[i]["volume_z"], outcomes[i]["pivot_near"],
+                                 "|".join(types), row["pivots_known"]))
+
+        out = {
+            "run_id": run_id,
+            "status": "done",
+            "kind": "time_windows",
+            "symbol": request["symbol"],
+            "request": {k: request[k] for k in ("lead_days", "permutations", "seed",
+                                                "exclude_events")}
+            | {"start": start.isoformat(), "end": end.isoformat()},
+            "config_version": request["config_version"],
+            **report,
+            "files": {"daily_csv": str(folder / "daily.csv"),
+                      "result_json": str(folder / "result.json")},
+            "elapsed_seconds": round(time.perf_counter() - started, 2),
+            "finished_at": _now_iso(),
+        }
+        _write_json(folder / "result.json", out)
+        return out
+    except Exception as exc:
+        out = {"run_id": run_id, "status": "error", "kind": "time_windows",
+               "error": f"{type(exc).__name__}: {exc}",
+               "elapsed_seconds": round(time.perf_counter() - started, 2)}
+        _write_json(folder / "result.json", out)
+        print(f"BAMCP backtest {run_id} loi: {out['error']}", file=sys.stderr)
+        return out
+
+
+def _gann_backtest_summary(result: dict[str, Any]) -> dict[str, Any]:
+    """Ban tom tat de tool tra ve (< 8 KB). Day du: get_backtest_result(run_id)."""
+    if result.get("status") != "done":
+        return result
+
+    def brief(row: dict[str, Any]) -> dict[str, Any]:
+        keep = ("lift", "delta", "p_value", "p_value_global", "n_in", "n_out",
+                "days_touched")
+        return {k: row[k] for k in keep if k in row}
+
+    return {
+        "run_id": result["run_id"],
+        "status": "done",
+        "symbol": result["symbol"],
+        "request": result["request"],
+        "days": result["days"],
+        "windows": result["windows"],
+        "coverage_pct": result["coverage_pct"],
+        "overall": {m: brief(r) for m, r in result["overall"].items()},
+        "by_type": {t: brief(r) for t, r in result["by_type"].items()},
+        "by_cycle_days": {d: {k: r.get(k) for k in ("lift", "p_value", "n_in")}
+                          for d, r in result["by_cycle_days"].items()},
+        "elapsed_seconds": result["elapsed_seconds"],
+        "note": ("p_value: dich cua so +-shift_days (giu che do bien dong) - so chinh. "
+                 "p_value_global: dat lai bat ky dau - nho hon nhieu ma p_value lon thi "
+                 "hieu ung den tu che do bien dong, khong phai tu thoi diem Gann. "
+                 "Trung binh/trung vi, suggested_weights: get_backtest_result(run_id)."),
+    }
 
 
 # ---------------------------------------------------------------- server
@@ -2979,7 +3113,20 @@ async def backtest_orb(from_date: str, to_date: str, session_ids: list[str] | No
 
 @mcp.tool()
 def get_backtest_result(run_id: str) -> dict[str, Any]:
-    """Ket qua mot lan backtest_orb (cung dang output). status: running | done | error."""
+    """Ket qua mot lan backtest_orb hoac backtest_time_windows (run_id bat dau
+    bang 'tw-'). status: running | done | error."""
+    # TM - #GANN-TW - Gann Time Windows: run cua time windows doc o thu muc rieng,
+    # va khong doi ORB phai bat
+    rid = str(run_id or "").strip()
+    if rid.startswith(GANN_RUN_PREFIX):
+        if not rid or "/" in rid or "\\" in rid or ".." in rid:
+            raise ValueError("run_id khong hop le")
+        path = GANN_BACKTEST_DIR / rid / "result.json"
+        if not path.exists():
+            recent = sorted((p.name for p in GANN_BACKTEST_DIR.iterdir() if p.is_dir()),
+                            reverse=True)[:10] if GANN_BACKTEST_DIR.exists() else []
+            raise ValueError(f"khong co backtest '{rid}'. Cac run gan day: {recent}")
+        return _read_json(path, {})
     _orb()
     try:
         return ORB_BACKTEST.result(run_id)
@@ -3164,6 +3311,84 @@ def get_time_windows(symbol: str = "", horizon_days: int = 30, min_score: float 
         "config_version": _gann_config_version(),
         "warnings": warnings + event_warnings,
     }
+
+
+# TM - #GANN-TW - Gann Time Windows
+@mcp.tool()
+async def backtest_time_windows(symbol: str = "", start: str = "", end: str = "",
+                                lead_days: int = 1, permutations: int = 200,
+                                seed: int = 42, exclude_events: bool = False
+                                ) -> dict[str, Any]:
+    """Kiem chung cua so thoi gian Gann tren lich su - walk-forward, khong lookahead.
+
+    Voi moi ngay t trong [start, end]: tinh diem nhu dang dung o cuoi ngay
+    t - lead_days (chi pivot da xac nhan luc do), roi so ngay trong cua so voi
+    ngay ngoai cua so tren 3 chi so: range_atr (bien do / ATR), volume_z,
+    pivot_near (co buoc ngoat that gan do khong).
+
+    start/end: 'YYYY-MM-DD'. Bo trong = tu nen 1d dau tien + warmup_days den nen
+      da dong gan nhat.
+    permutations: so lan xao tron cho permutation test (p-value).
+    seed: cung seed thi cung ket qua.
+    exclude_events: True = tat chieu su kien va bo ngay quanh su kien, de do
+      RIENG phan Gann.
+
+    Tra ban tom tat; neu chay qua ~55 giay thi tra status=running kem run_id -
+    goi get_backtest_result(run_id) sau. Ket qua co suggested_weights nhung
+    KHONG tu ghi vao config.
+    """
+    _gann_require()
+    sym = _resolve_symbol(symbol)
+    lead = int(lead_days)
+    if lead < 1:
+        raise ValueError("lead_days phai >= 1: diem cua ngay t chi duoc tinh tu du lieu truoc t")
+    perms = int(permutations)
+    if not 0 <= perms <= 2000:
+        raise ValueError("permutations phai trong [0, 2000]")
+
+    records_1d, _ = _gann_records(sym, "1d")
+    records_1w, _ = _gann_records(sym, "1w")
+    for record in records_1d + records_1w:
+        record["date"] = _bar_date({"open_time": record["time_ms"]})
+    closed, _ = _split_closed(_load_bars(sym, "1d"), "1d")
+    if len(closed) < 60:
+        raise ValueError(f"{sym} chi co {len(closed)} nen 1d - can backfill_klines truoc")
+    dates = [_bar_date(b) for b in closed]
+
+    warmup = int(GANN_BACKTEST_CFG.get("warmup_days") or 120)
+    first_day = date.fromisoformat(dates[0]) + timedelta(days=warmup)
+    last_day = date.fromisoformat(dates[-1])
+    try:
+        start_day = date.fromisoformat(start) if start.strip() else first_day
+        end_day = date.fromisoformat(end) if end.strip() else last_day
+    except ValueError as exc:
+        raise ValueError("start/end dung dang 'YYYY-MM-DD'") from exc
+    start_day = max(start_day, date.fromisoformat(dates[0]) + timedelta(days=lead))
+    end_day = min(end_day, last_day)
+    if end_day <= start_day:
+        raise ValueError(f"khoang trong: {start_day} -> {end_day} (du lieu 1d: "
+                         f"{dates[0]} -> {dates[-1]})")
+
+    events, _ = _gann_events()
+    request = {
+        "symbol": sym, "start": start_day, "end": end_day, "lead_days": lead,
+        "permutations": perms, "seed": int(seed), "exclude_events": bool(exclude_events),
+        "records_1d": records_1d, "records_1w": records_1w, "bars": closed,
+        "dates": dates, "events": events, "config_version": _gann_config_version(),
+    }
+    stamp = datetime.now(TZ).strftime("%Y%m%dT%H%M%S")
+    run_id = f"{GANN_RUN_PREFIX}{stamp}-{secrets.token_hex(3)}"
+    _write_json(GANN_BACKTEST_DIR / run_id / "result.json",
+                {"run_id": run_id, "status": "running", "kind": "time_windows",
+                 "symbol": sym, "started_at": _now_iso()})
+    task = asyncio.create_task(asyncio.to_thread(_gann_backtest_execute, run_id, request))
+    GANN_BACKTEST_TASKS.add(task)
+    task.add_done_callback(GANN_BACKTEST_TASKS.discard)
+    done, _ = await asyncio.wait({task}, timeout=55.0)
+    if done:
+        return _gann_backtest_summary(task.result())
+    return {"run_id": run_id, "status": "running",
+            "note": "Backtest dang chay nen. Goi get_backtest_result(run_id) sau."}
 
 
 # TM - #GANN-TW - Gann Time Windows

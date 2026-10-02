@@ -66,6 +66,7 @@ time_windows:
     pivots: "time_windows/pivots/{symbol}.json"
     manual_pivots: "time_windows/manual_pivots.json"
     events: "time_windows/events.json"
+    backtests: "time_windows/backtests"  # moi lan chay mot thu muc tw-<thoi diem>-<ma>
   pivots:
     swing_bars: {"1d": 2, "1w": 2}   # so nen nguoc chieu de xac nhan dao chieu
     atr_period: 14
@@ -103,6 +104,17 @@ time_windows:
     min_score: 3.0                   # duoi nguong nay thi khong goi la cua so
     merge_gap_days: 1                # hai doan cach nhau the nay thi gop lam mot
     max_hits_per_window: 8
+
+  # backtest_time_windows: ngay trong cua so co bien dong manh hon / gan buoc
+  # ngoat hon ngay ngoai cua so khong.
+  backtest:
+    atr_period: 20                   # range_atr = (high - low) / ATR den ngay t-1
+    volume_lookback: 20              # volume_z so voi chung nay ngay truoc
+    pivot_near_days: 2               # pivot_near: co pivot that trong +- chung nay ngay
+    # Permutation test chinh: moi cua so dich ngau nhien +- shift_days. Du nho de
+    # giu nguyen che do bien dong cua giai doan, du lon de xao tron thoi diem.
+    shift_days: 30
+    warmup_days: 120                 # start bo trong = ngay nen 1d dau tien + chung nay
 
 # So nen toi da giu theo tung khung. null = khong cat.
 # Khung nao khong khai thi dung klines.max_history nhu truoc.

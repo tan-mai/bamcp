@@ -45,6 +45,31 @@ def _pivot_ref(pivot: dict[str, Any]) -> dict[str, Any]:
             "level": pivot.get("level"), "timeframe": pivot.get("timeframe")}
 
 
+def merge_timeframes(daily: list[dict[str, Any]], weekly: list[dict[str, Any]],
+                     margin_ms: int, week_span_ms: int) -> list[dict[str, Any]]:
+    """Gop pivot 1d va 1w thanh mot danh sach, moi buoc ngoat DUNG MOT LAN.
+
+    Nen 1d la goc: ngay cua no chinh xac, va pivot 1d trung pivot 1w da mang
+    san bac major. Pivot 1w chi duoc them khi trong tuan cua no (+- margin)
+    khong co pivot 1d cung loai - vd lich su 1d ngan hon 1w. Lay ca hai khung
+    khong loc thi moi buoc ngoat lon bi dem hai lan (mot lan tu thu Hai cua
+    tuan, mot lan tu ngay that), diem cua no tu nhien gap doi.
+
+    Dung chung cho get_time_windows va backtest - hai noi phai thay cung mot
+    tap pivot, khong thi backtest do mot thu khac voi cai tool dang dua ra.
+    """
+    out = [{**p, "span_days": 1} for p in daily]
+    for item in weekly:
+        low = int(item["time_ms"]) - margin_ms
+        high = int(item["time_ms"]) + week_span_ms + margin_ms
+        if any(p["type"] == item["type"] and low <= int(p["time_ms"]) < high
+               for p in daily):
+            continue
+        out.append({**item, "span_days": 7})
+    out.sort(key=lambda p: p["time_ms"])
+    return out
+
+
 def eligible_pivots(pivots: list[dict[str, Any]], as_of: date,
                     max_age_days: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Pivot con duoc dem tu. Qua cu thi bo - dem tu pivot 5 nam truoc bang
