@@ -6,13 +6,14 @@ import asyncio
 import base64
 import contextlib
 import copy
+import hashlib
 import json
 import os
 import secrets
 import sys
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -28,6 +29,7 @@ from starlette.responses import JSONResponse
 import admin       # module cuc bo: trang cai dat
 import exchanges   # module cuc bo: adapter doc tai khoan san
 import gann_pivots  # TM - #GANN-TW - Gann Time Windows: pivot swing chart & trang thai song
+import gann_windows  # TM - #GANN-TW - Gann Time Windows: chieu thoi gian & cua so
 import klines_coverage  # TM - #GANN-TW - Gann Time Windows: do phu & loc theo thoi gian
 import settings    # module cuc bo: luu credential xuong volume
 # TM - #ORB - ORB Enhancement
@@ -1337,6 +1339,8 @@ GANN_PATHS: dict[str, Any] = GANN_CFG.get("paths") or {}
 GANN_TIMEFRAMES = ("1w", "1d")
 GANN_MANUAL_FILE = DATA_ROOT / str(
     GANN_PATHS.get("manual_pivots") or "time_windows/manual_pivots.json")
+GANN_EVENTS_FILE = DATA_ROOT / str(
+    GANN_PATHS.get("events") or "time_windows/events.json")
 # Truong noi bo cua tang tinh toan, khong dua ra ngoai tool.
 GANN_INTERNAL = ("index", "level_locked")
 # Truong bo khi tra ra tool, de giu output duoi nguong 8 KB cua muc 7:
@@ -1344,7 +1348,8 @@ GANN_INTERNAL = ("index", "level_locked")
 #   time_ms / confirmed_at_ms - nen 1d/1w luon mo 07:00 nen ngay la du dinh danh;
 #     epoch ms van nam trong file cache cho Phase 2 tinh chieu thoi gian
 GANN_OMIT = GANN_INTERNAL + ("timeframe", "time_ms", "confirmed_at_ms",
-                             "known_ms", "retracted_ms", "major_from_ms")
+                             "known_ms", "retracted_ms", "major_from_ms",
+                             "major_until_ms")
 
 
 def _gann_require() -> None:
@@ -1496,6 +1501,102 @@ def _gann_frame(symbol: str, timeframe: str, as_of_ms: int | None = None,
     """(pivot con hieu luc tai as_of_ms, ca doc). as_of_ms None = hien tai."""
     records, doc = _gann_records(symbol, timeframe, force=force)
     return gann_pivots.live_pivots(records, as_of_ms), doc
+
+
+# TM - #GANN-TW - Gann Time Windows
+def _gann_events() -> tuple[list[dict[str, Any]], list[str]]:
+    """Su kien vi mo nhap tay. File dang [{date, name, weight, symbols}]."""
+    doc = _read_json(GANN_EVENTS_FILE, [])
+    if isinstance(doc, dict):          # cho phep boc trong {"events": [...]}
+        doc = doc.get("events") or []
+    if not isinstance(doc, list):
+        return [], [f"{GANN_EVENTS_FILE.name} khong phai dang list - bo qua"]
+    rows, warnings = [], []
+    for item in doc:
+        if not isinstance(item, dict) or not str(item.get("date") or "").strip():
+            warnings.append(f"bo qua su kien khong hop le: {item!r}")
+            continue
+        rows.append(item)
+    return rows, warnings
+
+
+def _gann_compact_hit(hit: dict[str, Any]) -> dict[str, Any]:
+    """Hit dang gon cho tool, de output duoi nguong 8 KB cua BR muc 7.
+
+    Pivot gom thanh mot chuoi "low 2026-07-01 major" - Claude doc van ro, ma
+    mot object long nhau ton 5 dong moi hit. Ngay chieu toi (date) bo voi hit
+    co pivot vi suy ra duoc: date = peak - offset. Hit khong co pivot (seasonal,
+    event) thi giu date, vi do chinh la thong tin cua no.
+    Logic thuan (gann_windows) van tra object day du cho backtest va trang admin.
+    """
+    out = dict(hit)
+    ref = out.pop("pivot", None)
+    if ref:
+        out.pop("date", None)
+        out["pivot"] = f"{ref.get('type')} {ref.get('date')} {ref.get('level')}"
+    return out
+
+
+def _gann_config_version() -> str:
+    """Dau tay cua config time_windows, de doc ket qua cu con biet no sinh ra tu dau."""
+    raw = json.dumps(GANN_CFG, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:12]
+
+
+def _gann_as_of(text: str) -> tuple[date, int]:
+    """(ngay dung tai, moc ms cuoi ngay do). Rong = hien tai.
+
+    Lay CUOI ngay vi "dung tai ngay X" nghia la da biet moi nen dong trong ngay
+    X. Nen 1d mo 07:00 nen nen cua ngay X-1 dong vao 07:00 ngay X - dung bang
+    moc nay thi no da duoc tinh, con nen dang chay cua ngay X thi chua.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        now = datetime.now(TZ)
+        return now.date(), int(now.timestamp() * 1000)
+    try:
+        day = date.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError(f"as_of khong hop le: {text!r}. Dung 'YYYY-MM-DD'") from exc
+    end = datetime(day.year, day.month, day.day, tzinfo=TZ) + timedelta(
+        days=1, microseconds=-1)
+    return day, int(end.timestamp() * 1000)
+
+
+def _gann_window_pivots(symbol: str, as_of_ms: int
+                        ) -> tuple[list[dict[str, Any]], list[str]]:
+    """Pivot dem chu ky tu do, da biet tai as_of, moi buoc ngoat DUNG MOT LAN.
+
+    Nen 1d la goc: ngay cua no chinh xac, va pivot 1d trung pivot 1w da mang
+    san bac major. Pivot 1w chi duoc them khi trong tuan cua no khong co pivot
+    1d cung loai - vd lich su 1d ngan hon 1w. Lay ca hai khung khong loc thi
+    moi buoc ngoat lon bi dem hai lan (mot lan tu thu Hai cua tuan, mot lan tu
+    ngay that), diem cua no tu nhien gap doi.
+    """
+    warnings: list[str] = []
+    frames: dict[str, list[dict[str, Any]]] = {}
+    for tf in GANN_TIMEFRAMES:
+        try:
+            pivots, doc = _gann_frame(symbol, tf, as_of_ms)
+        except Exception as exc:
+            warnings.append(f"{tf}: {exc}")
+            pivots, doc = [], {}
+        warnings.extend(doc.get("warnings") or [])
+        frames[tf] = pivots
+
+    daily = frames.get("1d") or []
+    margin = int(GANN_PIVOT_CFG.get("major_merge_days") or 3) * 86_400_000
+    out: list[dict[str, Any]] = [{**p, "span_days": 1} for p in daily]
+    for weekly in frames.get("1w") or []:
+        low = weekly["time_ms"] - margin
+        high = weekly["time_ms"] + gann_pivots.MAJOR_SPAN_MS + margin
+        if any(p["type"] == weekly["type"] and low <= p["time_ms"] < high for p in daily):
+            continue
+        out.append({**weekly, "span_days": 7})
+    for pivot in out:
+        pivot["date"] = _bar_date({"open_time": pivot["time_ms"]})
+    out.sort(key=lambda p: p["time_ms"])
+    return out, warnings
 
 
 # ---------------------------------------------------------------- server
@@ -3021,6 +3122,47 @@ def get_swing_state(symbol: str = "", timeframe: str = "1d") -> dict[str, Any]:
         "last_closed_bar": _bar_time(closed[-1]) if closed else None,
         **state,
         "warnings": doc.get("warnings") or [],
+    }
+
+
+# TM - #GANN-TW - Gann Time Windows
+@mcp.tool()
+def get_time_windows(symbol: str = "", horizon_days: int = 30, min_score: float = 0,
+                     as_of: str = "", max_windows: int = 5) -> dict[str, Any]:
+    """Cua so thoi gian Gann: nhung ngay ma nhieu phep dem chu ky cung tro vao.
+
+    Tu moi pivot da xac nhan, dem ra cac chu ky (cycle), ky niem nam
+    (anniversary), moc theo mua (seasonal), do dai chan song lap lai
+    (swing_duration), cong su kien vi mo nhap tay (event). Ngay nao nhieu phep
+    dem cung roi vao thi diem cao.
+
+    horizon_days: nhin truoc bao nhieu ngay tinh tu as_of.
+    min_score: 0 = dung nguong trong config.
+    as_of: 'YYYY-MM-DD' = tinh nhu dang dung o cuoi ngay do, chi dung pivot luc
+      do da biet. Bo trong = hien tai. Dung de kiem tra va backtest.
+
+    CHU Y: day la GIA THUYET ve thoi diem, khong noi gia se di huong nao. Chua
+    duoc kiem chung cho toi khi co backtest_time_windows - dung dung mot minh
+    cua so nao de de xuat vao lenh.
+    """
+    _gann_require()
+    sym = _resolve_symbol(symbol)
+    day, as_of_ms = _gann_as_of(as_of)
+    horizon = max(1, min(int(horizon_days or 30), 365))
+    pivots, warnings = _gann_window_pivots(sym, as_of_ms)
+    events, event_warnings = _gann_events()
+    result = gann_windows.build(
+        pivots, day, horizon, GANN_CFG, events, sym,
+        min_score=float(min_score or 0) or None,
+        max_windows=max(1, min(int(max_windows or 5), 20)))
+    for window in result["windows"]:
+        window["hits"] = [_gann_compact_hit(h) for h in window["hits"]]
+    return {
+        "symbol": sym,
+        **result,
+        "pivots_used": len(pivots),
+        "config_version": _gann_config_version(),
+        "warnings": warnings + event_warnings,
     }
 
 

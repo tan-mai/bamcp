@@ -25,6 +25,9 @@ LEVELS = ("major", "intermediate", "minor")
 # major (muc FR-1.1).
 MAJOR_TIMEFRAME = "1w"
 DAY_MS = 86_400_000
+# Do dai mot nen cua MAJOR_TIMEFRAME. Dung de khop pivot 1d voi ca tuan cua
+# pivot 1w, khong chi voi gio mo cua tuan.
+MAJOR_SPAN_MS = 7 * DAY_MS
 
 
 # ---------------------------------------------------------------- ATR
@@ -269,18 +272,34 @@ def live_pivots(records: list[dict[str, Any]],
 
 # ---------------------------------------------------------------- phan cap
 
+def _alive_at(record: dict[str, Any], moment: int | None) -> bool:
+    """Record co hieu luc tai moment khong. Giong live_pivots nhung cho mot cai."""
+    if moment is not None and int(record.get("known_ms") or 0) > moment:
+        return False
+    gone = record.get("retracted_ms")
+    return gone is None or (moment is not None and gone > moment)
+
+
 def assign_levels(pivots: list[dict[str, Any]], timeframe: str,
                   intermediate_move_pct: float,
                   major_pivots: list[dict[str, Any]] | None = None,
                   merge_days: int = 3) -> None:
     """Xep bac major / intermediate / minor. Sua truc tiep tren list.
 
-    Pivot 1d trung mot pivot 1w thi duoc nang len major - nhung pivot 1w do co
-    the chi duoc xac nhan muon hon nhieu (nen tuan dong cham hon nen ngay). Nen
-    bac goc ghi vao `level`, con moc biet duoc viec nang len ghi rieng vao
-    `major_from_ms`: effective_level() moi quyet dinh bac tai mot thoi diem.
-    Khong lam vay thi backtest o nam 2021 se dung mot bac major ma luc do chua
-    ai biet.
+    Pivot 1d trung mot pivot 1w thi duoc nang len major. "Trung" do theo CA TUAN
+    cua nen 1w, them merge_days moi ben - khong phai +-merge_days quanh gio mo
+    cua tuan: time cua pivot 1w la luc nen tuan MO (thu Hai), con cuc tri that
+    co the roi vao bat ky ngay nao trong tuan. Do theo gio mo thi day COVID
+    3,621.81 (thu Sau 13/03/2020, 4 ngay sau thu Hai) khong duoc nang len major.
+
+    Trong khoang do chi nang MOT pivot - cai cuc tri nhat - va chi chon trong
+    cac pivot 1d da biet tai luc pivot 1w duoc xac nhan. Chon tren ca danh sach
+    thi mot pivot biet muon hon co the gianh mat cho cua mot pivot biet som hon,
+    va nhu the ket qua luc do khac voi viec tinh tren du lieu da cat.
+
+    Moc nang bac va moc het bac ghi rieng (major_from_ms / major_until_ms) chu
+    khong ghi de `level`: effective_level() moi quyet dinh bac tai mot thoi diem.
+    Pivot 1w ma bi bo thi pivot 1d no nang len cung het la major tu luc do.
 
     Pivot da bi ghim level bang tay (level_locked) thi khong doi.
     """
@@ -288,35 +307,55 @@ def assign_levels(pivots: list[dict[str, Any]], timeframe: str,
         for pivot in pivots:
             if not pivot.get("level_locked"):
                 pivot["level"] = "major"
-                pivot["major_from_ms"] = pivot.get("known_ms")
+                pivot["major_from_ms"] = None
+                pivot["major_until_ms"] = None
         return
-    window = max(0, int(merge_days)) * DAY_MS
-    majors = major_pivots or []
+
     for pivot in pivots:
         if pivot.get("level_locked"):
             continue
         move = pivot.get("move_pct") or 0.0
         pivot["level"] = "intermediate" if move >= intermediate_move_pct else "minor"
         pivot["major_from_ms"] = None
-        for major in majors:
-            if (major["type"] == pivot["type"]
-                    and abs(major["time_ms"] - pivot["time_ms"]) <= window):
-                pivot["major_from_ms"] = max(int(pivot.get("known_ms") or 0),
-                                             int(major.get("known_ms") or 0))
-                break
+        pivot["major_until_ms"] = None
+
+    margin = max(0, int(merge_days)) * DAY_MS
+    for major in major_pivots or []:
+        known = major.get("known_ms")
+        if known is None:
+            continue
+        low = int(major["time_ms"]) - margin
+        high = int(major["time_ms"]) + MAJOR_SPAN_MS + margin
+        candidates = [p for p in pivots
+                      if p["type"] == major["type"]
+                      and not p.get("level_locked")
+                      and low <= int(p["time_ms"]) < high
+                      and _alive_at(p, int(known))]
+        if not candidates:
+            continue
+        best = (max if major["type"] == "high" else min)(
+            candidates, key=lambda p: p["price"])
+        current = best.get("major_from_ms")
+        if current is None or int(known) < int(current):
+            best["major_from_ms"] = int(known)
+            best["major_until_ms"] = major.get("retracted_ms")
 
 
 def effective_level(pivot: dict[str, Any], as_of_ms: int | None = None) -> str:
     """Bac cua pivot tai mot thoi diem. as_of_ms None = hien tai.
 
-    Pivot duoc nang len major ke tu major_from_ms; truoc do no van la bac goc.
+    Pivot duoc nang len major trong khoang [major_from_ms, major_until_ms);
+    ngoai khoang do no la bac goc.
     """
-    moment = pivot.get("major_from_ms")
-    if moment is None:
+    start = pivot.get("major_from_ms")
+    if start is None:
         return pivot.get("level") or "minor"
-    if as_of_ms is None or int(moment) <= as_of_ms:
-        return "major"
-    return pivot.get("level") or "minor"
+    until = pivot.get("major_until_ms")
+    if as_of_ms is None:
+        promoted = until is None
+    else:
+        promoted = int(start) <= as_of_ms and (until is None or as_of_ms < int(until))
+    return "major" if promoted else (pivot.get("level") or "minor")
 
 
 # ---------------------------------------------------------------- pivot thu cong
@@ -400,6 +439,7 @@ def apply_manual(pivots: list[dict[str, Any]], entries: list[dict[str, Any]],
             "known_ms": confirmed + max(0, int(span_ms)),
             "retracted_ms": None,
             "major_from_ms": None,
+            "major_until_ms": None,
         })
 
     out.sort(key=lambda p: p["time_ms"])

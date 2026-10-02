@@ -65,6 +65,7 @@ time_windows:
   paths:                             # tuong doi so voi data_root
     pivots: "time_windows/pivots/{symbol}.json"
     manual_pivots: "time_windows/manual_pivots.json"
+    events: "time_windows/events.json"
   pivots:
     swing_bars: {"1d": 2, "1w": 2}   # so nen nguoc chieu de xac nhan dao chieu
     atr_period: 14
@@ -72,6 +73,36 @@ time_windows:
     min_move_atr: {"1d": 2.0, "1w": 2.0}
     intermediate_move_pct: 12.0      # pivot 1d tu bien do nay tro len = intermediate
     major_merge_days: 3              # pivot 1d trung pivot 1w trong khoang nay = major
+
+  # Chieu thoi gian. MOI TRONG SO O DAY LA SO KHOI DIEM, chua duoc kiem chung -
+  # backtest_time_windows (Phase 3) moi cho biet loai nao that su co gia tri va
+  # de xuat trong so moi. Dung coi may con so nay nhu ket luan.
+  projections:
+    tolerance_days: 2                # lech bao nhieu ngay thi van tinh la trung
+    # Pivot qua cu thi khong dem nua. Dem tu pivot 5 nam truoc bang chu ky 30
+    # ngay thi ra ca ram ngay, khong con y nghia gi.
+    max_pivot_age_days: {major: 1500, intermediate: 400, minor: 120}
+    level_weights: {major: 3.0, intermediate: 2.0, minor: 1.0}
+    cycle:
+      enabled: true
+      weight: 1.0
+      days: {30: 0.5, 45: 0.7, 60: 0.6, 90: 1.0, 120: 0.8, 135: 0.6, 144: 0.8,
+             180: 1.0, 225: 0.6, 240: 0.7, 270: 0.8, 315: 0.6, 360: 1.0}
+    anniversary: {enabled: true, weight: 1.0, levels: ["major"], max_years: 6}
+    seasonal:
+      enabled: true
+      weight: 0.5
+      dates: ["02-04", "03-21", "05-05", "06-21", "08-08", "09-22", "11-07", "12-21"]
+    swing_duration: {enabled: true, weight: 0.8, ratios: [0.5, 1.0, 2.0], legs: 3}
+    # Tat: scale_factor phu thuoc thang do gia cua tung cap, phai do bang
+    # backtest truoc. Bat ma dat sai scale thi chi them nhieu.
+    range_square: {enabled: false, weight: 0.5, scale_factor: {BTCUSDT: 100, ETHUSDT: 5}}
+    event: {enabled: true, weight: 1.5}
+
+  scoring:
+    min_score: 3.0                   # duoi nguong nay thi khong goi la cua so
+    merge_gap_days: 1                # hai doan cach nhau the nay thi gop lam mot
+    max_hits_per_window: 8
 
 # So nen toi da giu theo tung khung. null = khong cat.
 # Khung nao khong khai thi dung klines.max_history nhu truoc.
@@ -317,6 +348,12 @@ instructions: |
   huong doi. Doc 'note' truoc, no gom ket luan trong mot cau.
   Day la cach DOC CAU TRUC, khong phai tin hieu vao lenh: khong duoc dung mot
   minh overbalance de de xuat trade. Van phai qua check_trade nhu moi lenh khac.
+
+  get_time_windows cho cua so thoi gian Gann: nhung ngay ma nhieu phep dem chu
+  ky tu cac pivot cung tro vao. Moi hit noi ro dem tu pivot nao, bao nhieu ngay.
+  Cua so chi noi "quanh ngay nay de co bien dong/dao chieu", KHONG noi huong gia.
+  Trong so hien la so khoi diem CHUA KIEM CHUNG - khi nhac den cua so thi noi ro
+  dieu do, cho den khi co ket qua backtest_time_windows.
 
   ORB - OPENING RANGE BREAKOUT (chi tren cap orb.symbol, mac dinh BTCUSDT):
   Lenh ORB co BO RULE RIENG (khoi 'orb' cua get_rules), khong dung max_stop_points /
