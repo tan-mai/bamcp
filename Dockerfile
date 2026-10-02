@@ -34,6 +34,9 @@ COPY orb.py orb_history.py orb_runtime.py orb_backtest.py admin_orb.py ./
 # TM - #ORB-RULES - ORB Rule Set: bo rule ORB rieng (orb.py import module nay)
 COPY orb_rules.py ./
 
+# TM - #GANN-TW - Gann Time Windows
+COPY klines_coverage.py ./
+
 RUN mkdir -p /data/klines /data/bias /data/journal /data/journal/orb_skips \
              /data/orb/state /data/orb/logs /data/orb/history /data/orb/backtests \
     && chown -R bamcp:bamcp /data /app

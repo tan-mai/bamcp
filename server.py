@@ -27,6 +27,7 @@ from starlette.responses import JSONResponse
 
 import admin       # module cuc bo: trang cai dat
 import exchanges   # module cuc bo: adapter doc tai khoan san
+import klines_coverage  # TM - #GANN-TW - Gann Time Windows: do phu & loc theo thoi gian
 import settings    # module cuc bo: luu credential xuong volume
 # TM - #ORB - ORB Enhancement
 import admin_orb     # module cuc bo: trang quan ly phien ORB
@@ -52,6 +53,8 @@ with CONFIG_PATH.open("r", encoding="utf-8") as fh:
 SRV = CFG["server"]
 PATHS = CFG["paths"]
 KL = CFG["klines"]
+# TM - #GANN-TW - Gann Time Windows: retention rieng tung khung
+RETENTION: dict[str, Any] = CFG.get("retention") or {}
 FETCH = CFG.get("fetcher", {"enabled": False})
 RULES_SEED: dict[str, Any] = dict(CFG["rules"])   # gia tri goc, chi dung khi chua co rules.json
 AUTH = SRV.get("auth") or {}
@@ -888,7 +891,23 @@ def _kline_path(symbol: str, timeframe: str) -> Path:
     return _kline_dir(symbol) / PATHS["kline_filename"].format(timeframe=timeframe)
 
 
-def _merge_bars(old: list[Any], new: list[Any], cap: int) -> list[Any]:
+# TM - #GANN-TW - Gann Time Windows
+def _retention_for(timeframe: str) -> int | None:
+    """So nen toi da giu cho mot khung. None = khong cat.
+
+    Khung co khai trong `retention` thi theo khai bao do (ke ca null); khong khai
+    thi theo klines.max_history nhu truoc. Pivot Gann can toan bo lich su 1d/1w
+    tu 2019-09 (~2600 nen D), ma max_history mac dinh la 1000 - de nguyen la
+    moi lan fetch se cat mat phan backfill.
+    """
+    tf = timeframe.strip().lower()
+    if tf in RETENTION:
+        value = RETENTION[tf]
+        return None if value is None else max(1, int(value))
+    return int(FETCH.get("max_history", 1000)) or None
+
+
+def _merge_bars(old: list[Any], new: list[Any], cap: int | None) -> list[Any]:
     """Gop theo openTime, nen moi ghi de nen cu cung moc thoi gian."""
     merged: dict[int, Any] = {int(r[0]): r for r in old if isinstance(r, (list, tuple)) and r}
     for row in new:
@@ -924,7 +943,8 @@ async def _fetch_one(client: httpx.AsyncClient, symbol: str,
             existing = _read_json(path, [])
             if not isinstance(existing, list):
                 existing = []
-            merged = _merge_bars(existing, rows, int(FETCH.get("max_history", 1000)))
+            # TM - #GANN-TW - Gann Time Windows: retention theo tung khung
+            merged = _merge_bars(existing, rows, _retention_for(timeframe))
             _write_json(path, merged)
             return {"ok": True, "fetched": len(rows), "total": len(merged),
                     "at": _now_iso()}
@@ -1375,7 +1395,8 @@ def _orb_on_demand_view() -> list[dict[str, Any]]:
 
 @mcp.tool()
 def get_klines(timeframe: str, symbol: str = "", limit: int = 0,
-               include_forming: bool = False) -> dict[str, Any]:
+               include_forming: bool = False, start: str = "",
+               end: str = "") -> dict[str, Any]:
     """Lay nen OHLCV tho cua mot khung thoi gian.
 
     timeframe: mot trong cac khung khai bao o config (vd 1w, 1d, 4h, 1h, 15m).
@@ -1383,10 +1404,26 @@ def get_klines(timeframe: str, symbol: str = "", limit: int = 0,
     limit: so nen gan nhat, 0 = dung default_limit trong config.
     include_forming: mac dinh False, chi tra nen DA DONG. Bat True thi nen dang chay
       duoc them o cuoi voi is_closed=false - chi de biet gia hien tai, khong doc VSA tu no.
+    start, end: TM - #GANN-TW. 'YYYY-MM-DD' hoac 'YYYY-MM-DD HH:MM', bao gom ca
+      hai dau. Loc theo khoang TRUOC, roi limit lay N nen CUOI cua khoang. Bo
+      trong ca hai thi hanh vi y het truoc day.
     """
     sym = _resolve_symbol(symbol)
     tf = _validate_timeframe(timeframe)
     closed, forming = _split_closed(_load_bars(sym, tf), tf)
+
+    # TM - #GANN-TW - Gann Time Windows: loc theo khoang thoi gian
+    start_ms = klines_coverage.parse_time_bound(start, TZ)
+    end_ms = klines_coverage.parse_time_bound(end, TZ, end=True)
+    if start_ms is not None and end_ms is not None and start_ms > end_ms:
+        raise ValueError(f"start ({start}) phai truoc end ({end})")
+    ranged = bool(start_ms is not None or end_ms is not None)
+    if ranged:
+        closed = klines_coverage.slice_by_time(closed, start_ms, end_ms)
+        # Nen dang chay nam ngoai khoang thi khong dinh kem
+        if forming is not None:
+            keep = klines_coverage.slice_by_time([forming], start_ms, end_ms)
+            forming = keep[0] if keep else None
 
     n = int(limit) if limit else int(KL["default_limit"])
     n = max(1, min(n, int(KL["max_limit"])))
@@ -1399,7 +1436,7 @@ def get_klines(timeframe: str, symbol: str = "", limit: int = 0,
         rows.append({"time": _bar_time(forming), "is_closed": False,
                      **{k: forming[k] for k in keys}})
 
-    return {
+    out = {
         "symbol": sym,
         "timeframe": tf,
         "count": len(rows),
@@ -1407,6 +1444,141 @@ def get_klines(timeframe: str, symbol: str = "", limit: int = 0,
         "forming_bar_included": attached,
         "note": "Chi nen co is_closed=true moi duoc dung de danh gia VSA.",
         "bars": rows,
+    }
+    if ranged:
+        # Noi ro khoang da loc va con bao nhieu nen bi limit cat bot, de nguoi
+        # goi biet minh dang nhin mot phan hay toan bo khoang.
+        out["range"] = {"start": start or None, "end": end or None,
+                        "bars_in_range": len(closed),
+                        "truncated_by_limit": max(0, len(closed) - n)}
+    return out
+
+
+# TM - #GANN-TW - Gann Time Windows
+@mcp.tool()
+def get_data_coverage(symbol: str = "") -> dict[str, Any]:
+    """Do phu du lieu nen: co tu bao gio den bao gio, thieu cho nao.
+
+    symbol: bo trong = moi cap dang bat.
+    Goi cai nay truoc khi phan tich lich su dai, de biet du lieu co du khong -
+    thay vi keo hang nghin nen ve roi tu doan.
+    """
+    targets = [_resolve_symbol(symbol)] if symbol else _symbols()
+    rows = []
+    for sym in targets:
+        frames = []
+        for tf in KL["timeframes"]:
+            span = _tf_ms(tf)
+            try:
+                bars = _load_bars(sym, tf)
+            except Exception as exc:
+                frames.append({"timeframe": tf, "error": str(exc)})
+                continue
+            info = klines_coverage.coverage(bars, span, _retention_for(tf))
+            frames.append({
+                "timeframe": tf,
+                "count": info["count"],
+                "first_bar": _bar_time({"open_time": info["first_bar_ms"]})
+                if info["first_bar_ms"] else None,
+                "last_bar": _bar_time({"open_time": info["last_bar_ms"]})
+                if info["last_bar_ms"] else None,
+                "expected_count": info["expected_count"],
+                "gap_count": info["gap_count"],
+                "gaps": [
+                    {"from": _bar_time({"open_time": g["from_ms"]}),
+                     "to": _bar_time({"open_time": g["to_ms"]}),
+                     "missing_bars": g["missing_bars"]}
+                    for g in info["gaps"]
+                ],
+                "retention": info["retention"],
+            })
+        rows.append({"symbol": sym, "timeframes": frames})
+    return {"generated_at": _now_iso(), "symbols": rows}
+
+
+# TM - #GANN-TW - Gann Time Windows
+@mcp.tool()
+async def backfill_klines(timeframe: str, symbol: str = "",
+                          max_requests: int = 40) -> dict[str, Any]:
+    """Keo lich su cu ve cho day, lui dan den khi het du lieu tren san.
+
+    BR goi day la "script backfill", nhung VPS khong co shell nen lam thanh tool
+    de goi tu Claude.
+
+    Idempotent: gop theo openTime nen chay lai khong tao nen trung, chi lap cho
+    thieu. Dung lai khi san khong tra them nen cu hon nua, hoac het max_requests.
+
+    CHU Y: khung nao con bi retention cat (xem get_data_coverage) thi backfill
+    xong se bi cat lai o lan fetch sau. Dat retention cho khung do ve null truoc.
+    """
+    sym = _resolve_symbol(symbol)
+    tf = _validate_timeframe(timeframe)
+    span = _tf_ms(tf)
+    if span <= 0:
+        raise ValueError(f"khong biet do dai nen cua khung {tf}")
+
+    retention = _retention_for(tf)
+    path = _kline_path(sym, tf)
+    warnings: list[str] = []
+    if retention:
+        warnings.append(
+            f"khung {tf} dang gioi han {retention} nen - backfill xong se bi cat "
+            f"lai o lan fetch sau. Dat retention['{tf}'] = null trong config truoc.")
+
+    limit = int(FETCH.get("fetch_limit", 500))
+    requests_made = 0
+    added_total = 0
+
+    async with FETCH_LOCK:
+        async with httpx.AsyncClient() as client:
+            for _ in range(max(1, int(max_requests))):
+                existing = _read_json(path, [])
+                if not isinstance(existing, list):
+                    existing = []
+                before = len(existing)
+                oldest = min((int(r[0]) for r in existing
+                              if isinstance(r, (list, tuple)) and r), default=None)
+
+                params = {"symbol": sym, "interval": tf, "limit": limit}
+                if oldest is not None:
+                    # endTime inclusive: lui them mot span de khong xin lai dung
+                    # cay nen cu nhat dang co
+                    params["endTime"] = oldest - 1
+
+                try:
+                    resp = await client.get(_binance_url(), params=params,
+                                            timeout=float(FETCH["request_timeout"]))
+                    resp.raise_for_status()
+                    rows = resp.json()
+                except Exception as exc:
+                    warnings.append(f"dung som: {type(exc).__name__}: {exc}")
+                    break
+                requests_made += 1
+                if not isinstance(rows, list) or not rows:
+                    break        # het lich su
+
+                merged = _merge_bars(existing, rows, retention)
+                _write_json(path, merged)
+                added = len(merged) - before
+                added_total += added
+                if added <= 0:
+                    break        # san khong con nen cu hon -> da cham day
+
+    bars = _load_bars(sym, tf)
+    info = klines_coverage.coverage(bars, span, retention)
+    return {
+        "symbol": sym,
+        "timeframe": tf,
+        "requests_made": requests_made,
+        "bars_added": added_total,
+        "count": info["count"],
+        "first_bar": _bar_time({"open_time": info["first_bar_ms"]})
+        if info["first_bar_ms"] else None,
+        "last_bar": _bar_time({"open_time": info["last_bar_ms"]})
+        if info["last_bar_ms"] else None,
+        "gap_count": info["gap_count"],
+        "retention": retention,
+        "warnings": warnings,
     }
 
 

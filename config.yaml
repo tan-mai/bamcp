@@ -54,6 +54,14 @@ fetcher:
   retry: 3
   run_on_start: true
 
+# TM - #GANN-TW - Gann Time Windows
+# So nen toi da giu theo tung khung. null = khong cat.
+# Khung nao khong khai thi dung klines.max_history nhu truoc.
+# D va W phai la null thi pivot Gann moi co du lich su tu 2019-09.
+retention:
+  "1w": null
+  "1d": null
+
 klines:
   # File kline duoc tu nhan dang: mang Binance tho [[openTime,o,h,l,c,v,closeTime,...]]
   # hoac object [{"openTime":..,"open":..,...}]. Fetcher luon ghi dang mang Binance tho.
