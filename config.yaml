@@ -61,7 +61,12 @@ fetcher:
 # Rieng manual_pivots la du lieu goc do nguoi dung nhap, khong tu sinh lai duoc.
 time_windows:
   enabled: true
-  symbols: ["BTCUSDT", "ETHUSDT"]    # trong = moi cap dang bat
+  # Cap duoc phan tich Gann. Bat/tat TUNG CAP o trang /admin/gann (muc "Cap phan
+  # tich Gann") - co hieu luc ngay, khong can restart. Danh sach o day chi la MAC
+  # DINH cho lan dau, truoc khi bam o nao tren trang do. Cap tat thi tool Gann tu
+  # choi va chi cho bat o dau. Rong = KHONG cap nao (khong phai "moi cap").
+  # Cap phai dang duoc theo doi o trang cai dat chung thi moi co du lieu nen.
+  symbols: ["BTCUSDT", "XAUUSDT"]
   paths:                             # tuong doi so voi data_root
     pivots: "time_windows/pivots/{symbol}.json"
     manual_pivots: "time_windows/manual_pivots.json"
@@ -363,6 +368,11 @@ instructions: |
   - Quota lenh va daily_stop_loss van tinh gop tat ca cac cap.
 
   PIVOT GANN VA OVERBALANCE (khung 1w va 1d):
+  Gann chi chay cho cap nguoi dung DA BAT o trang /admin/gann. Tool Gann bao
+  "Gann dang tat cho X" thi noi nguoi dung bat o trang do - dung tu doan pivot
+  hay cua so cho cap do bang cach khac. XAUUSDT chi co du lieu tu 12/2025: it
+  pivot, nhat la khung 1w - noi ro khi phan tich Gann cho XAU.
+
   get_pivots tra dinh/day DA DUOC XAC NHAN dao chieu - khac swing fractal trong
   get_context: moi pivot co confirmed_at muon hon time, vi do la luc thuc su biet.
   Dung no cho tieu chi swing "co swing high/low ro rang lam moc cho SL va TP":

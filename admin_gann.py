@@ -10,9 +10,9 @@ import html
 import json
 from typing import Any
 
-SECTIONS = ("symbols", "pivots", "projections", "scoring", "backtest", "context")
+# symbols KHONG nam o day: no co o bat/tat rieng (muc "Cap phan tich Gann").
+SECTIONS = ("pivots", "projections", "scoring", "backtest", "context")
 SECTION_HINTS = {
-    "symbols": "Danh sách cặp tính pivot/cửa sổ. Rỗng = mọi cặp đang bật.",
     "pivots": "Đổi khối này thì pivot tự tính lại ở lần gọi kế tiếp (cache theo dấu tay config).",
     "projections": "Danh sách cycle, trọng số, tolerance, bật/tắt từng loại chiếu.",
     "scoring": "Ngưỡng cửa sổ (min_score), gộp cửa sổ, số hit tối đa.",
@@ -100,6 +100,21 @@ PAGE = """<!doctype html>
   <div id="msg"></div>
   __SETUP_BANNER__
   __CFG_WARNING__
+
+  <div class="card">
+    <h2>Cặp phân tích Gann</h2>
+    <p class="hint">Bật cặp nào thì Claude mới phân tích Gann cho cặp đó (pivot, swing state,
+      cửa sổ thời gian, backtest, hai field trong get_context). Tắt thì các tool Gann từ chối
+      và chỉ ra chỗ bật ở đây. Có hiệu lực ngay, không cần restart.
+      Cặp phải đang được theo dõi ở <a href="__ADMIN_PATH__">trang cài đặt chung</a> mới có dữ liệu nến.</p>
+    <div class="scroll"><table>
+      <thead><tr><th>Bật</th><th>Cặp</th><th>Nến 1d</th><th>Nến 1w</th><th></th></tr></thead>
+      <tbody>__TOGGLE_ROWS__</tbody>
+    </table></div>
+    <p class="hint">Khung 1d chỉ có ~500 nến (khoảng 1.4 năm) tới khi tải lịch sử: nhờ Claude gọi
+      <code>backfill_klines(timeframe="1d", symbol="...")</code>. Cặp niêm yết gần đây (vd XAUUSDT từ
+      12/2025) thì đã đủ toàn bộ lịch sử sẵn, không cần.</p>
+  </div>
 
   <div class="card">
     <h2>Pivot theo cặp</h2>
@@ -205,9 +220,11 @@ async function act(payload, doneText, button) {
     const body = await send(payload);
     say((doneText || "Đã lưu") + (body.note ? "\\n" + body.note : ""), true);
     setTimeout(() => location.reload(), 700);
+    return true;
   } catch (e) {
     say(e.message, false);
     if (button) button.disabled = false;
+    return false;
   }
 }
 
@@ -239,6 +256,19 @@ document.addEventListener("click", (e) => {
       x.style.display = x.dataset.symbol === d.symbol ? "" : "none";
     });
   }
+});
+
+document.addEventListener("change", (e) => {
+  const box = e.target.closest("input[data-toggle]");
+  if (!box) return;
+  box.disabled = true;
+  act({action: "symbol_toggle", symbol: box.dataset.toggle, enabled: box.checked},
+      (box.checked ? "Đã bật Gann cho " : "Đã tắt Gann cho ") + box.dataset.toggle, null)
+    .then((saved) => {
+      box.disabled = false;
+      // Luu khong duoc thi tra o ve trang thai cu - khong de trang noi sai
+      if (!saved) box.checked = !box.checked;
+    });
 });
 
 $("mp_add").addEventListener("click", (e) => {
@@ -284,9 +314,39 @@ def _num(value: Any, digits: int = 2) -> str:
     return _e(value)
 
 
+def _toggle_rows(rows: list[dict[str, Any]]) -> str:
+    """Moi cap dang theo doi mot dong: o bat/tat + tinh trang du lieu 1d/1w."""
+    if not rows:
+        return '<tr><td colspan="5" class="small">Chưa theo dõi cặp nào.</td></tr>'
+    out = []
+    for row in rows:
+        sym = _e(row["symbol"])
+        checked = " checked" if row.get("gann") else ""
+        notes = []
+        if not row.get("tracked"):
+            notes.append('<span class="pill err">chưa theo dõi</span> thêm ở trang cài đặt chung')
+        elif not row.get("app_enabled"):
+            notes.append('<span class="pill err">đang tắt ở trang chung</span> không kéo nến mới')
+        if row.get("tracked") and not row.get("bars_1d"):
+            notes.append('<span class="pill">chưa có nến</span> đợi một chu kỳ kéo dữ liệu')
+
+        def bars(tf: str) -> str:
+            count = row.get(f"bars_{tf}") or 0
+            first = row.get(f"first_{tf}")
+            return f"{count:,} từ {_e(first)}" if count else "—"
+
+        out.append(
+            f'<tr><td><input type="checkbox" data-toggle="{sym}"{checked} '
+            f'aria-label="Bật Gann cho {sym}"></td>'
+            f'<td><b>{sym}</b></td><td class="num">{bars("1d")}</td>'
+            f'<td class="num">{bars("1w")}</td>'
+            f'<td class="small">{" · ".join(notes)}</td></tr>')
+    return "".join(out)
+
+
 def _symbol_rows(symbols: list[dict[str, Any]]) -> str:
     if not symbols:
-        return '<tr><td colspan="6" class="small">Không có cặp nào trong time_windows.symbols.</td></tr>'
+        return '<tr><td colspan="6" class="small">Chưa bật Gann cho cặp nào — bật ở mục trên.</td></tr>'
     out = []
     for row in symbols:
         sym = _e(row["symbol"])
@@ -468,6 +528,7 @@ def render(view: dict[str, Any], *, action_path: str, admin_path: str,
         "__SETUP_BANNER__": SETUP_BANNER if setup_required else "",
         "__SETUP_FIELD__": SETUP_FIELD if setup_required else "",
         "__CFG_WARNING__": f'<div class="warn">{_e(warning)}</div>' if warning else "",
+        "__TOGGLE_ROWS__": _toggle_rows(view.get("toggles") or []),
         "__SYMBOL_ROWS__": _symbol_rows(symbols),
         "__SYMBOL_TABS__": _symbol_tabs(symbols),
         "__PIVOT_LISTS__": _pivot_lists(symbols),

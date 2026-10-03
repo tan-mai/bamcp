@@ -7,7 +7,9 @@ import base64
 import contextlib
 import copy
 import csv
+import functools
 import hashlib
+import inspect
 import json
 import os
 import secrets
@@ -24,6 +26,7 @@ import uvicorn
 import yaml
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import JSONResponse
 
@@ -1370,12 +1373,19 @@ GANN_OMIT = GANN_INTERNAL + ("timeframe", "time_ms", "confirmed_at_ms",
 def _gann_cfg() -> dict[str, Any]:
     """Config time_windows dang hieu luc: config.yaml, de tung khoi bang file admin.
 
-    Doc lai khi file doi (theo mtime) - day la cho 9.5 "sua tren admin, lan goi
-    sau phan anh ngay, khong restart". KHONG sua dict tra ve: no la ban dung
-    chung, can sua thi deepcopy.
+    Doc lai khi file doi - day la cho 9.5 "sua tren admin, lan goi sau phan
+    anh ngay, khong restart". KHONG sua dict tra ve: no la ban dung chung, can
+    sua thi deepcopy.
+
+    Khoa cache la (mtime, kich thuoc). Rieng mtime khong du: tren Windows dong
+    ho ghi file nhay theo nhip vai ms, hai lan ghi sat nhau (bam hai o lien
+    tiep) ra CUNG mtime va cache tra ban cu. Vi vay moi lan chinh process nay
+    ghi file deu goi _gann_cfg_invalidate(); khoa (mtime, size) chi con lo cho
+    truong hop sua tay file tren may chu.
     """
     try:
-        mtime = GANN_CONFIG_FILE.stat().st_mtime_ns
+        stat = GANN_CONFIG_FILE.stat()
+        mtime = (stat.st_mtime_ns, stat.st_size)
     except OSError:
         mtime = None
     if _GANN_CFG_CACHE["cfg"] is not None and _GANN_CFG_CACHE["mtime"] == mtime:
@@ -1398,6 +1408,45 @@ def _gann_cfg() -> dict[str, Any]:
     return cfg
 
 
+def _tool_with_reasons(**options: Any):
+    """Nhu @mcp.tool(), nhung loi nghiep vu (ValueError, FileNotFoundError) toi duoc Claude.
+
+    SDK MCP 2.x chi chuyen nguyen van thong diep cua ToolError; moi exception
+    khac bi coi la SAP - Claude chi thay "Error executing tool <ten>", con cau
+    huong dan ("Gann dang tat cho ETHUSDT, bat o /admin/gann") nam lai trong log
+    server. Mat cau do thi Claude chi con doan.
+
+    Tra ve ham GOC (khong boc) de code goi truc tiep van nhu cu; chi ban dang ky
+    voi MCP la ban boc. Loi khac (AssertionError, loi lap trinh) van la sap.
+    """
+    register = mcp.tool(**options)
+
+    def decorator(fn):
+        if inspect.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def wrapped(*args: Any, **kwargs: Any) -> Any:
+                try:
+                    return await fn(*args, **kwargs)
+                except (ValueError, FileNotFoundError) as exc:
+                    raise ToolError(str(exc)) from exc
+        else:
+            @functools.wraps(fn)
+            def wrapped(*args: Any, **kwargs: Any) -> Any:
+                try:
+                    return fn(*args, **kwargs)
+                except (ValueError, FileNotFoundError) as exc:
+                    raise ToolError(str(exc)) from exc
+        register(wrapped)
+        return fn
+
+    return decorator
+
+
+def _gann_cfg_invalidate() -> None:
+    """Goi ngay sau moi lan ghi/xoa file config admin - xem _gann_cfg()."""
+    _GANN_CFG_CACHE.update(mtime=None, cfg=None)
+
+
 def _gann_require() -> None:
     if not GANN_ENABLED:
         raise ValueError(
@@ -1405,13 +1454,50 @@ def _gann_require() -> None:
             "config roi restart.")
 
 
+def _gann_wanted() -> list[str]:
+    """Cap nguoi dung BAT Gann (khoi symbols), dung thu tu, khong trung."""
+    out: list[str] = []
+    for item in _gann_cfg().get("symbols") or []:
+        sym = str(item).strip().upper()
+        if sym and sym not in out:
+            out.append(sym)
+    return out
+
+
 def _gann_symbols() -> list[str]:
-    """Cap duoc tinh pivot: danh sach trong config, giao voi cap dang bat."""
+    """Cap dang phan tich Gann: bat o trang /admin/gann VA dang duoc theo doi.
+
+    Danh sach rong nghia la KHONG cap nao - khong phai "moi cap". Bat/tat la
+    tung o mot tren trang admin; neu rong = tat ca thi bo het dau tick lai
+    thanh bat het.
+    """
     active = _symbols()
-    wanted = [str(s).upper() for s in (_gann_cfg().get("symbols") or [])]
-    if not wanted:
-        return active
-    return [s for s in wanted if s in active]
+    return [s for s in _gann_wanted() if s in active]
+
+
+def _gann_symbol(symbol: str = "") -> str:
+    """Cap cho tool Gann. Cap dang tat thi bao ro bat o dau, khong tu chay.
+
+    Bo trong = cap dau tien dang bat Gann (khong phai cap mac dinh cua ca he
+    thong: cap do co the dang tat Gann).
+    """
+    if not symbol:
+        enabled = _gann_symbols()
+        if not enabled:
+            raise ValueError(
+                f"Chua bat Gann cho cap nao. Bat o trang {ADMIN_GANN_PATH} "
+                "(muc 'Cap phan tich Gann') - co hieu luc ngay, khong can restart.")
+        return enabled[0]
+    sym = _resolve_symbol(symbol)
+    if sym in _gann_symbols():
+        return sym
+    if sym in _gann_wanted():
+        raise ValueError(
+            f"{sym} da bat Gann nhung dang TAT o trang cai dat chung ({ADMIN_PATH}) nen "
+            "khong co du lieu nen moi. Bat cap do o trang cai dat chung truoc.")
+    raise ValueError(
+        f"Gann dang tat cho {sym}. Bat o trang {ADMIN_GANN_PATH} (muc 'Cap phan tich "
+        f"Gann') - co hieu luc ngay, khong can restart. Dang bat: {_gann_symbols() or 'khong cap nao'}.")
 
 
 def _gann_pivot_path(symbol: str) -> Path:
@@ -1842,7 +1928,7 @@ def _orb_on_demand_view() -> list[dict[str, Any]]:
         out.append(item)
     return out
 
-@mcp.tool()
+@_tool_with_reasons()
 def get_klines(timeframe: str, symbol: str = "", limit: int = 0,
                include_forming: bool = False, start: str = "",
                end: str = "") -> dict[str, Any]:
@@ -1904,7 +1990,7 @@ def get_klines(timeframe: str, symbol: str = "", limit: int = 0,
 
 
 # TM - #GANN-TW - Gann Time Windows
-@mcp.tool()
+@_tool_with_reasons()
 def get_data_coverage(symbol: str = "") -> dict[str, Any]:
     """Do phu du lieu nen: co tu bao gio den bao gio, thieu cho nao.
 
@@ -1946,7 +2032,7 @@ def get_data_coverage(symbol: str = "") -> dict[str, Any]:
 
 
 # TM - #GANN-TW - Gann Time Windows
-@mcp.tool()
+@_tool_with_reasons()
 async def backfill_klines(timeframe: str, symbol: str = "",
                           max_requests: int = 40) -> dict[str, Any]:
     """Keo lich su cu ve cho day, lui dan den khi het du lieu tren san.
@@ -3293,7 +3379,7 @@ def get_orb_config() -> dict[str, Any]:
 # -------------------------------------------------------- Gann time windows tools
 
 # TM - #GANN-TW - Gann Time Windows
-@mcp.tool()
+@_tool_with_reasons()
 def get_pivots(symbol: str = "", timeframe: str = "1d", level: str = "",
                since: str = "", limit: int = 30) -> dict[str, Any]:
     """Pivot swing chart Gann - dinh/day da duoc xac nhan dao chieu.
@@ -3308,7 +3394,7 @@ def get_pivots(symbol: str = "", timeframe: str = "1d", level: str = "",
     la gia tri cua no - no la cai ma luc do thuc su da biet.
     """
     _gann_require()
-    sym = _resolve_symbol(symbol)
+    sym = _gann_symbol(symbol)
     pivots, doc = _gann_frame(sym, timeframe)
 
     want = level.strip().lower()
@@ -3335,7 +3421,7 @@ def get_pivots(symbol: str = "", timeframe: str = "1d", level: str = "",
 
 
 # TM - #GANN-TW - Gann Time Windows
-@mcp.tool()
+@_tool_with_reasons()
 def get_swing_state(symbol: str = "", timeframe: str = "1d") -> dict[str, Any]:
     """Xu huong, chan dang chay, va overbalance thoi gian/gia theo Gann.
 
@@ -3347,7 +3433,7 @@ def get_swing_state(symbol: str = "", timeframe: str = "1d") -> dict[str, Any]:
     Doc 'note' truoc, no gom ca ket luan trong mot cau.
     """
     _gann_require()
-    return _gann_swing_state(_resolve_symbol(symbol), timeframe)
+    return _gann_swing_state(_gann_symbol(symbol), timeframe)
 
 
 def _gann_swing_state(sym: str, timeframe: str) -> dict[str, Any]:
@@ -3380,7 +3466,7 @@ def _gann_swing_state(sym: str, timeframe: str) -> dict[str, Any]:
 
 
 # TM - #GANN-TW - Gann Time Windows
-@mcp.tool()
+@_tool_with_reasons()
 def get_time_windows(symbol: str = "", horizon_days: int = 30, min_score: float = 0,
                      as_of: str = "", max_windows: int = 5) -> dict[str, Any]:
     """Cua so thoi gian Gann: nhung ngay ma nhieu phep dem chu ky cung tro vao.
@@ -3400,7 +3486,7 @@ def get_time_windows(symbol: str = "", horizon_days: int = 30, min_score: float 
     cua so nao de de xuat vao lenh.
     """
     _gann_require()
-    return _gann_time_windows(_resolve_symbol(symbol), horizon_days, min_score, as_of,
+    return _gann_time_windows(_gann_symbol(symbol), horizon_days, min_score, as_of,
                               max_windows)
 
 
@@ -3428,7 +3514,7 @@ def _gann_time_windows(sym: str, horizon_days: int = 30, min_score: float = 0,
 
 
 # TM - #GANN-TW - Gann Time Windows
-@mcp.tool()
+@_tool_with_reasons()
 async def backtest_time_windows(symbol: str = "", start: str = "", end: str = "",
                                 lead_days: int = 1, permutations: int = 200,
                                 seed: int = 42, exclude_events: bool = False
@@ -3452,7 +3538,7 @@ async def backtest_time_windows(symbol: str = "", start: str = "", end: str = ""
     KHONG tu ghi vao config.
     """
     _gann_require()
-    sym = _resolve_symbol(symbol)
+    sym = _gann_symbol(symbol)
     lead = int(lead_days)
     if lead < 1:
         raise ValueError("lead_days phai >= 1: diem cua ngay t chi duoc tinh tu du lieu truoc t")
@@ -3508,7 +3594,7 @@ async def backtest_time_windows(symbol: str = "", start: str = "", end: str = ""
 
 
 # TM - #GANN-TW - Gann Time Windows
-@mcp.tool()
+@_tool_with_reasons()
 def recompute_pivots(symbol: str = "") -> dict[str, Any]:
     """Tinh lai pivot tu dau va ghi lai cache.
 
@@ -3516,10 +3602,10 @@ def recompute_pivots(symbol: str = "") -> dict[str, Any]:
     doi config, hay khi doi pivot thu cong. Goi khi vua backfill them lich su cu,
     hoac khi muon chac chan.
 
-    symbol bo trong = moi cap trong time_windows.symbols.
+    symbol bo trong = moi cap dang bat Gann o trang /admin/gann.
     """
     _gann_require()
-    targets = [_resolve_symbol(symbol)] if symbol else _gann_symbols()
+    targets = [_gann_symbol(symbol)] if symbol else _gann_symbols()
     rows = []
     for sym in targets:
         doc = _gann_doc(sym, force=True)
@@ -4091,6 +4177,62 @@ def _gann_validate_section(section: str, value: Any) -> Any:
     return value
 
 
+def _gann_toggle(symbol: str, enabled: Any) -> tuple[int, dict[str, Any]]:
+    """Bat/tat Gann cho mot cap. Ghi khoi symbols cua file config admin.
+
+    Bat thi cap phai dang duoc theo doi (co trong trang cai dat chung) - khong
+    thi khong co nen nao de tinh. Tat thi khong doi gi ca: cap da go khoi he
+    thong ma con nam trong danh sach Gann van phai tat duoc.
+    """
+    sym = symbol.strip().upper()
+    if not sym:
+        return 400, {"error": "thieu symbol"}
+    if not isinstance(enabled, bool):
+        return 400, {"error": "enabled phai la true/false"}
+    known = [r["symbol"] for r in STORE.symbols(DEFAULT_SYMBOL)]
+    if enabled and sym not in known:
+        return 400, {"error": f"{sym} chua duoc theo doi. Them cap o trang cai dat chung "
+                              f"({ADMIN_PATH}) truoc, roi bat Gann."}
+    with _GANN_ADMIN_LOCK:
+        wanted = [s for s in _gann_wanted() if s != sym]
+        if enabled:
+            wanted.append(sym)
+        # Giu thu tu theo trang cai dat chung - cap dau tien la mac dinh cua tool
+        order = {s: i for i, s in enumerate(known)}
+        wanted.sort(key=lambda s: order.get(s, len(order)))
+        override = _read_json(GANN_CONFIG_FILE, {}) if GANN_CONFIG_FILE.exists() else {}
+        if not isinstance(override, dict):
+            override = {}
+        override["symbols"] = wanted
+        _write_json(GANN_CONFIG_FILE, override)
+        _gann_cfg_invalidate()
+    note = (f"Da bat Gann cho {sym}." if enabled else f"Da tat Gann cho {sym}.")
+    return 200, {"ok": True, "symbols": _gann_symbols(), "note": note
+                 + " Co hieu luc ngay, khong can restart."}
+
+
+def _gann_toggle_rows() -> list[dict[str, Any]]:
+    """Moi cap dang theo doi (va cap lo nam trong danh sach Gann) kem tinh trang du lieu."""
+    rows = []
+    known = STORE.symbols(DEFAULT_SYMBOL)
+    wanted = _gann_wanted()
+    names = [r["symbol"] for r in known] + [s for s in wanted
+                                             if s not in {r["symbol"] for r in known}]
+    app_on = {r["symbol"]: r["enabled"] for r in known}
+    for sym in names:
+        row: dict[str, Any] = {"symbol": sym, "gann": sym in wanted,
+                               "tracked": sym in app_on, "app_enabled": app_on.get(sym, False)}
+        for tf in GANN_TIMEFRAMES:
+            try:
+                closed, _ = _split_closed(_load_bars(sym, tf), tf)
+            except Exception:
+                closed = []
+            row[f"bars_{tf}"] = len(closed)
+            row[f"first_{tf}"] = _bar_date(closed[0]) if closed else None
+        rows.append(row)
+    return rows
+
+
 def _gann_admin_view() -> dict[str, Any]:
     """Du lieu cho trang admin Gann. Loi cua tung cap nam trong dong cua cap do."""
     symbols = []
@@ -4141,6 +4283,8 @@ def _gann_admin_view() -> dict[str, Any]:
     events, _ = _gann_events()
     return {
         "symbols": symbols,
+        "toggles": _gann_toggle_rows(),
+        "admin_path": ADMIN_PATH,
         "manual": manual if isinstance(manual, dict) else {},
         "manual_file": str(GANN_MANUAL_FILE),
         "events": events,
@@ -4173,11 +4317,17 @@ def _gann_admin_action(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
                     _write_json(GANN_CONFIG_FILE, override)
                 elif GANN_CONFIG_FILE.exists():
                     GANN_CONFIG_FILE.unlink()
+                _gann_cfg_invalidate()
                 return 200, {"ok": True, "config_version": _gann_config_version(),
                              "note": "Co hieu luc ngay o lan goi tool ke tiep."}
 
             if action in ("pivot_add", "pivot_delete"):
-                sym = _resolve_symbol(str(payload.get("symbol") or ""))
+                raw_symbol = str(payload.get("symbol") or "").strip().upper()
+                # Xoa thi khong doi cap con duoc theo doi: dong pivot cu cua mot
+                # cap da go khoi he thong van phai xoa duoc
+                sym = _resolve_symbol(raw_symbol) if action == "pivot_add" else raw_symbol
+                if not sym:
+                    return 400, {"error": "thieu symbol"}
                 tf = str(payload.get("timeframe") or "").strip().lower()
                 if tf not in GANN_TIMEFRAMES:
                     return 400, {"error": f"khung {tf!r} khong co pivot"}
@@ -4251,8 +4401,11 @@ def _gann_admin_action(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
                 _write_json(GANN_EVENTS_FILE, rows)
                 return 200, {"ok": True}
 
+        if action == "symbol_toggle":
+            return _gann_toggle(str(payload.get("symbol") or ""), payload.get("enabled"))
+
         if action == "recompute":
-            sym = _resolve_symbol(str(payload.get("symbol") or ""))
+            sym = _gann_symbol(str(payload.get("symbol") or ""))
             doc = _gann_doc(sym, force=True)
             counts = {tf: block.get("live", 0)
                       for tf, block in (doc.get("timeframes") or {}).items()}
