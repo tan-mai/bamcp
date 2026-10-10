@@ -11,6 +11,7 @@ import functools
 import hashlib
 import inspect
 import json
+import math
 import os
 import secrets
 import sys
@@ -34,6 +35,7 @@ import admin       # module cuc bo: trang cai dat
 import admin_gann  # TM - #GANN-TW - Gann Time Windows: trang admin Gann
 import exchanges   # module cuc bo: adapter doc tai khoan san
 import gann_backtest  # TM - #GANN-TW - Gann Time Windows: backtest walk-forward
+import gann_levels  # TM - #GANN-PL - Gann Price Levels: Square of 9, quat, cham/phan ung
 import gann_pivots  # TM - #GANN-TW - Gann Time Windows: pivot swing chart & trang thai song
 import gann_windows  # TM - #GANN-TW - Gann Time Windows: chieu thoi gian & cua so
 import klines_coverage  # TM - #GANN-TW - Gann Time Windows: do phu & loc theo thoi gian
@@ -3623,6 +3625,239 @@ def recompute_pivots(symbol: str = "") -> dict[str, Any]:
             "warnings": doc.get("warnings") or [],
         })
     return {"recomputed_at": _now_iso(), "symbols": rows}
+
+
+# --------------------------------------------------------- Gann price levels
+
+# TM - #GANN-PL - Gann Price Levels
+PL_YAML: dict[str, Any] = CFG.get("gann_price_levels") or {}
+
+
+def _pl_cfg() -> dict[str, Any]:
+    """Khoi gann_price_levels dang hieu luc. KHONG sua dict tra ve."""
+    return PL_YAML
+
+
+def _pl_config_version() -> str:
+    """Hash cua RIENG khoi gann_price_levels (R4)."""
+    raw = json.dumps(_pl_cfg(), sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:12]
+
+
+class _PLInputError(ValueError):
+    """Tham so sai: tool tra {"error", "hint"} thay vi nem ra MCP (R6)."""
+
+    def __init__(self, message: str, hint: str = "") -> None:
+        super().__init__(message)
+        self.hint = hint
+
+
+def _pl_error(exc: Exception) -> dict[str, Any]:
+    if isinstance(exc, (ValueError, FileNotFoundError)):
+        hint = getattr(exc, "hint", "") or "kiem tra lai tham so theo mo ta cua tool"
+        return {"error": str(exc), "hint": hint}
+    # Loi lap trinh: van khong nem ra MCP (R6), nhung de lai traceback trong log
+    import traceback
+    traceback.print_exc()
+    return {"error": f"loi noi bo: {type(exc).__name__}: {exc}",
+            "hint": "xem log server (docker compose logs)"}
+
+
+def _pl_tool(**options: Any):
+    """Nhu @mcp.tool(), nhung moi loi thanh JSON {"error", "hint"} - khong nem ra MCP."""
+    register = mcp.tool(**options)
+
+    def decorator(fn):
+        if inspect.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def wrapped(*args: Any, **kwargs: Any) -> Any:
+                try:
+                    return await fn(*args, **kwargs)
+                except Exception as exc:
+                    return _pl_error(exc)
+        else:
+            @functools.wraps(fn)
+            def wrapped(*args: Any, **kwargs: Any) -> Any:
+                try:
+                    return fn(*args, **kwargs)
+                except Exception as exc:
+                    return _pl_error(exc)
+        register(wrapped)
+        return fn
+
+    return decorator
+
+
+def _pl_context(symbol: str, as_of: str) -> dict[str, Any]:
+    """Moi thu cac tool gia Gann can, cat dung tai as_of (R1, R2).
+
+    Nen: chi nen 1d DA DONG truoc cuoi ngay as_of. Pivot: pivot da biet tai as_of
+    tu kho cua get_pivots (known_ms <= as_of, chat hon confirmed_at <= as_of: nen
+    xac nhan chi dong sau mot khung). Swing state: chinh ham cua get_swing_state,
+    tinh tren dung tap nen va pivot do.
+    """
+    _gann_require()
+    try:
+        sym = _gann_symbol(symbol)
+    except ValueError as exc:
+        raise _PLInputError(str(exc), f"bat cap o trang {ADMIN_GANN_PATH}, hoac doi symbol") from exc
+    try:
+        day, as_of_ms = _gann_as_of(as_of)
+    except ValueError as exc:
+        raise _PLInputError(str(exc), "as_of dang 'YYYY-MM-DD'; bo trong = hien tai") from exc
+    cfg = _pl_cfg()
+    warnings: list[str] = []
+    try:
+        raw = _load_bars(sym, "1d")
+    except FileNotFoundError as exc:
+        raw = []
+        warnings.append(str(exc))
+    span = _tf_ms("1d")
+    bars = [b for b in raw if (b.get("close_time") or b["open_time"] + span - 1) <= as_of_ms]
+    dates = [_bar_date(b) for b in bars]
+    period = int(cfg.get("atr_period") or 14)
+    atr, used = gann_levels.atr_value(bars, period)
+    if bars and used < period:
+        warnings.append(f"ATR tinh tren {used} nen, it hon atr_period {period}")
+
+    if str(cfg.get("pivot_timeframe") or "1d") == "1w":
+        weekly, _ = _gann_frame(sym, "1w", as_of_ms)
+        pivots = [{**p, "date": _bar_date({"open_time": p["time_ms"]})} for p in weekly]
+        pivot_warnings: list[str] = []
+    else:
+        pivots, pivot_warnings = _gann_window_pivots(sym, as_of_ms)
+    warnings.extend(pivot_warnings)
+    daily, _ = _gann_frame(sym, "1d", as_of_ms)
+    state = gann_pivots.swing_state(daily, bars, "1d") if bars else None
+    ref = bars[-1] if bars else None
+    decimals = gann_levels.tick_decimals(sym, cfg.get("tick_decimals"),
+                                         float(ref["close"]) if ref else 0.0)
+    return {
+        "symbol": sym, "day": day, "as_of_ms": as_of_ms, "bars": bars, "dates": dates,
+        "atr": atr, "ref_price": float(ref["close"]) if ref else None,
+        "ref_bar_time": _bar_time(ref) if ref else None, "decimals": decimals,
+        "pivots": pivots, "swing": state,
+        "leg": gann_levels.leg_extremes(state, bars, dates),
+        "warnings": warnings,
+    }
+
+
+def _pl_head(ctx: dict[str, Any]) -> dict[str, Any]:
+    """Cac field goc chung cua moi tool (R4), tru note/warnings."""
+    dec = ctx["decimals"]
+    return {
+        "symbol": ctx["symbol"],
+        "as_of": ctx["day"].isoformat(),
+        "ref_price": round(ctx["ref_price"], dec) if ctx["ref_price"] is not None else None,
+        "ref_bar_time": ctx["ref_bar_time"],
+        "atr": round(ctx["atr"], dec) if ctx["atr"] is not None else None,
+    }
+
+
+def _pl_tail(note: str, warnings: list[str]) -> dict[str, Any]:
+    seen: list[str] = []
+    for item in warnings:
+        if item not in seen:
+            seen.append(item)
+    return {"note": note, "warnings": seen, "config_version": _pl_config_version(),
+            "computed_at": _now_iso()}
+
+
+def _pl_source_text(src: dict[str, Any]) -> str:
+    """Mot nguon cua zone thanh mot dong - object 5 truong ton ~170 byte moi nguon
+    khi in JSON, 12 zone x 4 nguon la vuot nguong ~8 KB. Module thuan van tra
+    object day du cho backtest.
+    """
+    text = f"{src['anchor']} {src['deg']:+d} = {src['price']} ({src['score']})"
+    if src.get("harmonic_of"):
+        text += f" dieu hoa voi {src['harmonic_of']}"
+    return text
+
+
+@_pl_tool()
+def get_sq9_levels(symbol: str = "", as_of: str = "", anchors: str = "auto",
+                   step_deg: int = 0, max_rotations: int = 0, range_pct: float = 0,
+                   max_zones: int = 12) -> dict[str, Any]:
+    """Vung gia Square of 9 quanh gia hien tai: da gop, cham diem, kem lich su phan ung.
+
+    Moi anchor A sinh muc L = (sqrt(A) + theta/180)^2, theta buoc step_deg. Muc
+    gan nhau gop thanh zone; diem zone = trong so bac anchor x trong so goc. Moi
+    zone kem so lan gia da cham, da bat lai (reactions), da pha (breaks).
+
+    symbol: bo trong = cap dau tien dang bat Gann.
+    as_of: 'YYYY-MM-DD' = tinh nhu dang dung o cuoi ngay do. Bo trong = hien tai.
+    anchors: "auto" (pivot gan day + dau/dinh chan song dang chay) hoac danh sach
+      gia cach nhau dau phay, vd "87385.1,74909.4".
+    step_deg: 45 | 90 | 180 | 360. 0 = theo config.
+    max_rotations, range_pct: 0 = theo config. max_zones: so zone toi da tra ve.
+
+    Doc 'note' truoc. nearest_above/below = zone gan gia nhat moi phia;
+    strongest_above/below = zone diem cao nhat moi phia; zones = thang gia giam dan.
+    Warning "anchor dieu hoa" nghia la hai anchor sinh cung mot day muc - zone
+    trung nhau do cau truc, KHONG phai hoi tu doc lap.
+
+    CHU Y: day la GIA THUYET ve moc gia, khong noi gia se di huong nao. Chua duoc
+    kiem chung cho toi khi co backtest_price_levels - khong dung mot minh de de
+    xuat vao lenh.
+    """
+    cfg = _pl_cfg()
+    sq = cfg.get("sq9") or {}
+    step = int(step_deg or sq.get("step_deg") or 45)
+    if step not in gann_levels.SQ9_STEPS:
+        raise _PLInputError(f"step_deg khong hop le: {step_deg}",
+                            "chi nhan 45, 90, 180, 360; 0 = theo config")
+    rotations = int(max_rotations or sq.get("max_rotations") or 3)
+    if not 1 <= rotations <= 50:
+        raise _PLInputError(f"max_rotations khong hop le: {max_rotations}", "1..50; 0 = theo config")
+    window = float(range_pct or sq.get("range_pct") or 8)
+    if not 0 < window <= 50:
+        raise _PLInputError(f"range_pct khong hop le: {range_pct}", "(0, 50]; 0 = theo config")
+    cap = int(max_zones or 12)
+    if not 1 <= cap <= 50:
+        raise _PLInputError(f"max_zones khong hop le: {max_zones}", "1..50")
+
+    manual: list[float] = []
+    text = (anchors or "").strip()
+    if text.lower() not in ("", "auto"):
+        try:
+            manual = [float(x) for x in text.split(",") if x.strip()]
+        except ValueError as exc:
+            raise _PLInputError(f"anchors khong hop le: {anchors!r}",
+                                'dung "auto" hoac gia cach nhau dau phay, vd "87385.1,74909.4"') from exc
+        if not manual or any(x <= 0 for x in manual):
+            raise _PLInputError(f"anchors khong hop le: {anchors!r}", "moi gia phai > 0")
+
+    ctx = _pl_context(symbol, as_of)
+    head = _pl_head(ctx)
+    params = {"step_deg": step, "max_rotations": rotations, "range_pct": window}
+    warnings = list(ctx["warnings"])
+    if not ctx["bars"]:
+        warnings.append("khong co nen 1d da dong truoc as_of")
+        return {**head, **params, "anchors_used": [], "zones": [],
+                **_pl_tail("Chua co du lieu nen 1d de tinh Square of 9.", warnings)}
+
+    weights = {str(k): float(v) for k, v in (cfg.get("level_weights") or {}).items()}
+    if manual:
+        chosen = [{"price": p, "type": None, "date": None, "level": "intermediate",
+                   "source": "manual"} for p in manual]
+    else:
+        chosen = gann_levels.select_anchors(ctx["pivots"], ctx["leg"], ctx["day"],
+                                            sq.get("anchors") or {}, weights)
+    if len(chosen) < 2:
+        warnings.append(f"chi co {len(chosen)} anchor - it hon 2, zone khong so sanh duoc")
+
+    dec = ctx["decimals"]
+    result = gann_levels.sq9_analysis(
+        anchors=chosen, bars=ctx["bars"], dates=ctx["dates"], ref_price=ctx["ref_price"],
+        atr=ctx["atr"], cfg=sq, reaction=cfg.get("reaction") or {}, level_weights=weights,
+        step=step, max_rotations=rotations, range_pct=window, max_zones=cap, decimals=dec)
+    warnings.extend(result.pop("warnings"))
+    note = result.pop("note")
+    for zone in result["zones"]:
+        zone["sources"] = [_pl_source_text(src) for src in zone["sources"]]
+    used = [{"price": a["price"], "type": a["type"], "date": a["date"], "level": a["level"],
+             "source": a["source"], "sqrt": round(math.sqrt(a["price"]), 4)} for a in chosen]
+    return {**head, **params, "anchors_used": used, **result, **_pl_tail(note, warnings)}
 
 
 # ---------------------------------------------------------------- admin

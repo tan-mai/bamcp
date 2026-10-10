@@ -134,6 +134,75 @@ time_windows:
     max_windows: 3
     max_hits: 3                      # moi cua so toi da chung nay hit
 
+# TM - #GANN-PL - Gann Price Levels
+# Moc gia Gann (Square of 9, quat, hoi tu). Moi con so la mac dinh, chua kiem
+# chung - backtest_price_levels moi cho biet co gia tri hay khong. Tool chi chay
+# cho cap dang bat Gann o trang /admin/gann, giong time windows.
+gann_price_levels:
+  atr_period: 14
+  pivot_timeframe: "1d"          # khung lay pivot cho anchor; pivot 1w (major) luon duoc cong them
+  level_weights:                 # trong so theo cap pivot anchor
+    major: 1.0
+    intermediate: 0.7
+    minor: 0.4
+  # So le khi lam tron gia. Cap khong co o day thi doan theo do lon cua gia.
+  tick_decimals: {BTCUSDT: 1, ETHUSDT: 1, ADAUSDT: 4}
+
+  sq9:
+    step_deg: 45                 # buoc goc; 45 = co ca 45/90/135/180...
+    max_rotations: 3             # so vong 360 moi phia
+    range_pct: 8                 # chi tra muc trong +/- range_pct quanh ref_price
+    anchors:
+      max_anchors: 6             # toi da so anchor tu chon (chua tinh dau/dinh chan song)
+      lookback_days: 400         # chi lay pivot trong N ngay gan nhat
+      include_leg_extremes: true # luon them day/dinh cua chan song dang chay
+    angle_weights:               # theo |deg| mod 360
+      "0": 1.0                   # tron vong 360
+      "180": 0.8
+      "90": 0.6                  # 90 va 270
+      "45": 0.4                  # 45, 135, 225, 315
+    zone_merge_atr: 0.15         # cac muc cach nhau <= 0.15 ATR thi gop zone
+    harmonic_anchor_tol_atr: 0.15  # 2 anchor lech nhau gan tron so vong -> warning
+    history_days: 120            # dem touches/reactions trong N ngay
+
+  fan:
+    scale_method: "swing"        # swing | atr | fixed
+    atr_multiplier: 0.25         # dung khi scale_method = atr
+    fixed_points_per_bar:        # dung khi scale_method = fixed
+      BTCUSDT: 366
+      ETHUSDT: 15
+      ADAUSDT: 0.006
+    angles: [8, 4, 3, 2, 1, 0.5, 0.3333, 0.25, 0.125]
+    angle_labels: ["8x1", "4x1", "3x1", "2x1", "1x1", "1x2", "1x3", "1x4", "1x8"]
+    project_days: 10
+    min_swing_bars: 3            # nhip hoi ngan hon thi khong dung lam scale
+
+  reaction:                      # dinh nghia cham/phan ung, dung chung live + backtest
+    touch_atr: 0.15              # high/low cach muc <= 0.15 ATR = cham
+    reaction_atr: 1.0            # di nguoc >= 1 ATR...
+    reaction_bars: 3             # ...trong 3 nen sau khi cham = phan ung
+    break_close_atr: 0.25        # dong cua vuot muc >= 0.25 ATR = pha
+
+  confluence:
+    price_tol_atr: 0.3           # cac thanh phan cach nhau <= 0.3 ATR = cung vung gia
+    date_tol_days: 2
+    component_weights:
+      sq9_zone: 1.0
+      fan_line: 0.8
+      time_window: 1.0
+      overbalance: 1.2
+    min_score: 2.0
+    max_points: 5
+
+  backtest:
+    warmup_days: 120
+    permutations: 200
+    seed: 42
+    async_after_seconds: 55
+    # Tuong doi so voi data_root nhu moi duong dan khac (Docker: /data/price_levels/backtests).
+    # Duong dan tuyet doi thi dung nguyen.
+    output_dir: "price_levels/backtests"
+
 # So nen toi da giu theo tung khung. null = khong cat.
 # Khung nao khong khai thi dung klines.max_history nhu truoc.
 # D va W phai la null thi pivot Gann moi co du lich su tu 2019-09.
