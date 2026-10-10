@@ -96,9 +96,15 @@ def leg_extremes(state: dict[str, Any] | None, bars: list[dict[str, Any]],
 
 
 def fmt_price(price: float, decimals: int) -> str:
-    """Gia cho cau note: 81.6k voi gia lon, nguyen so le voi gia nho (ADA)."""
-    if price >= 1000:
+    """Gia cho cau note: 81.6k voi BTC, so nguyen voi ETH, giu so le voi gia nho (ADA).
+
+    "k" mot so le chi du min tu 10k tro len - voi ETH ~2486 thi hai zone cach 25
+    diem deu thanh "2.5k", doc khong phan biet duoc.
+    """
+    if price >= 10000:
         return f"{price / 1000:.1f}k"
+    if price >= 100:
+        return f"{price:.0f}"
     return f"{price:.{decimals}f}"
 
 

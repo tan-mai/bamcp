@@ -148,9 +148,13 @@ gann_price_levels:
   # So le khi lam tron gia. Cap khong co o day thi doan theo do lon cua gia.
   tick_decimals: {BTCUSDT: 1, ETHUSDT: 1, ADAUSDT: 4}
 
+  # Tan chot 2026-10-10 sau khi xem du lieu that. So goc cua requirement (step 45,
+  # max_rotations 3, merge 0.15, harmonic 0.15) cho BTC ra MOT zone rong 13,160 diem:
+  # muc 45 do chi cach nhau ~0.064 ATR nen noi chuoi het, va moi cap anchor deu
+  # thanh "dieu hoa". Ca cap gia nho (ADA ~0.24) van chua co zone - de nguyen.
   sq9:
-    step_deg: 45                 # buoc goc; 45 = co ca 45/90/135/180...
-    max_rotations: 3             # so vong 360 moi phia
+    step_deg: 180                # buoc goc; 180 = chi 180/360. 45/90 qua day voi gia BTC
+    max_rotations: 6             # so vong 360 moi phia; 6 de toi duoc -2160 (6 vong)
     range_pct: 8                 # chi tra muc trong +/- range_pct quanh ref_price
     anchors:
       max_anchors: 6             # toi da so anchor tu chon (chua tinh dau/dinh chan song)
@@ -161,8 +165,8 @@ gann_price_levels:
       "180": 0.8
       "90": 0.6                  # 90 va 270
       "45": 0.4                  # 45, 135, 225, 315
-    zone_merge_atr: 0.15         # cac muc cach nhau <= 0.15 ATR thi gop zone
-    harmonic_anchor_tol_atr: 0.15  # 2 anchor lech nhau gan tron so vong -> warning
+    zone_merge_atr: 0.05         # cac muc cach nhau <= 0.05 ATR thi gop zone
+    harmonic_anchor_tol_atr: 0.02  # 2 anchor lech nhau gan tron so vong -> warning
     history_days: 120            # dem touches/reactions trong N ngay
 
   fan:
