@@ -131,6 +131,9 @@ Rule chia làm hai phạm vi.
 | `min_take_profit_points` | 500 |
 | `swing_min_take_profit_points` | 2000 |
 | `swing_max_stop_points` | 1500 |
+| `min_rr` | 1.5 *(R:R tối thiểu, không đo bằng điểm)* |
+
+**`min_rr`** — R:R = khoảng cách tới TP ÷ khoảng cách tới SL, tính từ giá vào; lệnh đạt khi R:R ≥ `min_rr` của cặp. Áp cho mọi lệnh không phải ORB, cả scalp lẫn swing. R:R thấp hơn thì `check_trade` trả `would_pass: false` kèm vi phạm `R:R 1.25 < min_rr 1.5`, và `log_trade` chạy đúng kiểm tra đó. `get_rules(symbol=...)` trả khối `min_rr` với `value` và `source` — `symbol` nếu cặp đặt riêng, `default` nếu đang kế thừa. Đổi cho một cặp: `update_rules({"min_rr": 2}, reason="...", symbol="ETHUSDT")`; bỏ trống `symbol` là đổi mặc định cho mọi cặp chưa đặt riêng.
 
 Lệnh `strategy="ORB"` **không** chấm bằng các rule trên (trừ `max_margin_per_trade`) và không ăn quota/daily stop chung — ORB có bộ rule riêng, xem [Bộ rule ORB riêng](#bộ-rule-orb-riêng).
 
@@ -148,7 +151,7 @@ Khối `rules:` trong `config.yaml` chỉ là **giá trị khởi tạo**. Lần
 
 `rules.json` từ bản một-phạm-vi vẫn đọc được nguyên vẹn: nó chỉ có khối `values`, và mọi cặp kế thừa đúng những con số đang có — không cần bước chuyển đổi nào.
 
-Server chỉ chặn giá trị làm vỡ logic tính toán — `daily_stop_loss` phải `<= 0`, các rule còn lại phải `>= 0`, tên rule phải có thật (gõ sai tên là báo lỗi chứ không âm thầm tạo rule mới), và cặp phải đang được theo dõi (gõ sai tên cặp thì không tạo ra một bộ rule mồ côi). Ngoài ra nới hay siết bao nhiêu là quyền bạn.
+Server chỉ chặn giá trị làm vỡ logic tính toán — `daily_stop_loss` phải `<= 0`, `min_rr` phải `> 0`, các rule còn lại phải `>= 0`, tên rule phải có thật (gõ sai tên là báo lỗi chứ không âm thầm tạo rule mới), và cặp phải đang được theo dõi (gõ sai tên cặp thì không tạo ra một bộ rule mồ côi). Ngoài ra nới hay siết bao nhiêu là quyền bạn.
 
 **Mọi thay đổi đều để lại dấu.** `rules.json` giữ `history` đầy đủ: đổi gì, từ bao nhiêu sang bao nhiêu, lúc nào, vì sao, và **cho cặp nào** — "siết cả tài khoản" với "siết mỗi ADA" là hai dòng khác nhau trong lịch sử. Và:
 

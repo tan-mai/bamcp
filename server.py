@@ -263,7 +263,16 @@ SYMBOL_RULE_KEYS = (
     "min_take_profit_points",
     "swing_min_take_profit_points",
     "swing_max_stop_points",
+    # TM - #MIN-RR - min_rr theo cap: R:R toi thieu. Khong do bang diem nhung van
+    # theo cap - moi cap mot nhip gia, mot ty le dang de choi rieng.
+    "min_rr",
 )
+
+# TM - #MIN-RR - min_rr theo cap: mac dinh khi cap chua dat rieng. Dat ca trong
+# code phong config.yaml cu (BAMCP_CONFIG tro ra ngoai image) chua co key nay -
+# thieu thi _evaluate_trade khong cham duoc lenh nao.
+DEFAULT_MIN_RR = 1.5
+RULES_SEED.setdefault("min_rr", DEFAULT_MIN_RR)
 
 # Rang buoc ky thuat, KHONG phai rang buoc ky luat. Chung chi chan gia tri lam
 # vo logic tinh toan (vd daily_stop_loss duong -> stop_hit dung ngay tu lenh dau).
@@ -279,6 +288,10 @@ _RULE_BOUNDS: dict[str, tuple[float | None, float | None]] = {
     "swing_max_margin_per_trade": (0, None),
     "swing_max_stop_points": (0, None),
 }
+
+# TM - #MIN-RR - min_rr theo cap: phai > 0, khong chi >= 0 - min_rr = 0 la tat
+# rule ma khong noi ra.
+_RULE_POSITIVE = ("min_rr",)
 
 # TM - #ORB-RULES - ORB Rule Set: rules.json co the bi ghi tu nhieu duong (tool,
 # admin, migrate lan dau) - khoa de khong mat thay doi / khong migrate hai lan.
@@ -387,6 +400,9 @@ def _validate_rule_changes(changes: dict[str, Any], symbol: str = "") -> dict[st
         if isinstance(raw, bool) or not isinstance(raw, (int, float)):
             raise ValueError(f"{key} phai la so, nhan duoc {type(raw).__name__}")
         value = float(raw)
+        # TM - #MIN-RR - min_rr theo cap
+        if key in _RULE_POSITIVE and value <= 0:
+            raise ValueError(f"{key} phai > 0, nhan duoc {value}")
         low, high = _RULE_BOUNDS.get(key, (None, None))
         if low is not None and value < low:
             raise ValueError(f"{key} phai >= {low}, nhan duoc {value}")
@@ -1262,6 +1278,9 @@ def _evaluate_trade(*, symbol: str, side: str, entry: float, stop: float,
     swing de lach - lenh chi duoc huong han muc swing khi TP thuc su dat nguong
     swing_min_take_profit_points cua CHINH CAP DO. Neu khong, no bi ha xuong
     scalp va ghi lai dieu do. Cai nhan la he qua cua con so, khong phai y muon.
+
+    min_rr cua cap ap cho ca scalp lan swing. Lenh ORB khong di qua ham nay -
+    no cham bang orb.min_rr (orb_rules.score).
     """
     side = side.strip().lower()
     if side not in ("long", "short"):
@@ -1272,7 +1291,9 @@ def _evaluate_trade(*, symbol: str, side: str, entry: float, stop: float,
 
     stop_points = round(abs(float(entry) - float(stop)), 2)
     target_points = round(abs(float(target) - float(entry)), 2)
+    rr = round(target_points / stop_points, 2) if stop_points else None
     swing_threshold = float(rules["swing_min_take_profit_points"])
+    min_rr = float(rules["min_rr"])
 
     violations: list[str] = []
     demoted = False
@@ -1305,6 +1326,11 @@ def _evaluate_trade(*, symbol: str, side: str, entry: float, stop: float,
         violations.append(f"SL {stop_points} > {prefix}max_stop_points ({max_stop:g})")
     if target_points < min_tp:
         violations.append(f"TP {target_points} < {prefix}min_take_profit_points ({min_tp:g})")
+    # TM - #MIN-RR - min_rr theo cap: so bang chinh con so 'rr' tra ra (lam tron 2
+    # chu so), de khong bao "R:R 1.5 < min_rr 1.5" vi sai so float (0.3 / 0.2 =
+    # 1.4999...). SL = gia vao thi khong co R:R - bo qua nhu orb_rules.score.
+    if rr is not None and rr < min_rr:
+        violations.append(f"R:R {rr:g} < min_rr {min_rr:g}")
     # max_margin = 0 nghia la khong gioi han (chi dung cho swing)
     if max_margin > 0 and float(margin_usd) > max_margin:
         violations.append(f"margin {margin_usd} > {prefix}max_margin_per_trade ({max_margin:g})")
@@ -1319,16 +1345,19 @@ def _evaluate_trade(*, symbol: str, side: str, entry: float, stop: float,
         "target": float(target),
         "stop_points": stop_points,
         "target_points": target_points,
-        "rr": round(target_points / stop_points, 2) if stop_points else None,
+        "rr": rr,
         "margin_usd": float(margin_usd),
         "limits_applied": {
             "symbol": symbol,
             "max_margin_per_trade": max_margin or "khong gioi han",
             "max_stop_points": max_stop,
             "min_take_profit_points": min_tp,
+            # TM - #MIN-RR - min_rr theo cap
+            "min_rr": min_rr,
             # Nhac lai cai gi tu dau, de doc lai nhat ky cu khong phai doan
             "max_stop_points_scope": f"rieng {symbol}",
             "min_take_profit_points_scope": f"rieng {symbol}",
+            "min_rr_scope": f"rieng {symbol}",
             "max_margin_per_trade_scope": "chung moi cap",
         },
         "rule_violations": violations,
@@ -2295,16 +2324,26 @@ def save_bias(
 def get_rules(symbol: str = "", history_limit: int = 10) -> dict[str, Any]:
     """Doc bo quy dinh dang co hieu luc va lich su thay doi.
 
-    symbol: dien ten cap de xem dung bo rule ap cho cap do (SL/TP/nguong swing
-      cua no). Bo trong = rule chung + gia tri mac dinh cho cap chua dat rieng.
+    symbol: dien ten cap de xem dung bo rule ap cho cap do (SL/TP/nguong swing/
+      min_rr cua no). Bo trong = rule chung + gia tri mac dinh cho cap chua dat rieng.
     history_limit: so lan doi gan nhat can xem, 0 = xem tat ca.
+
+    Khoi 'min_rr' = R:R toi thieu dang ap cho cap, kem nguon: "symbol" (cap dat
+    rieng) hoac "default" (ke thua mac dinh).
     """
     sym = _resolve_symbol(symbol) if symbol else ""
     doc = _rules_doc()
     history = doc["history"]
+    rules = _load_rules(sym)
     return {
         "symbol": sym or None,
-        "rules": _load_rules(sym),
+        "rules": rules,
+        # TM - #MIN-RR - min_rr theo cap: gia tri dang ap + no den tu dau
+        "min_rr": {
+            "value": rules["min_rr"],
+            "source": "symbol" if "min_rr" in doc["symbols"].get(sym, {}) else "default",
+            "applies_to": "moi lenh khong phai ORB (lenh ORB cham bang orb.min_rr)",
+        },
         "scope": {
             "chung_moi_cap": list(GLOBAL_RULE_KEYS),
             "rieng_tung_cap": list(SYMBOL_RULE_KEYS),
@@ -2344,7 +2383,11 @@ def update_rules(changes: dict[str, Any], reason: str,
     symbol: bo trong = doi rule CHUNG (quota lenh/ngay, margin, daily_stop_loss),
       dong thoi la mac dinh cho cap chua dat rieng. Dien ten cap = chi doi rule
       cua rieng cap do, va chi duoc doi max_stop_points, min_take_profit_points,
-      swing_min_take_profit_points, swing_max_stop_points.
+      swing_min_take_profit_points, swing_max_stop_points, min_rr.
+
+    min_rr: R:R toi thieu (TP / SL tinh tu gia vao), so > 0, mac dinh 1.5. Ap cho
+      moi lenh KHONG phai ORB: {"min_rr": 2} + symbol = chi cap do; bo trong
+      symbol = doi mac dinh cho moi cap chua dat rieng. Khac orb.min_rr (orb = true).
 
     Doi rule chung ma van dien symbol thi tool bao loi - khong am tham ghi nham
     pham vi.
@@ -2518,9 +2561,11 @@ def log_trade(
 ) -> dict[str, Any]:
     """Ghi mot lenh vua vao. Tra ve canh bao neu pham rule, nhung van ghi de nhat ky dung thuc te.
 
-    symbol: bo trong = cap mac dinh. Nguong SL toi da, TP toi thieu va nguong
-      swing duoc lay theo DUNG CAP NAY. Quota lenh/ngay, margin va daily_stop_loss
-      thi dung chung cho moi cap.
+    symbol: bo trong = cap mac dinh. Nguong SL toi da, TP toi thieu, nguong
+      swing va min_rr duoc lay theo DUNG CAP NAY. Quota lenh/ngay, margin va
+      daily_stop_loss thi dung chung cho moi cap.
+    R:R (TP / SL tu gia vao) < min_rr cua cap -> them vi pham "R:R <x> < min_rr <y>"
+      (cung kiem tra voi check_trade; lenh ORB dung orb.min_rr).
     trade_type: scalp (mac dinh, han muc chat) hoac swing (han muc rong hon).
       Khai swing ma TP khong dat nguong swing_min_take_profit_points CUA CAP DO
       thi lenh tu dong bi ha xuong han muc scalp - dan nhan khong lach duoc.
@@ -2676,8 +2721,10 @@ def check_trade(side: str, entry: float, stop: float, target: float,
     dung, co pham rule gi khong. Muon ghi that thi goi log_trade voi cung tham so.
 
     symbol: bo trong = cap mac dinh. Nguong diem (SL toi da, TP toi thieu,
-      nguong swing) lay theo dung cap nay, nen cham cung mot bo so tren hai cap
-      khac nhau co the ra hai ket qua khac nhau - do la co y.
+      nguong swing) va min_rr lay theo dung cap nay, nen cham cung mot bo so tren
+      hai cap khac nhau co the ra hai ket qua khac nhau - do la co y.
+    R:R = TP / SL tinh tu gia vao (truong 'rr'). R:R < min_rr cua cap ->
+      would_pass = false, vi pham "R:R <x> < min_rr <y>" (ap ca scalp lan swing).
     strategy = ORB (can session_id): cham bang bo rule ORB rieng (rules.orb):
       limits_applied lay tu rule ORB, rule_set = "orb", kiem them min_rr,
       orb.daily_stop_loss, orb.max_trades_per_day (dem theo or_date) va SL trong

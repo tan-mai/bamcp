@@ -435,5 +435,122 @@ class OrbRuleSetServerTest(unittest.TestCase):
                                     rules_override={"khong_co": 1}))
 
 
+# TM - #MIN-RR - min_rr theo cap
+
+class MinRrTest(unittest.TestCase):
+    """BR "min_rr theo cap giao dich": mac dinh 1.5, dat rieng theo cap, ap cho
+    moi lenh khong phai ORB qua check_trade / log_trade; lenh ORB giu orb.min_rr."""
+
+    @classmethod
+    def setUpClass(cls):
+        server.STORE.symbols(server.DEFAULT_SYMBOL)
+        cls.added = [s for s in ("ETHUSDT",) if not server.STORE.has_symbol(s)]
+        for sym in cls.added:
+            server.STORE.add_symbol(sym)
+
+    @classmethod
+    def tearDownClass(cls):
+        for sym in cls.added:
+            server.STORE.remove_symbol(sym)
+        OrbRuleSetServerTest.reset()
+
+    def setUp(self):
+        OrbRuleSetServerTest.reset()
+        svc = server.ORB_SVC
+        svc.market_snapshot = lambda at=None: dict(MARKET)
+        self.addCleanup(vars(svc).pop, "market_snapshot", None)
+        # Ha TP toi thieu de chi con R:R quyet dinh lenh dat hay khong
+        server.update_rules({"min_take_profit_points": 100}, "min_rr test", symbol="BTCUSDT")
+        server.update_rules({"min_take_profit_points": 10}, "min_rr test", symbol="ETHUSDT")
+
+    @staticmethod
+    def btc(target: float, stop: float = 99800, **kw) -> dict:
+        return server.check_trade(side="long", entry=100000, stop=stop, target=target,
+                                  margin_usd=10, symbol="BTCUSDT", **kw)
+
+    @staticmethod
+    def eth(target: float, **kw) -> dict:
+        return server.check_trade(side="long", entry=2500, stop=2480, target=target,
+                                  margin_usd=10, symbol="ETHUSDT", **kw)
+
+    def test_default_applies_to_symbol_without_override(self):
+        rules = server.get_rules(symbol="BTCUSDT")
+        self.assertEqual((rules["min_rr"]["value"], rules["min_rr"]["source"]), (1.5, "default"))
+        self.assertEqual(rules["rules"]["min_rr"], 1.5)
+        self.assertEqual(rules["defaults_for_symbols"]["min_rr"], 1.5)
+        self.assertEqual(server.get_rules()["min_rr"]["source"], "default")
+
+        low = self.btc(target=100250)                   # SL 200 / TP 250 -> R:R 1.25
+        self.assertFalse(low["would_pass"])
+        self.assertEqual(low["rule_violations"], ["R:R 1.25 < min_rr 1.5"])
+        self.assertEqual(low["limits_applied"]["min_rr"], 1.5)
+        # R:R dung bang min_rr la dat (R:R >= min_rr)
+        edge = self.btc(target=100300)
+        self.assertEqual((edge["rr"], edge["would_pass"]), (1.5, True))
+
+    def test_swing_is_checked_too(self):
+        out = self.btc(stop=98500, target=102000, trade_type="swing")   # SL 1500 / TP 2000
+        self.assertEqual((out["trade_type"], out["demoted_to_scalp"]), ("swing", False))
+        self.assertEqual(out["rule_violations"], ["R:R 1.33 < min_rr 1.5"])
+
+    def test_symbol_override_and_default_change(self):
+        since = len(server._rules_doc()["history"])
+        out = server.update_rules({"min_rr": 2.0}, "ETH chop, doi R:R cao hon", symbol="ETHUSDT")
+        self.assertEqual(out["changes"], {"min_rr": {"from": 1.5, "to": 2}})
+        row = server._rules_doc()["history"][since]
+        self.assertEqual((row["symbol"], row["changes"], row["source"]),
+                         ("ETHUSDT", {"min_rr": {"from": 1.5, "to": 2}}, "mcp"))
+        eth = server.get_rules(symbol="ETHUSDT")
+        self.assertEqual((eth["min_rr"]["value"], eth["min_rr"]["source"]), (2, "symbol"))
+        self.assertEqual(eth["symbol_overrides"]["ETHUSDT"]["min_rr"], 2)
+        self.assertEqual(server.get_rules(symbol="BTCUSDT")["min_rr"]["value"], 1.5)
+
+        # Cung R:R 1.8: ETH (min_rr 2) truot, BTC (mac dinh 1.5) dat
+        self.assertEqual(self.eth(target=2536)["rule_violations"], ["R:R 1.8 < min_rr 2"])
+        self.assertTrue(self.btc(target=100360)["would_pass"])
+
+        # Bo trong symbol = doi mac dinh: BTC keo theo, ETH giu phan dat rieng
+        server.update_rules({"min_rr": 2.5}, "siet mac dinh")
+        btc = server.get_rules(symbol="BTCUSDT")["min_rr"]
+        self.assertEqual((btc["value"], btc["source"]), (2.5, "default"))
+        self.assertEqual(server.get_rules(symbol="ETHUSDT")["min_rr"]["value"], 2)
+        self.assertEqual(self.btc(target=100360)["rule_violations"], ["R:R 1.8 < min_rr 2.5"])
+
+    def test_invalid_values_rejected(self):
+        for bad in (0, -1, "2", True):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                server.update_rules({"min_rr": bad}, "gia tri sai", symbol="BTCUSDT")
+        with self.assertRaises(ValueError):
+            server.update_rules({"min_rr": 0}, "gia tri sai")
+        self.assertEqual(server.get_rules(symbol="BTCUSDT")["min_rr"]["value"], 1.5)
+
+    def test_log_trade_runs_same_check(self):
+        out = server.log_trade(side="long", entry=100000, stop=99800, target=100250,
+                               margin_usd=10, symbol="BTCUSDT")
+        self.assertTrue(out["logged"])
+        self.assertEqual(out["rule_violations"], ["R:R 1.25 < min_rr 1.5"])
+        trade = out["trade"]
+        self.assertEqual(trade["rule_violations"], ["R:R 1.25 < min_rr 1.5"])
+        self.assertEqual((trade["rules_at_entry"]["min_rr"], trade["limits_applied"]["min_rr"]),
+                         (1.5, 1.5))
+
+    def test_orb_keeps_orb_min_rr(self):
+        server.update_rules({"min_rr": 5}, "chi scalp/swing", symbol="BTCUSDT")
+        out = server.check_trade(side="long", entry=83800, stop=83500, target=84250,
+                                 margin_usd=20, strategy="ORB", session_id="ny")
+        self.assertEqual(out["orb_rule_violations"], [])        # R:R 1.5 >= orb.min_rr 1.5
+        self.assertNotIn("min_rr 5", " ".join(out["rule_violations"]))
+        low = server.check_trade(side="long", entry=83800, stop=83500, target=84200,
+                                 margin_usd=20, strategy="ORB", session_id="ny")
+        self.assertEqual(low["orb_rule_violations"], ["R:R 1.33 < orb.min_rr (1.5)"])
+
+    def test_admin_page_has_min_rr_input(self):
+        server.update_rules({"min_rr": 2}, "admin test", symbol="ETHUSDT")
+        page = run(server.http_admin(None)).body.decode()
+        self.assertIn('id="sr_min_rr"', page)
+        self.assertIn('"ETHUSDT": {', page)
+        self.assertIn('"min_rr": "2"', page)
+
+
 if __name__ == "__main__":
     unittest.main()

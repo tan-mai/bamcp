@@ -186,7 +186,7 @@ __SETUP_BANNER__
 
   <div class="card">
     <h2>Quy định theo từng cặp</h2>
-    <div class="hint" style="margin-bottom:14px">Mấy rule này đo bằng <strong>điểm giá</strong>, mà điểm của mỗi cặp là một thứ khác nhau — 300 điểm trên BTC với 300 điểm trên ADA không nói lên cùng một điều. Vì vậy mỗi cặp giữ ngưỡng riêng.</div>
+    <div class="hint" style="margin-bottom:14px">Ngưỡng SL/TP đo bằng <strong>điểm giá</strong>, mà điểm của mỗi cặp là một thứ khác nhau — 300 điểm trên BTC với 300 điểm trên ADA không nói lên cùng một điều. Vì vậy mỗi cặp giữ ngưỡng riêng.</div>
 
     <label for="rule_symbol">Đang sửa cặp</label>
     <select id="rule_symbol">__RULE_SYMBOL_OPTIONS__</select>
@@ -212,6 +212,14 @@ __SETUP_BANNER__
         <label for="sr_swing_max_stop_points">SL tối đa swing (điểm)</label>
         <input type="text" inputmode="decimal" id="sr_swing_max_stop_points">
       </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="sr_min_rr">R:R tối thiểu</label>
+        <input type="text" inputmode="decimal" id="sr_min_rr">
+        <div class="hint">TP ÷ SL tính từ giá vào, phải &gt; 0. Áp cho mọi lệnh không phải ORB — lệnh ORB dùng <code>orb.min_rr</code> ở trang ORB.</div>
+      </div>
+      <div></div>
     </div>
     <div class="hint">Dán nhãn "swing" không lách được hạn mức: lệnh chỉ được hưởng bộ hạn mức swing khi TP thực sự đạt ngưỡng của <em>chính cặp đó</em>, nếu không nó tự động bị hạ về scalp và việc đó được ghi lại.</div>
     <div class="hint">Đổi được nhiều cặp trong một lần — chuyển cặp ở ô trên, sửa tiếp, rồi bấm Lưu một lần.</div>

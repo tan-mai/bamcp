@@ -286,6 +286,10 @@ rules:
   swing_min_take_profit_points: 2000
   swing_max_stop_points: 1500
 
+  # TM - #MIN-RR - min_rr theo cap: R:R toi thieu (TP / SL tinh tu gia vao), > 0.
+  # Ap cho moi lenh KHONG phai ORB (scalp lan swing); lenh ORB dung orb.min_rr.
+  min_rr: 1.5
+
 # ORB - Opening Range Breakout. OR = nen M15 DAU TIEN cua moi phien.
 # Tham so CHUNG o day (sua xong thi restart). Danh sach PHIEN (gio mo, timezone,
 # ngay giao dich, override rieng) quan ly o trang <admin_path>/orb, luu o
@@ -418,9 +422,15 @@ instructions: |
   Doi may rule nay thi goi update_rules KHONG kem symbol.
 
   RIENG tung cap: max_stop_points, min_take_profit_points,
-  swing_min_take_profit_points, swing_max_stop_points. May cai nay do bang diem
-  gia, ma 300 diem tren BTC voi 300 diem tren ADA khong noi len cung mot dieu.
-  Doi may rule nay thi BAT BUOC kem symbol; goi khong kem symbol se bi tu choi.
+  swing_min_take_profit_points, swing_max_stop_points, min_rr. Bon cai dau do
+  bang diem gia, ma 300 diem tren BTC voi 300 diem tren ADA khong noi len cung
+  mot dieu. Doi cho mot cap thi kem symbol; bo trong symbol la doi gia tri MAC
+  DINH cho moi cap chua dat rieng.
+
+  min_rr = R:R toi thieu (TP / SL tinh tu gia vao, mac dinh 1.5). Lenh KHONG
+  phai ORB (scalp lan swing) co R:R < min_rr cua cap thi check_trade tra
+  would_pass = false voi vi pham "R:R <x> < min_rr <y>"; log_trade kiem y het.
+  get_rules(symbol=...) tra khoi 'min_rr' kem nguon (symbol / default).
 
   Vi vay luon truyen symbol cho get_rules, check_trade, log_trade va
   get_today_status. Bo trong la lay cap mac dinh - va ban se cham lenh cua cap
@@ -471,7 +481,7 @@ instructions: |
 
   ORB - OPENING RANGE BREAKOUT (chi tren cap orb.symbol, mac dinh BTCUSDT):
   Lenh ORB co BO RULE RIENG (khoi 'orb' cua get_rules), khong dung max_stop_points /
-  min_take_profit_points / max_trades_per_day / daily_stop_loss cua scalp-swing.
+  min_take_profit_points / min_rr / max_trades_per_day / daily_stop_loss cua scalp-swing.
   - Cham lenh ORB: SL <= orb.max_stop_points, TP >= orb.min_take_profit_points,
     R:R >= orb.min_rr, va SL phai nam trong vung an toan thanh ly.
   - Quota va daily stop cua ORB tinh RIENG (orb.max_trades_per_day,
