@@ -40,6 +40,48 @@ CREATE TABLE IF NOT EXISTS fetch_schedules (
   updated_at       INTEGER NOT NULL
 );
 """,
+    # TM - #ENTRY-ALERT - Entry setups & alerts
+    """
+CREATE TABLE IF NOT EXISTS setups (
+  id               TEXT NOT NULL PRIMARY KEY,
+  code             TEXT NOT NULL UNIQUE,
+  symbol           TEXT NOT NULL,
+  bias_date        TEXT NOT NULL,
+  direction        TEXT NOT NULL,
+  status           TEXT NOT NULL,
+  zone_low         REAL NOT NULL,
+  zone_high        REAL NOT NULL,
+  trigger_type     TEXT NOT NULL,
+  trigger_params   TEXT,
+  confirm_type     TEXT,
+  confirm_level    REAL,
+  entry            REAL NOT NULL,
+  stop             REAL NOT NULL,
+  target           REAL NOT NULL,
+  max_chase        REAL,
+  invalidate_level REAL NOT NULL,
+  m15_filter       INTEGER NOT NULL DEFAULT 1,
+  expires_at       INTEGER NOT NULL,
+  tr_high REAL, tr_low REAL, tr_since INTEGER,
+  state_data       TEXT,
+  note             TEXT,
+  created_by       TEXT,
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS setup_events (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  setup_id     TEXT,
+  at           INTEGER NOT NULL,
+  event        TEXT NOT NULL,
+  from_status  TEXT, to_status TEXT,
+  tf TEXT, candle_open_time INTEGER, price REAL,
+  details      TEXT,
+  notified     INTEGER NOT NULL DEFAULT 0,
+  notify_error TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_setups_active ON setups(symbol, status);
+CREATE INDEX IF NOT EXISTS ix_events_setup ON setup_events(setup_id, at);
+""",
 ]
 
 _MIGRATED: set[str] = set()

@@ -37,6 +37,10 @@ Tuỳ chọn đọc tài khoản thật từ Binance, Bybit hoặc OKX bằng AP
 | `backtest_orb` | Backtest ORB trên M5 lịch sử, tách in-sample/out-of-sample |
 | `get_backtest_result` | Lấy kết quả backtest chạy lâu theo `run_id` |
 | `get_orb_config` | Tham số + rule ORB đang áp dụng (kèm nguồn từng lớp), cảnh báo `rule_infeasible` |
+| `save_setups` | Lưu kế hoạch vào lệnh thành setup có cấu trúc; watcher canh trên nến M5 đã đóng |
+| `get_setups` | Setup kèm trạng thái hiện tại và event gần nhất |
+| `cancel_setup` | Huỷ đúng một setup (bắt buộc lý do) |
+| `get_setup_events` | Lịch sử chuyển trạng thái và tin đã gửi |
 | `migrate_klines` | `import` nến JSON sang SQLite / `verify` đối chiếu hai bên (xem [Lưu nến trong SQLite](#lưu-nến-trong-sqlite)) |
 
 Không có tool đặt lệnh. Cố ý. Plan của ORB chỉ là con số đề xuất — người dùng tự đặt lệnh trên sàn.
@@ -482,6 +486,8 @@ Các đường chính:
 | `POST /admin/orb/sessions` | có* | xem trước / lưu / bật / tắt / xoá phiên — trang trên gọi |
 | `POST /admin/orb/rules` | có* | xem trước / lưu rule ORB, thêm / xoá news day — trang trên gọi |
 | `GET /admin/schedules` | có* | lịch kéo nến theo từng khung |
+| `GET /admin/alerts` | có* | thông báo Discord/Telegram, watcher, setups |
+| `POST /admin/alerts/action` | có* | lưu thông báo / gửi thử / lưu watcher / huỷ, tạo setup, timeline — trang trên gọi |
 | `POST /admin/schedules/action` | có* | thêm / sửa / bật tắt / xoá / chạy ngay / xem trước cron — trang trên gọi |
 
 `*` `/admin` mở công khai khi **chưa** đặt mật khẩu lần nào, nhưng lúc đó phải có setup token mới ghi được. Xem mục [Trang admin](#trang-admin).
@@ -493,7 +499,8 @@ Không có REST API nào khác. Muốn pull dữ liệu ngay thì bảo Claude g
 ```
 <data_root>/          # Docker: /data, mount ra ./data trên host
 ├── klines/    1w.json  1d.json  4h.json  1h.json  15m.json   # storage.kline_store = json
-├── bamcp.db              # SQLite: bảng klines (storage.kline_store = sqlite), fetch_schedules
+├── bamcp.db              # SQLite: bảng klines (storage.kline_store = sqlite), fetch_schedules, setups, setup_events
+├── alerts/config.json    # khối notify + watcher do /admin/alerts ghi (webhook, bot token)
 ├── bias/      2026-09-12.json
 ├── rules.json            # rule chung + phần đặt riêng từng cặp + khối orb (rule ORB) + lịch sử đổi
 ├── settings.json         # username/password (hash) + credential sàn — chmod 600
@@ -538,6 +545,39 @@ Khởi động lại (`run_on_start: true`): schedule nào đã lỡ lịch tron
 Rollback: `fetcher.mode: interval` chạy lại vòng lặp `interval_seconds` cũ; bảng `fetch_schedules` giữ nguyên để bật lại sau.
 
 Task phân tích bias lúc 7h VN nên đặt 00:05 UTC, sau khi đã có nến 4h và 1d.
+
+## Setup vào lệnh và cảnh báo
+
+AI chỉ lập kế hoạch: cuối buổi phân tích bias, Claude gọi `save_setups(symbol, setups, replace=true)` cho từng cặp. Việc canh giá chạy hoàn toàn trên server: watcher chạy ở giây thứ 20 sau mỗi mốc 5 phút, đọc nến 5m mới nhất trong DB (chưa có thì thử lại sau 10 giây, tối đa 3 lần), xét từng setup trên nến **đã đóng** và gửi một tin mỗi lần setup đổi trạng thái.
+
+Mã setup: `<base>-<yyyyMMdd>-<chữ cái>`, vd `BTC-20261101-A`. Tool nhận id hoặc code.
+
+| Trạng thái | Sang | Khi | Tin |
+|---|---|---|---|
+| WAITING | IN_ZONE | high/low của nến giao với vùng | có |
+| IN_ZONE | WAITING | đóng ra ngoài vùng về phía cũ, chưa trigger | không |
+| IN_ZONE | TRIGGERED | trigger đạt | có nếu có bước confirm |
+| TRIGGERED | CONFIRMED | đóng vượt `confirm_level` trong `confirm_within` nến; không có confirm thì sang ngay | — |
+| TRIGGERED | WAITING | quá `confirm_within` nến chưa confirm | "trigger hỏng" |
+| CONFIRMED | ENTRY_VALID | \|close − entry\| ≤ max_chase và check_trade pass | **tín hiệu vào lệnh** |
+| CONFIRMED | MISSED | giá đã vượt entry hơn max_chase | "không đuổi" |
+| CONFIRMED | BLOCKED | check_trade fail | kèm lý do (không gửi lại cùng lý do trong ngày) |
+| MISSED | ENTRY_VALID | giá quay lại trong max_chase và check_trade pass | có |
+| ENTRY_VALID | WAITING | hết `entry_valid_candles` nến chưa khớp | "hết cửa sổ entry" |
+| TRIGGERED…MISSED | FILLED | vị thế OKX mới cùng hướng, hoặc `log_trade(setup_id=...)` | có |
+| chưa kết thúc | INVALIDATED / EXPIRED / CANCELLED | đóng quá `invalidate_level` (kèm M15 nếu `m15_filter`) / quá `expires_at` / `cancel_setup` hoặc `replace=true` | có |
+
+Trigger (xét khi IN_ZONE; `vol_ok` = volume ≥ `vol_mult` × SMA(`sma_period`) volume M5): `spring`, `utad`, `sos`, `sow`, `rejection`, `retest`, `close_above`, `close_below`. Thiếu `sma_period` nến lịch sử thì không xét, ghi event `INSUFFICIENT_DATA`. Khởi động lại thì xét bù tối đa 12 nến, chỉ gửi tin cho trạng thái cuối.
+
+`max_chase` hiệu lực = min(khai báo, x_max), với x_max giữ R:R tại giá vào thực tế ≥ `min_rr` của cặp — long: `((T−E) − m(E−S)) / (1+m)`. x_max ≤ 0 thì `save_setups` từ chối setup đó. Ví dụ E 67500, S 67050, T 68400, m 1.5 → 90.
+
+Thông báo: `notify.channel` = `discord` (webhook) / `telegram` (bot, `parse_mode=HTML`) / `both`. Gửi lỗi thì thử lại sau 2s, 10s, 30s; Discord 429 thì chờ đúng `retry_after`. Vẫn lỗi thì ghi `notify_error`, không chặn watcher. Cảnh báo hệ thống, mỗi loại tối đa 1 lần/giờ: `PLAN_MISSING` (tới `plan_deadline_utc` mà cặp trong `watch_symbols` chưa có setup hôm nay), `FETCHER_STALE` (quá 15 phút không có nến 5m mới).
+
+Khớp lệnh OKX: mỗi lượt quét, cặp có setup từ TRIGGERED trở đi thì đọc vị thế; vị thế mới mở sau lúc trigger, cùng hướng → FILLED cho setup có entry gần giá mở nhất, không setup nào khớp → tin "lệnh mở ngoài kế hoạch". Mã OKX theo `watcher.okx_symbol_map`.
+
+Trang `/admin/alerts`: kênh + webhook / bot token / chat id (che, chỉ ghi đè khi nhập mới), nút Gửi tin thử; watcher bật/tắt, `watch_symbols`, `plan_deadline_utc`, bảng tham số mặc định + override theo cặp; danh sách setup theo ngày/trạng thái, timeline event, huỷ, form tạo setup tay. Lưu vào `alerts/config.json`, có hiệu lực ngay.
+
+Sau deploy, phía Claude: dời task phân tích bias sang 00:05 UTC và kết thúc bằng `save_setups(..., replace=true)` cho từng cặp; khi hỏi "vào được chưa" thì đọc `get_setups` + `get_setup_events` trước, rồi mới đọc nến M5/M15 đã đóng.
 
 ## Lưu nến trong SQLite
 

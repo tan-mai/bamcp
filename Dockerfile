@@ -42,6 +42,8 @@ COPY gann_levels.py ./
 COPY sqlite_db.py kline_store.py kline_migrate.py ./
 # TM - #M5-FETCH - Per-timeframe schedules + M5
 COPY cron_utc.py fetch_schedules.py admin_schedules.py ./
+# TM - #ENTRY-ALERT - Entry setups & alerts
+COPY entry_logic.py entry_store.py entry_watcher.py notifier.py admin_entry.py ./
 
 RUN mkdir -p /data/klines /data/bias /data/journal /data/journal/orb_skips \
              /data/orb/state /data/orb/logs /data/orb/history /data/orb/backtests \

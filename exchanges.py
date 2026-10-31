@@ -331,6 +331,10 @@ class OkxV5(BaseExchange):
         text = (symbol or self.symbol).strip().upper()
         if "-" in text:
             return text
+        # TM - #ENTRY-ALERT - Entry setups & alerts
+        mapped = (self.options.get("symbol_map") or {}).get(text)
+        if mapped:
+            return str(mapped).strip().upper()
         base, quote = split_pair(text)
         if not quote:
             return text
@@ -358,6 +362,8 @@ class OkxV5(BaseExchange):
                 "mark_price": _f(row.get("markPx")),
                 "unrealized_pnl": _f(row.get("upl")),
                 "leverage": _f(row.get("lever")) or None,
+                # TM - #ENTRY-ALERT - Entry setups & alerts
+                "opened_ms": int(_f(row.get("cTime"))) or None,
             })
         return out
 

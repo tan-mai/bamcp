@@ -33,8 +33,12 @@ from starlette.responses import JSONResponse
 
 import admin       # module cuc bo: trang cai dat
 import admin_gann  # TM - #GANN-TW - Gann Time Windows: trang admin Gann
+import admin_entry  # TM - #ENTRY-ALERT - Entry setups & alerts
 import admin_schedules  # TM - #M5-FETCH - Per-timeframe schedules + M5
 import cron_utc  # TM - #M5-FETCH - Per-timeframe schedules + M5
+import entry_logic  # TM - #ENTRY-ALERT - Entry setups & alerts
+import entry_store  # TM - #ENTRY-ALERT - Entry setups & alerts
+import entry_watcher  # TM - #ENTRY-ALERT - Entry setups & alerts
 import exchanges   # module cuc bo: adapter doc tai khoan san
 import fetch_schedules  # TM - #M5-FETCH - Per-timeframe schedules + M5
 import gann_backtest  # TM - #GANN-TW - Gann Time Windows: backtest walk-forward
@@ -43,6 +47,7 @@ import gann_pivots  # TM - #GANN-TW - Gann Time Windows: pivot swing chart & tra
 import gann_windows  # TM - #GANN-TW - Gann Time Windows: chieu thoi gian & cua so
 import klines_coverage  # TM - #GANN-TW - Gann Time Windows: do phu & loc theo thoi gian
 import kline_store  # TM - #KL-SQL - Kline storage SQLite
+import notifier  # TM - #ENTRY-ALERT - Entry setups & alerts
 import settings    # module cuc bo: luu credential xuong volume
 # TM - #ORB - ORB Enhancement
 import admin_orb     # module cuc bo: trang quan ly phien ORB
@@ -2783,8 +2788,12 @@ def log_trade(
     or_date: str = "",
     or_high: float = 0.0,
     or_low: float = 0.0,
+    setup_id: str = "",
 ) -> dict[str, Any]:
     """Ghi mot lenh vua vao. Tra ve canh bao neu pham rule, nhung van ghi de nhat ky dung thuc te.
+
+    setup_id: TM - #ENTRY-ALERT. id hoac code cua setup (save_setups) ma lenh nay vao
+      theo - setup chuyen sang FILLED va gui tin. Setup phai cung cap.
 
     symbol: bo trong = cap mac dinh. Nguong SL toi da, TP toi thieu, nguong
       swing va min_rr duoc lay theo DUNG CAP NAY. Quota lenh/ngay, margin va
@@ -2807,6 +2816,12 @@ def log_trade(
     sym = _resolve_symbol(symbol)
     # TM - #ORB - ORB Enhancement: kiem tra truoc khi ghi de input sai khong de lai dong rac
     tag = _strategy_fields(strategy, variant, session_id, or_date, or_high, or_low)
+    # TM - #ENTRY-ALERT - Entry setups & alerts
+    linked = SETUPS.get(setup_id.strip()) if (setup_id or "").strip() else None
+    if linked and linked["symbol"] != sym:
+        raise ValueError(f"setup {linked['code']} la cua {linked['symbol']}, khong phai {sym}")
+    if linked and linked["status"] in entry_logic.TERMINAL:
+        raise ValueError(f"setup {linked['code']} da ket thuc ({linked['status']})")
     path = JOURNAL_DIR / f"{day}.json"
     trades = _read_json(path, [])
     # TM - #ORB-RULES - ORB Rule Set: cung mot ham cham voi check_trade (BR-ORB-10)
@@ -2846,6 +2861,8 @@ def log_trade(
         **tag,
         # TM - #ORB-RULES - ORB Rule Set
         **({"rule_set": "orb"} if orb_checks else {}),
+        # TM - #ENTRY-ALERT - Entry setups & alerts
+        **({"setup_id": linked["id"], "setup_code": linked["code"]} if linked else {}),
     }
     trades.append(trade)
     _write_json(path, trades)
@@ -2855,6 +2872,11 @@ def log_trade(
         "rule_violations": violations,
         "rules_changed_today": _changed_today(_rules_history(), day),
     }
+    # TM - #ENTRY-ALERT - Entry setups & alerts
+    if linked:
+        out["setup"] = _setup_finish(linked, "FILLED", "FILLED",
+                                     {"trade_id": trade["id"], "source": "log_trade",
+                                      "journal_date": day}, price=trade["entry"])
     if orb_checks:
         # TM - #ORB - ORB Enhancement: da vao lenh thi dung watch phien (BR-04)
         out["orb_checks"] = orb_checks
@@ -3014,6 +3036,10 @@ def _exchange() -> exchanges.BaseExchange:
 
     # Phan khong phai secret (base_url, category, inst_type) van lay tu config.yaml
     options = ACCOUNT.get(cfg["name"]) or {}
+    # TM - #ENTRY-ALERT - Entry setups & alerts
+    if cfg["name"] == "okx":
+        options = {**options, "symbol_map": {str(k).upper(): v for k, v in (
+            _alerts_cfg()["watcher"].get("okx_symbol_map") or {}).items()}}
     return exchanges.build(
         cfg["name"],
         key=cfg["key"],
@@ -3292,7 +3318,8 @@ async def _open_positions(symbols: list[str] | None = None) -> dict[str, Any]:
 async def get_positions(symbol: str = "") -> dict[str, Any]:
     """Vi the dang mo THAT TREN SAN, tren MOI cap dang theo doi.
 
-    symbol: bo trong = tat ca cac cap trong danh sach o trang admin.
+    symbol: bo trong = tat ca cac cap trong danh sach o trang admin. OKX doi ma cap
+      theo watcher.okx_symbol_map (vd ETHUSDT -> ETH-USDT-SWAP), TM - #ENTRY-ALERT.
     Day la su that, khong phai nhat ky tu khai.
     """
     return await _open_positions([_resolve_symbol(symbol)] if symbol else None)
@@ -4132,6 +4159,238 @@ def get_sq9_levels(symbol: str = "", as_of: str = "", anchors: str = "auto",
     return {**head, **params, "anchors_used": used, **result, **_pl_tail(note, warnings)}
 
 
+# ---------------------------------------------------------------- entry setups
+# TM - #ENTRY-ALERT - Entry setups & alerts
+
+ALERTS_YAML: dict[str, Any] = {"notify": CFG.get("notify") or {}, "watcher": CFG.get("watcher") or {}}
+ALERTS_FILE = DATA_ROOT / str(PATHS.get("alerts_config_file") or "alerts/config.json")
+ALERT_PARAM_DEFAULTS: dict[str, Any] = {
+    "vol_mult": 2.0, "sma_period": 20, "body_pct": 0.6, "wick_pct": 0.6,
+    "retest_low_vol_mult": 0.8, "confirm_within": 3, "entry_valid_candles": 3, "m15_filter": True,
+}
+_ALERTS_CACHE: dict[str, Any] = {"key": None, "cfg": None}
+_ALERTS_LOCK = threading.Lock()
+
+
+def _alerts_cfg() -> dict[str, Any]:
+    try:
+        stat = ALERTS_FILE.stat()
+        key = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        key = None
+    if _ALERTS_CACHE["cfg"] is not None and _ALERTS_CACHE["key"] == key:
+        return _ALERTS_CACHE["cfg"]
+    cfg = copy.deepcopy(ALERTS_YAML)
+    if key is not None:
+        try:
+            override = _read_json(ALERTS_FILE, {})
+        except Exception as exc:
+            override = {}
+            print(f"CANH BAO: {ALERTS_FILE.name} loi ({type(exc).__name__}) - dang dung config.yaml",
+                  file=sys.stderr)
+        for block in ("notify", "watcher"):
+            if isinstance(override, dict) and isinstance(override.get(block), dict):
+                cfg[block] = override[block]
+    watcher = cfg["watcher"]
+    watcher["defaults"] = {**ALERT_PARAM_DEFAULTS, **(watcher.get("defaults") or {})}
+    watcher["symbol_overrides"] = {str(k).upper(): v or {} for k, v in
+                                   (watcher.get("symbol_overrides") or {}).items()}
+    watcher["watch_symbols"] = [str(s).upper() for s in (watcher.get("watch_symbols") or [])]
+    _ALERTS_CACHE.update(key=key, cfg=cfg)
+    return cfg
+
+
+def _alerts_save(block: str, value: dict[str, Any]) -> None:
+    with _ALERTS_LOCK:
+        doc = _read_json(ALERTS_FILE, {}) if ALERTS_FILE.exists() else {}
+        doc = doc if isinstance(doc, dict) else {}
+        doc[block] = value
+        _write_json(ALERTS_FILE, doc)
+        _ALERTS_CACHE.update(key=None, cfg=None)
+
+
+def _parse_moment(value: Any, *, end: bool = False) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)) or str(value).strip().isdigit():
+        number = int(float(value))
+        return number * 1000 if number < 10_000_000_000 else number
+    return klines_coverage.parse_time_bound(str(value).replace("T", " ")[:16], TZ, end=end)
+
+
+def _setup_check(symbol: str, side: str, price: float, stop: float,
+                 target: float) -> dict[str, Any]:
+    verdict = check_trade(side=side, entry=price, stop=stop, target=target, margin_usd=0.0,
+                          symbol=symbol)
+    trades = _read_json(JOURNAL_DIR / f"{_today()}.json", [])
+    taken = len([t for t in trades if isinstance(t, dict) and not _is_orb(t)])
+    return {"would_pass": verdict["would_pass"], "rule_violations": verdict["rule_violations"],
+            "rr": verdict["rr"], "trade_type": verdict["trade_type"],
+            "quota": f"{taken}/{int(_load_rules(symbol)['max_trades_per_day'])}"}
+
+
+async def _setup_positions(symbol: str) -> list[dict[str, Any]] | None:
+    if not _account_enabled():
+        return None
+    return (await _open_positions([symbol]))["positions"]
+
+
+SETUPS = entry_store.SetupStore(SQLITE_PATH)
+WATCHER = entry_watcher.EntryWatcher(
+    SETUPS, klines=lambda: KLINE_STORE, cfg=_alerts_cfg,
+    min_rr=lambda symbol: float(_load_rules(symbol)["min_rr"]),
+    check=_setup_check, positions=_setup_positions, tz=TZ, span_ms=_tf_ms)
+
+
+def _setup_view(setup: dict[str, Any], last: dict[str, Any] | None = None) -> dict[str, Any]:
+    state = setup.get("state") or {}
+    out = {k: setup[k] for k in ("id", "code", "symbol", "bias_date", "direction", "status",
+                                 "zone_low", "zone_high", "trigger_type", "trigger_params",
+                                 "confirm_type", "confirm_level", "entry", "stop", "target",
+                                 "max_chase", "invalidate_level", "m15_filter", "tr_high",
+                                 "tr_low", "note", "created_by")}
+    out["expires_at"] = _stamp(setup["expires_at"])
+    out["tr_since"] = _stamp(setup["tr_since"]) if setup.get("tr_since") else None
+    out["created_at"] = _stamp(setup["created_at"])
+    out["terminal"] = setup["status"] in entry_logic.TERMINAL
+    out["state"] = {k: state[k] for k in ("max_chase", "x_max", "min_rr", "last_price",
+                                          "came_from", "confirm_count", "entry_valid_count",
+                                          "trigger", "confirm") if k in state}
+    if state.get("last_candle"):
+        out["state"]["last_candle"] = _stamp(state["last_candle"])
+    if state.get("triggered_at"):
+        out["state"]["triggered_at"] = _stamp(state["triggered_at"])
+    if last:
+        out["last_event"] = _event_view(last)
+    return out
+
+
+def _event_view(event: dict[str, Any]) -> dict[str, Any]:
+    out = {k: event.get(k) for k in ("id", "event", "from_status", "to_status", "price",
+                                     "details", "notified", "notify_error")}
+    out["at"] = _stamp(event["at"])
+    out["candle"] = _stamp(event["candle_open_time"]) if event.get("candle_open_time") else None
+    if event.get("code") or event.get("symbol"):
+        out["code"], out["symbol"] = event.get("code"), event.get("symbol")
+    return out
+
+
+def _setup_finish(setup: dict[str, Any], status: str, event: str,
+                  details: dict[str, Any], price: float | None = None) -> dict[str, Any]:
+    if setup["status"] in entry_logic.TERMINAL:
+        raise ValueError(f"setup {setup['code']} da ket thuc ({setup['status']})")
+    ids = SETUPS.apply(setup, status, setup["state"], [{
+        "event": event, "from_status": setup["status"], "to_status": status, "price": price,
+        "candle_open_time": None, "details": details}])
+    WATCHER.notify_threadsafe(ids[-1])
+    return {"id": setup["id"], "code": setup["code"], "status": status, "event_id": ids[-1]}
+
+
+def _save_setups(symbol: str, setups: list[dict[str, Any]], replace: bool,
+                 created_by: str) -> dict[str, Any]:
+    if not isinstance(setups, list):
+        raise ValueError("setups phai la list")
+    min_rr = float(_load_rules(symbol)["min_rr"])
+    params = WATCHER.params_for(symbol)
+    now = int(time.time() * 1000)
+    cleaned, rejected = [], []
+    for index, raw in enumerate(setups):
+        try:
+            cleaned.append((index, entry_logic.validate(
+                raw, min_rr=min_rr, now_ms=now, parse_time=_parse_moment,
+                default_expiry=lambda day: _parse_moment(day, end=True),
+                default_day=_today(), default_m15=bool(params.get("m15_filter", True)))))
+        except ValueError as exc:
+            rejected.append({"index": index, "error": str(exc)})
+    replaced = []
+    if replace and (cleaned or not setups):
+        for old in SETUPS.active(symbol):
+            _setup_finish(old, "CANCELLED", "CANCELLED",
+                          {"reason": "thay boi save_setups(replace=true)", "by": created_by})
+            replaced.append(old["code"])
+    saved = []
+    for index, clean in cleaned:
+        row = SETUPS.insert(symbol, clean, created_by)
+        verdict = check_trade(side=clean["direction"], entry=clean["entry"], stop=clean["stop"],
+                              target=clean["target"], margin_usd=0.0, symbol=symbol)
+        saved.append({"index": index, "id": row["id"], "code": row["code"], "status": row["status"],
+                      "bias_date": row["bias_date"], "expires_at": _stamp(row["expires_at"]),
+                      "x_max": round(clean["x_max"], 4),
+                      "max_chase_effective": round(clean["max_chase_effective"], 4),
+                      "check_trade": {k: verdict[k] for k in ("would_pass", "rule_violations",
+                                                              "rr", "trade_type")}})
+    return {"symbol": symbol, "min_rr": min_rr, "saved": saved, "rejected": rejected,
+            "replaced": replaced, "ids": [s["id"] for s in saved],
+            "codes": [s["code"] for s in saved]}
+
+
+@_tool_with_reasons()
+def save_setups(symbol: str, setups: list[dict[str, Any]], replace: bool = False) -> dict[str, Any]:
+    """Luu ke hoach vao lenh thanh cac setup co cau truc - watcher se canh tren nen M5 da dong.
+
+    symbol: cap cua MOI setup trong lan goi. replace=true: huy moi setup CHUA KET THUC
+      cua cap nay truoc (dung sau buoi phan tich bias moi ngay).
+    Moi setup (object):
+      direction long|short; zone_low < zone_high; entry; stop (long: duoi entry, short:
+      tren); target; invalidate_level (long: duoi entry); trigger_type: spring|sos|
+      close_above (long), utad|sow|close_below (short), rejection|retest (ca hai).
+      Tuy chon: confirm_type close_above|close_below + confirm_level; max_chase (bo trong
+      = tu tinh tu SL/TP/min_rr); trigger_params {vol_mult, sma_period, body_pct, wick_pct,
+      retest_low_vol_mult, confirm_within, entry_valid_candles, m15_filter, ref_low,
+      ref_high, level}; m15_filter; expires_at ('YYYY-MM-DD HH:MM' gio VN hoac epoch ms,
+      bo trong = het ngay bias_date); bias_date (bo trong = hom nay); tr_high, tr_low,
+      tr_since; note.
+    Setup co x_max <= 0 (khong dat min_rr ngay tai entry) bi tu choi kem ly do. Moi setup
+    hop le duoc cham check_trade dang thu. Tra ve id + code (vd BTC-20261101-A).
+    """
+    return _save_setups(_resolve_symbol(symbol), setups, bool(replace), "claude")
+
+
+@_tool_with_reasons()
+def get_setups(symbol: str = "", status: str = "", date: str = "") -> dict[str, Any]:
+    """Danh sach setup kem trang thai hien tai va event gan nhat.
+
+    status: mot hoac nhieu trang thai cach nhau dau phay, hoac 'active' (chua ket thuc).
+    date: bias_date 'YYYY-MM-DD'. Bo trong ca status lan date = setup dang chay + setup cua hom nay.
+    """
+    sym = _resolve_symbol(symbol) if symbol else None
+    if status or date:
+        rows = SETUPS.list(symbol=sym, status=status or None, bias_date=date or None)
+    else:
+        seen: dict[str, dict[str, Any]] = {}
+        for row in SETUPS.active(sym) + SETUPS.list(symbol=sym, bias_date=_today()):
+            seen.setdefault(row["id"], row)
+        rows = sorted(seen.values(), key=lambda r: (r["bias_date"], r["code"]), reverse=True)
+    last = SETUPS.last_events([r["id"] for r in rows])
+    return {"count": len(rows), "watcher_enabled": _watcher_active(),
+            "setups": [_setup_view(r, last.get(r["id"])) for r in rows]}
+
+
+@_tool_with_reasons()
+def cancel_setup(id: str, reason: str) -> dict[str, Any]:
+    """Huy DUNG MOT setup (id hoac code). Khong dong vao setup khac cung huong. Bat buoc ly do."""
+    if not (reason or "").strip():
+        raise ValueError("reason la bat buoc")
+    return _setup_finish(SETUPS.get(id.strip()), "CANCELLED", "CANCELLED",
+                         {"reason": reason.strip(), "by": "claude"})
+
+
+@_tool_with_reasons()
+def get_setup_events(setup_id: str = "", symbol: str = "", date: str = "") -> dict[str, Any]:
+    """Lich su chuyen trang thai va tin da gui (notified / notify_error).
+
+    setup_id: id hoac code. symbol: moi setup cua cap + canh bao he thong nhac cap do.
+    date: 'YYYY-MM-DD' (gio VN) - loc theo luc xay ra event. Toi da 200 event moi nhat.
+    """
+    sid = SETUPS.get(setup_id.strip())["id"] if setup_id else None
+    start = end = None
+    if date:
+        start, end = _day_window_ms(date)
+    rows = SETUPS.events(setup_id=sid, symbol=_resolve_symbol(symbol) if symbol else None,
+                         start_ms=start, end_ms=end)
+    return {"count": len(rows), "events": [_event_view(e) for e in rows]}
+
+
 # ---------------------------------------------------------------- admin
 
 ADMIN_PATH = SRV.get("admin_path", "/admin")
@@ -4214,7 +4473,9 @@ async def http_admin(request):
         # TM - #GANN-TW - Gann Time Windows
         gann_path=ADMIN_GANN_PATH if GANN_ENABLED else "",
         # TM - #M5-FETCH - Per-timeframe schedules + M5
-        extra_links=[("Kéo nến", ADMIN_SCHEDULES_PATH, "lịch kéo nến theo từng khung")],
+        extra_links=[("Kéo nến", ADMIN_SCHEDULES_PATH, "lịch kéo nến theo từng khung"),
+                     # TM - #ENTRY-ALERT - Entry setups & alerts
+                     ("Vào lệnh", ADMIN_ALERTS_PATH, "setups, watcher, thông báo Discord/Telegram")],
     )
     return HTMLResponse(page, headers={"Cache-Control": "no-store"})
 
@@ -4965,7 +5226,8 @@ ADMIN_SCHEDULES_ACTION_PATH = ADMIN_SCHEDULES_PATH + "/action"
 
 
 def _watcher_active() -> bool:
-    return False
+    # TM - #ENTRY-ALERT - Entry setups & alerts
+    return bool(_alerts_cfg()["watcher"].get("enabled"))
 
 
 def _run_time(ms: int | None) -> dict[str, str] | None:
@@ -5048,6 +5310,171 @@ async def http_admin_schedules_action(request):
     if not _setup_ok(payload):
         return JSONResponse({"error": "Setup token sai"}, status_code=403)
     status, body = await _schedules_action(payload)
+    return JSONResponse(body, status_code=status)
+
+
+# TM - #ENTRY-ALERT - Entry setups & alerts
+ADMIN_ALERTS_PATH = ADMIN_PATH.rstrip("/") + "/alerts"
+ADMIN_ALERTS_ACTION_PATH = ADMIN_ALERTS_PATH + "/action"
+
+
+def _mask(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return "(chưa đặt)"
+    return f"(đã đặt …{text[-4:]})" if len(text) > 8 else "(đã đặt)"
+
+
+def _alerts_view(date_text: str, status: str) -> dict[str, Any]:
+    cfg = _alerts_cfg()
+    notify, watcher = cfg["notify"], cfg["watcher"]
+    tracked = [r["symbol"] for r in STORE.symbols(DEFAULT_SYMBOL)]
+    symbols = tracked + [s for s in watcher["watch_symbols"] if s not in tracked]
+    rows = SETUPS.list(bias_date=date_text or (None if status else _today()), status=status or None)
+    if not date_text and not status:
+        seen = {r["id"]: r for r in rows}
+        for row in SETUPS.active():
+            seen.setdefault(row["id"], row)
+        rows = sorted(seen.values(), key=lambda r: (r["bias_date"], r["code"]), reverse=True)
+    last = SETUPS.last_events([r["id"] for r in rows])
+    scan = dict(WATCHER.last_scan)
+    if scan.get("at"):
+        scan["at_text"] = _stamp(scan["at"])
+    warnings = []
+    if not WATCHER.running:
+        warnings.append("Watcher chưa chạy (server chưa khởi động xong).")
+    if "5m" not in {s["timeframe"] for s in SCHEDULES.list() if s["enabled"]} and watcher.get("enabled"):
+        warnings.append("Không có schedule 5m nào đang bật — watcher sẽ không có nến mới.")
+    return {
+        "notify": {"channel": notify.get("channel") or "discord",
+                   "display_timezone": notify.get("display_timezone") or str(TZ),
+                   "webhook_mask": _mask((notify.get("discord") or {}).get("webhook_url")),
+                   "token_mask": _mask((notify.get("telegram") or {}).get("bot_token")),
+                   "chat_mask": _mask((notify.get("telegram") or {}).get("chat_id"))},
+        "watcher": watcher, "symbols": symbols,
+        "override_symbols": sorted(set(watcher["watch_symbols"]) | set(watcher["symbol_overrides"])),
+        "param_keys": list(entry_logic.PARAM_KEYS), "statuses": list(entry_logic.STATUSES),
+        "triggers": list(entry_logic.TRIGGERS), "date": date_text, "status": status,
+        "today": _today(), "setups": [_setup_view(r, last.get(r["id"])) for r in rows],
+        "last_scan": scan, "alerts_file": str(ALERTS_FILE), "warnings": warnings,
+    }
+
+
+def _alert_param(key: str, value: Any) -> Any:
+    if key == "m15_filter":
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on", "co")
+        return bool(value)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} phai la so, nhan duoc {value!r}") from None
+    if key in ("sma_period", "confirm_within", "entry_valid_candles"):
+        if number < 1 or number != int(number):
+            raise ValueError(f"{key} phai la so nguyen >= 1")
+        return int(number)
+    if number <= 0:
+        raise ValueError(f"{key} phai > 0")
+    return number
+
+
+def _alert_params(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("tham so phai la object")
+    unknown = sorted(set(raw) - set(entry_logic.PARAM_KEYS))
+    if unknown:
+        raise ValueError(f"tham so khong ho tro: {unknown}")
+    return {k: _alert_param(k, v) for k, v in raw.items() if v is not None and v != ""}
+
+
+async def _alerts_action(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    action = str(payload.get("action") or "").strip().lower()
+    cfg = _alerts_cfg()
+    try:
+        if action == "notify_save":
+            channel = str(payload.get("channel") or "").strip().lower()
+            if channel not in notifier.CHANNELS:
+                raise ValueError(f"channel phai la mot trong {list(notifier.CHANNELS)}")
+            tz_name = str(payload.get("display_timezone") or "").strip() or str(TZ)
+            try:
+                ZoneInfo(tz_name)
+            except Exception:
+                raise ValueError(f"display_timezone khong hop le: {tz_name}") from None
+            block = copy.deepcopy(cfg["notify"])
+            block.update(channel=channel, display_timezone=tz_name)
+            discord, telegram = dict(block.get("discord") or {}), dict(block.get("telegram") or {})
+            if _optional(payload, "discord_webhook_url"):
+                discord["webhook_url"] = _optional(payload, "discord_webhook_url")
+            if _optional(payload, "telegram_bot_token"):
+                telegram["bot_token"] = _optional(payload, "telegram_bot_token")
+            if _optional(payload, "telegram_chat_id"):
+                telegram["chat_id"] = _optional(payload, "telegram_chat_id")
+            block.update(discord=discord, telegram=telegram)
+            _alerts_save("notify", block)
+            return 200, {"ok": True}
+        if action == "notify_test":
+            alert = notifier.system_alert("TEST", {"at": int(time.time() * 1000)}, WATCHER.display_tz())
+            error = await notifier.deliver(cfg["notify"], alert)
+            return 200, {"ok": not error, "error": error, "channel": cfg["notify"].get("channel")}
+        if action == "watcher_save":
+            block = copy.deepcopy(cfg["watcher"])
+            deadline = str(payload.get("plan_deadline_utc") or "00:30").strip()
+            try:
+                hh, mm = (int(x) for x in deadline.split(":"))
+                if not (0 <= hh < 24 and 0 <= mm < 60):
+                    raise ValueError
+            except ValueError:
+                raise ValueError("plan_deadline_utc phai dang HH:MM") from None
+            overrides = payload.get("symbol_overrides") or {}
+            if not isinstance(overrides, dict):
+                raise ValueError("symbol_overrides phai la object")
+            block.update(
+                enabled=bool(payload.get("enabled")), plan_deadline_utc=f"{hh:02d}:{mm:02d}",
+                watch_symbols=sorted({str(s).strip().upper() for s in payload.get("watch_symbols") or []
+                                      if str(s).strip()}),
+                defaults={**ALERT_PARAM_DEFAULTS, **_alert_params(payload.get("defaults") or {})},
+                symbol_overrides={str(k).upper(): _alert_params(v) for k, v in overrides.items()})
+            _alerts_save("watcher", block)
+            return 200, {"ok": True}
+        if action == "setup_cancel":
+            reason = str(payload.get("reason") or "").strip()
+            if not reason:
+                raise ValueError("reason la bat buoc")
+            return 200, _setup_finish(SETUPS.get(str(payload.get("id") or "")), "CANCELLED",
+                                      "CANCELLED", {"reason": reason, "by": "admin"})
+        if action == "setup_create":
+            sym = _resolve_symbol(str(payload.get("symbol") or ""))
+            return 200, _save_setups(sym, [payload.get("setup") or {}], False, "admin")
+        if action == "setup_events":
+            sid = SETUPS.get(str(payload.get("id") or ""))["id"]
+            return 200, {"events": [_event_view(e) for e in SETUPS.events(setup_id=sid)]}
+        return 400, {"error": f"action khong ho tro: {action!r}"}
+    except ValueError as exc:
+        return 400, {"error": str(exc)}
+
+
+@mcp.custom_route(ADMIN_ALERTS_PATH, methods=["GET"])
+async def http_admin_alerts(request):
+    from starlette.responses import HTMLResponse
+    date_text = str(request.query_params.get("date") or "").strip()
+    status = str(request.query_params.get("status") or "").strip()
+    page = admin_entry.render(_alerts_view(date_text, status), action_path=ADMIN_ALERTS_ACTION_PATH,
+                              admin_path=ADMIN_PATH, schedules_path=ADMIN_SCHEDULES_PATH,
+                              setup_required=not STORE.has_auth())
+    return HTMLResponse(page, headers={"Cache-Control": "no-store"})
+
+
+@mcp.custom_route(ADMIN_ALERTS_ACTION_PATH, methods=["POST"])
+async def http_admin_alerts_action(request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "body khong phai JSON"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "body phai la object"}, status_code=400)
+    if not _setup_ok(payload):
+        return JSONResponse({"error": "Setup token sai"}, status_code=403)
+    status, body = await _alerts_action(payload)
     return JSONResponse(body, status_code=status)
 
 
@@ -5139,7 +5566,9 @@ def build_app():
                          # TM - #GANN-TW - Gann Time Windows
                          ADMIN_GANN_PATH, ADMIN_GANN_ACTION_PATH,
                          # TM - #M5-FETCH - Per-timeframe schedules + M5
-                         ADMIN_SCHEDULES_PATH, ADMIN_SCHEDULES_ACTION_PATH),
+                         ADMIN_SCHEDULES_PATH, ADMIN_SCHEDULES_ACTION_PATH,
+                         # TM - #ENTRY-ALERT - Entry setups & alerts
+                         ADMIN_ALERTS_PATH, ADMIN_ALERTS_ACTION_PATH),
         )
 
     inner = app.router.lifespan_context
@@ -5156,11 +5585,13 @@ def build_app():
         # TM - #ORB - ORB Enhancement: scheduler ORB song cung vong doi app nhu fetcher
         orb_task = (asyncio.create_task(ORB_SCHEDULER.run_forever())
                     if ORB_SCHEDULER is not None else None)
+        # TM - #ENTRY-ALERT - Entry setups & alerts
+        watch_task = asyncio.create_task(WATCHER.run_forever())
         try:
             async with inner(scope):
                 yield
         finally:
-            for running in (task, orb_task):
+            for running in (task, orb_task, watch_task):
                 if running:
                     running.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
@@ -5209,6 +5640,9 @@ if __name__ == "__main__":
     print(f"BAMCP kline_store={KLINE_STORE.kind} sqlite_path={SQLITE_PATH}", file=sys.stderr)
     # TM - #M5-FETCH - Per-timeframe schedules + M5
     print(f"BAMCP fetcher mode={FETCH_MODE} admin={ADMIN_SCHEDULES_PATH}", file=sys.stderr)
+    # TM - #ENTRY-ALERT - Entry setups & alerts
+    print(f"BAMCP watcher enabled={_watcher_active()} channel={_alerts_cfg()['notify'].get('channel')} "
+          f"admin={ADMIN_ALERTS_PATH}", file=sys.stderr)
     # TM - #ORB - ORB Enhancement
     if ORB_ENABLED:
         print(f"BAMCP ORB: symbol={ORB_SYMBOL} sessions={ORB_SESSIONS.ids()} "
