@@ -53,12 +53,17 @@ fetcher:
                              # spot     = san giao ngay. Volume hai ben KHAC NHAU.
   base_url_futures: "https://fapi.binance.com/fapi/v1/klines"
   base_url_spot: "https://api.binance.com/api/v3/klines"
-  interval_seconds: 900      # 15 phut
+  interval_seconds: 900      # 15 phut - chi dung khi mode = interval
   fetch_limit: 500           # so nen moi lan pull (Binance toi da 1000)
   max_history: 1000          # so nen giu lai trong file sau khi merge
   request_timeout: 20
   retry: 3
-  run_on_start: true
+  run_on_start: true         # mode = schedules: luc khoi dong chay bu schedule da lo lich (TM - #M5-FETCH)
+  # TM - #M5-FETCH - Per-timeframe schedules + M5
+  mode: "schedules"          # schedules | interval (interval = vong lap 900 giay cu, de rollback)
+  seed_defaults: true        # bang fetch_schedules rong thi tao 6 schedule mac dinh luc khoi dong
+  reload_seconds: 30         # scheduler tu doc lai bang moi chung nay giay
+  supported_timeframes: ["5m", "15m", "1h", "4h", "1d", "1w"]
 
 # TM - #GANN-TW - Gann Time Windows
 # Pivot kieu swing chart Gann, trang thai song, va (cac phase sau) cua so thoi gian.
@@ -228,6 +233,8 @@ klines:
   timeframes: ["1w", "1d", "4h", "1h", "15m"]
   # Khung chi keo khi goi refresh_data(timeframes=["5m"]) hoac trong giai doan
   # watch cua ORB. Fetcher nen KHONG bao gio keo cac khung nay.
+  # TM - #M5-FETCH - Per-timeframe schedules + M5: fetcher.mode = schedules thi 5m
+  # duoc keo theo schedule pull-5m (trang /admin/schedules).
   on_demand_timeframes: ["5m"]
   default_limit: 120
   max_limit: 1000

@@ -81,6 +81,7 @@ PAGE = """<!doctype html>
 <p class="sub">Lưu vào <code>__SETTINGS_PATH__</code>, tồn tại qua mọi lần tạo lại container.</p>
 __ORB_LINK__
 __GANN_LINK__
+__EXTRA_LINKS__
 
 __SETUP_BANNER__
 
@@ -476,7 +477,8 @@ def render(state: dict[str, Any], *, settings_path: str, save_path: str,
            symbol_overrides: dict[str, list[str]],
            global_rule_keys: tuple[str, ...],
            symbol_rule_keys: tuple[str, ...],
-           orb_path: str = "", gann_path: str = "") -> str:
+           orb_path: str = "", gann_path: str = "",
+           extra_links: list[tuple[str, str, str]] | None = None) -> str:
     """Dung HTML tu trang thai da duoc che giau. Khong nhan secret that.
 
     `rules` la rule chung + mac dinh; `symbol_rules` la gia tri da giai cho tung
@@ -545,6 +547,10 @@ def render(state: dict[str, Any], *, settings_path: str, save_path: str,
         # TM - #GANN-TW - Gann Time Windows: loi vao trang Gann
         "__GANN_LINK__": (f'<p class="sub">Gann: <a href="{html.escape(gann_path)}">'
                           f'pivot, cửa sổ thời gian, backtest</a></p>' if gann_path else ""),
+        # TM - #M5-FETCH - Per-timeframe schedules + M5
+        "__EXTRA_LINKS__": "".join(
+            f'<p class="sub">{html.escape(label)}: <a href="{html.escape(path)}">'
+            f'{html.escape(text)}</a></p>' for label, path, text in (extra_links or [])),
     }
 
     page = PAGE

@@ -22,6 +22,24 @@ CREATE TABLE IF NOT EXISTS klines (
   UNIQUE (symbol, tf, open_time)
 );
 """,
+    # TM - #M5-FETCH - Per-timeframe schedules + M5
+    """
+CREATE TABLE IF NOT EXISTS fetch_schedules (
+  id               TEXT    NOT NULL PRIMARY KEY,
+  name             TEXT    NOT NULL UNIQUE,
+  timeframe        TEXT    NOT NULL,
+  symbols          TEXT,
+  cron             TEXT    NOT NULL,
+  enabled          INTEGER NOT NULL DEFAULT 1,
+  overlap_candles  INTEGER NOT NULL DEFAULT 3,
+  last_run_at      INTEGER,
+  last_status      TEXT,
+  last_error       TEXT,
+  last_duration_ms INTEGER,
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL
+);
+""",
 ]
 
 _MIGRATED: set[str] = set()

@@ -27,7 +27,8 @@ NOW = T0 + 10 * H1 + 1_000
 
 
 def tearDownModule():
-    shutil.rmtree(_TMP, ignore_errors=True)
+    if Path(server.DATA_ROOT).resolve() != Path(_TMP).resolve():
+        shutil.rmtree(_TMP, ignore_errors=True)
 
 
 def raw(i: int, close: float | None = None) -> list:

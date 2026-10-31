@@ -40,6 +40,8 @@ COPY klines_coverage.py gann_pivots.py gann_windows.py gann_backtest.py admin_ga
 COPY gann_levels.py ./
 # TM - #KL-SQL - Kline storage SQLite
 COPY sqlite_db.py kline_store.py kline_migrate.py ./
+# TM - #M5-FETCH - Per-timeframe schedules + M5
+COPY cron_utc.py fetch_schedules.py admin_schedules.py ./
 
 RUN mkdir -p /data/klines /data/bias /data/journal /data/journal/orb_skips \
              /data/orb/state /data/orb/logs /data/orb/history /data/orb/backtests \

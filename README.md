@@ -14,6 +14,8 @@ Tuỳ chọn đọc tài khoản thật từ Binance, Bybit hoặc OKX bằng AP
 |---|---|
 | `list_timeframes` | Các cặp đang theo dõi, khung nào đã có dữ liệu, lần pull gần nhất |
 | `refresh_data` | Ép pull ngay từ Binance, không chờ chu kỳ |
+| `backfill_klines` | Kéo lịch sử cũ về (lùi tới khi hết dữ liệu hoặc `days` ngày) |
+| `get_data_coverage` | Độ phủ dữ liệu từng khung (kể cả 5m), chỗ thiếu nến |
 | `get_klines` | Nến OHLCV thô, mặc định chỉ trả nến đã đóng |
 | `get_context` | Range, vị trí giá trong range, spread/volume cho VSA, swing gần nhất, độ tươi dữ liệu — theo cặp |
 | `get_bias` | Đọc bias đã lưu của một cặp |
@@ -479,6 +481,8 @@ Các đường chính:
 | `GET /admin/orb` | có* | quản lý phiên, rule ORB và news days (chỉ có khi `orb.enabled`) |
 | `POST /admin/orb/sessions` | có* | xem trước / lưu / bật / tắt / xoá phiên — trang trên gọi |
 | `POST /admin/orb/rules` | có* | xem trước / lưu rule ORB, thêm / xoá news day — trang trên gọi |
+| `GET /admin/schedules` | có* | lịch kéo nến theo từng khung |
+| `POST /admin/schedules/action` | có* | thêm / sửa / bật tắt / xoá / chạy ngay / xem trước cron — trang trên gọi |
 
 `*` `/admin` mở công khai khi **chưa** đặt mật khẩu lần nào, nhưng lúc đó phải có setup token mới ghi được. Xem mục [Trang admin](#trang-admin).
 
@@ -489,7 +493,7 @@ Không có REST API nào khác. Muốn pull dữ liệu ngay thì bảo Claude g
 ```
 <data_root>/          # Docker: /data, mount ra ./data trên host
 ├── klines/    1w.json  1d.json  4h.json  1h.json  15m.json   # storage.kline_store = json
-├── bamcp.db              # SQLite: bảng klines (storage.kline_store = sqlite)
+├── bamcp.db              # SQLite: bảng klines (storage.kline_store = sqlite), fetch_schedules
 ├── bias/      2026-09-12.json
 ├── rules.json            # rule chung + phần đặt riêng từng cặp + khối orb (rule ORB) + lịch sử đổi
 ├── settings.json         # username/password (hash) + credential sàn — chmod 600
@@ -504,13 +508,36 @@ Không có REST API nào khác. Muốn pull dữ liệu ngay thì bảo Claude g
     └── backtests/ <run_id>/  result.json  trades.csv  equity.csv
 ```
 
-`klines/<cặp>/5m.json` chỉ xuất hiện khi ORB watch hoặc khi gọi `refresh_data(timeframes=["5m"])`; vòng pull 15 phút không bao giờ kéo khung 5m.
-
-Mỗi chu kỳ (mặc định 15 phút) server gọi Binance, merge theo `openTime` nên không trùng nến, và giữ tối đa `max_history` nến.
+Server kéo nến theo **fetch schedules** (xem [Lịch kéo nến theo khung](#lịch-kéo-nến-theo-khung)): mỗi khung một lịch riêng, kể cả 5m. Merge theo `openTime` nên không trùng nến; bản JSON giữ tối đa `max_history` nến.
 
 Nếu bạn có pipeline khác ghi vào cùng thư mục thì đặt `fetcher.enabled: false` để tắt phần pull tích hợp.
 
 **Quan trọng — `fetcher.market`:** để `futures` nếu bạn trade perpetual swap. Volume spot và volume perp khác nhau, mà VSA thì sống bằng volume.
+
+## Lịch kéo nến theo khung
+
+`fetcher.mode: schedules` (mặc định): mỗi khung một schedule độc lập, cron 6 trường có giây, giờ **UTC**. Quản lý ở `/admin/schedules` — bật/tắt, thêm, sửa, xoá, "Chạy ngay", xem trước 3 lần chạy kế tiếp. Thay đổi có hiệu lực ngay; scheduler tự đọc lại bảng mỗi `reload_seconds`.
+
+Bảng `fetch_schedules` trong `bamcp.db` rỗng thì lúc khởi động tạo 6 schedule mặc định (`seed_defaults`), mỗi lượt chạy 5 giây sau khi nến đóng:
+
+| name | timeframe | cron (UTC) |
+|---|---|---|
+| pull-5m | 5m | `5 */5 * * * *` |
+| pull-15m | 15m | `5 */15 * * * *` |
+| pull-1h | 1h | `5 0 * * * *` |
+| pull-4h | 4h | `5 0 */4 * * *` |
+| pull-1d | 1d | `5 0 0 * * *` |
+| pull-1w | 1w | `5 0 0 * * MON` |
+
+Mỗi lượt, với từng cặp: kéo từ nến mới nhất trong store lùi `overlap_candles` nến (tự vá lỗ gần), tới hiện tại. Nến vừa đóng chưa có trên Binance thì thử lại sau 3 giây, tối đa 3 lần. Khoá theo (cặp, khung): lượt trước chưa xong thì lượt sau ghi `skipped`; `refresh_data`, watch ORB và `backfill_klines` dùng chung khoá đó. Mỗi lượt ghi `last_run_at`, `last_status` (`ok` / `error` / `skipped`), `last_error`, `last_duration_ms`; `list_timeframes` trả các trường đó cho từng khung, còn `last_fetch_error` là lỗi gần nhất của bất kỳ schedule nào.
+
+Sau deploy, backfill 90 ngày 5m cho mỗi cặp: `backfill_klines(timeframe="5m", symbol="...", days=90, max_requests=60)` (nên chạy sau khi đã sang `kline_store: sqlite` — bản JSON cắt 5m theo `max_history`).
+
+Khởi động lại (`run_on_start: true`): schedule nào đã lỡ lịch trong lúc server tắt — lần chạy kế tiếp sau `last_run_at` đã qua — được chạy bù ngay một lần.
+
+Rollback: `fetcher.mode: interval` chạy lại vòng lặp `interval_seconds` cũ; bảng `fetch_schedules` giữ nguyên để bật lại sau.
+
+Task phân tích bias lúc 7h VN nên đặt 00:05 UTC, sau khi đã có nến 4h và 1d.
 
 ## Lưu nến trong SQLite
 
