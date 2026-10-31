@@ -39,6 +39,7 @@ import gann_levels  # TM - #GANN-PL - Gann Price Levels: Square of 9, quat, cham
 import gann_pivots  # TM - #GANN-TW - Gann Time Windows: pivot swing chart & trang thai song
 import gann_windows  # TM - #GANN-TW - Gann Time Windows: chieu thoi gian & cua so
 import klines_coverage  # TM - #GANN-TW - Gann Time Windows: do phu & loc theo thoi gian
+import kline_store  # TM - #KL-SQL - Kline storage SQLite
 import settings    # module cuc bo: luu credential xuong volume
 # TM - #ORB - ORB Enhancement
 import admin_orb     # module cuc bo: trang quan ly phien ORB
@@ -67,6 +68,8 @@ KL = CFG["klines"]
 # TM - #GANN-TW - Gann Time Windows: retention rieng tung khung
 RETENTION: dict[str, Any] = CFG.get("retention") or {}
 FETCH = CFG.get("fetcher", {"enabled": False})
+# TM - #KL-SQL - Kline storage SQLite
+STORAGE: dict[str, Any] = CFG.get("storage") or {}
 RULES_SEED: dict[str, Any] = dict(CFG["rules"])   # gia tri goc, chi dung khi chua co rules.json
 AUTH = SRV.get("auth") or {}
 ACCOUNT = CFG.get("account") or {"enabled": False}
@@ -91,6 +94,9 @@ if _env("BAMCP_SYMBOL"):
     FETCH["symbol"] = _env("BAMCP_SYMBOL")
 if _env("BAMCP_MARKET"):
     FETCH["market"] = _env("BAMCP_MARKET")
+# TM - #KL-SQL - Kline storage SQLite
+if _env("BAMCP_KLINE_STORE"):
+    STORAGE["kline_store"] = _env("BAMCP_KLINE_STORE")
 
 # Gia tri KHOI TAO tu env/config.yaml. Chung chi duoc dung de nap settings.json
 # lan dau; sau do trang admin la nguon su that. Neu khong lam vay thi bam Luu
@@ -121,6 +127,13 @@ BIAS_DIR = DATA_ROOT / PATHS["bias_dir"]
 JOURNAL_DIR = DATA_ROOT / PATHS["journal_dir"]
 RULES_FILE = DATA_ROOT / PATHS.get("rules_file", "rules.json")
 SETTINGS_FILE = DATA_ROOT / PATHS.get("settings_file", "settings.json")
+# TM - #KL-SQL - Kline storage SQLite
+SQLITE_PATH = Path(str(STORAGE.get("sqlite_path") or "bamcp.db")).expanduser()
+if not SQLITE_PATH.is_absolute():
+    SQLITE_PATH = DATA_ROOT / SQLITE_PATH
+KLINE_STORE_KIND = str(STORAGE.get("kline_store") or "json").strip().lower()
+if KLINE_STORE_KIND not in ("json", "sqlite"):
+    raise SystemExit(f"storage.kline_store phai la json hoac sqlite, nhan duoc {KLINE_STORE_KIND!r}")
 
 STORE = settings.SettingsStore(SETTINGS_FILE, TZ)
 
@@ -765,12 +778,13 @@ def _normalize_bars(raw: Any) -> list[dict[str, float]]:
 def _load_bars(symbol: str, timeframe: str) -> list[dict[str, float]]:
     sym = _resolve_symbol(symbol)
     tf = _validate_timeframe(timeframe)
-    path = _kline_path(symbol, tf)
-    if not path.exists():
+    # TM - #KL-SQL - Kline storage SQLite
+    bars = KLINE_STORE.get_klines(sym, tf)
+    if not bars:
         raise FileNotFoundError(
             f"Chua co du lieu {symbol} khung {tf}. Doi mot chu ky pull, "
             f"hoac goi refresh_data({symbol!r}).")
-    return _normalize_bars(_read_json(path, []))
+    return bars
 
 
 def _bar_time(bar: dict[str, float]) -> str:
@@ -943,6 +957,40 @@ def _merge_bars(old: list[Any], new: list[Any], cap: int | None) -> list[Any]:
     return ordered[-cap:] if cap else ordered
 
 
+# TM - #KL-SQL - Kline storage SQLite
+KLINE_JSON = kline_store.JsonKlineStore(
+    KLINES_DIR, path_fn=_kline_path, normalize=_normalize_bars, merge=_merge_bars,
+    retention=_retention_for, read_json=_read_json, write_json=_write_json,
+    timeframes=lambda: list(KL["timeframes"]) + _on_demand_timeframes())
+_KLINE_SQLITE: kline_store.SqliteKlineStore | None = None
+
+
+def _kline_sqlite() -> kline_store.SqliteKlineStore:
+    global _KLINE_SQLITE
+    if _KLINE_SQLITE is None:
+        _KLINE_SQLITE = kline_store.SqliteKlineStore(SQLITE_PATH, span_ms=_tf_ms)
+    return _KLINE_SQLITE
+
+
+KLINE_STORE: kline_store.IKlineStore = (_kline_sqlite() if KLINE_STORE_KIND == "sqlite"
+                                        else KLINE_JSON)
+
+
+def _kline_coverage(symbol: str | None = None) -> dict[tuple[str, str], dict[str, Any]]:
+    return {(c["symbol"], c["tf"]): c for c in KLINE_STORE.get_coverage(symbol)}
+
+
+def _kline_migrate(action: str) -> dict[str, Any]:
+    action = (action or "").strip().lower()
+    if action == "import":
+        return {"action": action, "sqlite_path": str(SQLITE_PATH),
+                **kline_store.import_json(KLINE_JSON, _kline_sqlite())}
+    if action == "verify":
+        return {"action": action, "sqlite_path": str(SQLITE_PATH),
+                **kline_store.verify(KLINE_JSON, _kline_sqlite(), span_ms=_tf_ms)}
+    raise ValueError("action phai la import hoac verify")
+
+
 async def _fetch_one(client: httpx.AsyncClient, symbol: str,
                      timeframe: str, limit: int | None = None,
                      source: str = "manual") -> dict[str, Any]:
@@ -966,14 +1014,9 @@ async def _fetch_one(client: httpx.AsyncClient, symbol: str,
             if not isinstance(rows, list) or not rows:
                 raise ValueError("Binance tra ve du lieu rong")
 
-            path = _kline_path(symbol, timeframe)
-            existing = _read_json(path, [])
-            if not isinstance(existing, list):
-                existing = []
-            # TM - #GANN-TW - Gann Time Windows: retention theo tung khung
-            merged = _merge_bars(existing, rows, _retention_for(timeframe))
-            _write_json(path, merged)
-            return {"ok": True, "fetched": len(rows), "total": len(merged),
+            # TM - #KL-SQL - Kline storage SQLite
+            stored = KLINE_STORE.upsert(symbol, timeframe, rows)
+            return {"ok": True, "fetched": len(rows), "total": stored["total"],
                     "at": _now_iso()}
         except Exception as exc:
             last_exc = exc
@@ -1102,10 +1145,10 @@ ORB_LOG = orb_runtime.EventLog(ORB_LOG_DIR)
 
 def _orb_load_live(symbol: str, timeframe: str) -> tuple[list[dict[str, Any]], int | None]:
     """Nen trong file kline live + luc file duoc ghi (ms). Khong co file thi rong."""
-    path = _kline_path(symbol, timeframe)
+    # TM - #KL-SQL - Kline storage SQLite
     try:
-        stamp = int(path.stat().st_mtime * 1000)
-        return _normalize_bars(_read_json(path, [])), stamp
+        bars = KLINE_STORE.get_klines(symbol, timeframe)
+        return bars, (KLINE_STORE.written_at(symbol, timeframe) if bars else None)
     except FileNotFoundError:
         return [], None
     except (OSError, ValueError) as exc:
@@ -1914,14 +1957,16 @@ def list_timeframes() -> dict[str, Any]:
     da co du lieu chua.
     """
     rows = []
+    # TM - #KL-SQL - Kline storage SQLite
+    coverage = _kline_coverage()
     for entry in STORE.symbols(DEFAULT_SYMBOL):
         frames = []
         for tf in KL["timeframes"]:
-            path = _kline_path(entry["symbol"], tf)
-            item = {"timeframe": tf, "exists": path.exists()}
-            if path.exists():
+            cov = coverage.get((entry["symbol"], tf))
+            item = {"timeframe": tf, "exists": bool(cov and cov["count"])}
+            if item["exists"] and cov["updated_ms"]:
                 item["updated_at"] = datetime.fromtimestamp(
-                    path.stat().st_mtime, TZ).strftime("%Y-%m-%d %H:%M:%S")
+                    cov["updated_ms"] / 1000, TZ).strftime("%Y-%m-%d %H:%M:%S")
             frames.append(item)
         rows.append({
             "symbol": entry["symbol"],
@@ -1948,14 +1993,16 @@ def list_timeframes() -> dict[str, Any]:
 def _orb_on_demand_view() -> list[dict[str, Any]]:
     """Khung on-demand (5m): fetcher nen khong keo, chi refresh_data / watch ORB."""
     out = []
+    # TM - #KL-SQL - Kline storage SQLite
+    coverage = _kline_coverage(ORB_SYMBOL)
     for tf in _on_demand_timeframes():
-        path = _kline_path(ORB_SYMBOL, tf)
+        cov = coverage.get((ORB_SYMBOL, tf))
         item: dict[str, Any] = {"symbol": ORB_SYMBOL, "timeframe": tf,
-                                "exists": path.exists(),
+                                "exists": bool(cov and cov["count"]),
                                 "pulled_by": "refresh_data / ORB watch (khong theo fetcher nen)"}
-        if path.exists():
+        if item["exists"] and cov["updated_ms"]:
             item["updated_at"] = datetime.fromtimestamp(
-                path.stat().st_mtime, TZ).strftime("%Y-%m-%d %H:%M:%S")
+                cov["updated_ms"] / 1000, TZ).strftime("%Y-%m-%d %H:%M:%S")
         out.append(item)
     return out
 
@@ -2083,8 +2130,8 @@ async def backfill_klines(timeframe: str, symbol: str = "",
     if span <= 0:
         raise ValueError(f"khong biet do dai nen cua khung {tf}")
 
-    retention = _retention_for(tf)
-    path = _kline_path(sym, tf)
+    # TM - #KL-SQL - Kline storage SQLite
+    retention = _retention_for(tf) if KLINE_STORE.kind == "json" else None
     warnings: list[str] = []
     if retention:
         warnings.append(
@@ -2098,12 +2145,10 @@ async def backfill_klines(timeframe: str, symbol: str = "",
     async with FETCH_LOCK:
         async with httpx.AsyncClient() as client:
             for _ in range(max(1, int(max_requests))):
-                existing = _read_json(path, [])
-                if not isinstance(existing, list):
-                    existing = []
-                before = len(existing)
-                oldest = min((int(r[0]) for r in existing
-                              if isinstance(r, (list, tuple)) and r), default=None)
+                # TM - #KL-SQL - Kline storage SQLite
+                cov = KLINE_STORE.get_coverage(sym, tf)
+                before = cov[0]["count"] if cov else 0
+                oldest = cov[0]["first_open_time"] if cov else None
 
                 params = {"symbol": sym, "interval": tf, "limit": limit}
                 if oldest is not None:
@@ -2123,9 +2168,8 @@ async def backfill_klines(timeframe: str, symbol: str = "",
                 if not isinstance(rows, list) or not rows:
                     break        # het lich su
 
-                merged = _merge_bars(existing, rows, retention)
-                _write_json(path, merged)
-                added = len(merged) - before
+                # TM - #KL-SQL - Kline storage SQLite
+                added = KLINE_STORE.upsert(sym, tf, rows)["total"] - before
                 added_total += added
                 if added <= 0:
                     break        # san khong con nen cu hon -> da cham day
@@ -2146,6 +2190,22 @@ async def backfill_klines(timeframe: str, symbol: str = "",
         "retention": retention,
         "warnings": warnings,
     }
+
+
+# TM - #KL-SQL - Kline storage SQLite
+@_tool_with_reasons()
+async def migrate_klines(action: str) -> dict[str, Any]:
+    """Chuyen nen JSON sang SQLite va doi chieu hai ben (rollout storage.kline_store).
+
+    action:
+      import - chep moi nen da dong tu file JSON vao SQLite. Chay lai bao nhieu lan
+        cung khong sinh trung (upsert theo symbol, tf, open_time).
+      verify - voi moi symbol x tf: so so nen, open_time dau/cuoi va OHLCV tung nen
+        giua JSON (chi nen da dong) va SQLite. ok = true khi mismatches = 0.
+    Cung viec voi lenh: python kline_migrate.py import|verify
+    """
+    async with FETCH_LOCK:
+        return await asyncio.to_thread(_kline_migrate, action)
 
 
 @mcp.tool()
@@ -3953,8 +4013,10 @@ def _numeric_rules(raw: dict[str, Any]) -> dict[str, float]:
 async def http_admin(request):
     from starlette.responses import HTMLResponse
     tracked = STORE.symbols(DEFAULT_SYMBOL)
+    # TM - #KL-SQL - Kline storage SQLite
+    coverage = _kline_coverage()
     ready = {
-        row["symbol"]: all(_kline_path(row["symbol"], tf).exists()
+        row["symbol"]: all((coverage.get((row["symbol"], tf)) or {}).get("count")
                            for tf in KL["timeframes"])
         for row in tracked
     }
@@ -4876,6 +4938,8 @@ if __name__ == "__main__":
 
     print(f"BAMCP data_root={DATA_ROOT} symbol={FETCH.get('symbol')} "
           f"market={FETCH.get('market')} fetcher={bool(FETCH.get('enabled'))}", file=sys.stderr)
+    # TM - #KL-SQL - Kline storage SQLite
+    print(f"BAMCP kline_store={KLINE_STORE.kind} sqlite_path={SQLITE_PATH}", file=sys.stderr)
     # TM - #ORB - ORB Enhancement
     if ORB_ENABLED:
         print(f"BAMCP ORB: symbol={ORB_SYMBOL} sessions={ORB_SESSIONS.ids()} "

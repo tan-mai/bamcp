@@ -35,6 +35,7 @@ Tuỳ chọn đọc tài khoản thật từ Binance, Bybit hoặc OKX bằng AP
 | `backtest_orb` | Backtest ORB trên M5 lịch sử, tách in-sample/out-of-sample |
 | `get_backtest_result` | Lấy kết quả backtest chạy lâu theo `run_id` |
 | `get_orb_config` | Tham số + rule ORB đang áp dụng (kèm nguồn từng lớp), cảnh báo `rule_infeasible` |
+| `migrate_klines` | `import` nến JSON sang SQLite / `verify` đối chiếu hai bên (xem [Lưu nến trong SQLite](#lưu-nến-trong-sqlite)) |
 
 Không có tool đặt lệnh. Cố ý. Plan của ORB chỉ là con số đề xuất — người dùng tự đặt lệnh trên sàn.
 
@@ -487,7 +488,8 @@ Không có REST API nào khác. Muốn pull dữ liệu ngay thì bảo Claude g
 
 ```
 <data_root>/          # Docker: /data, mount ra ./data trên host
-├── klines/    1w.json  1d.json  4h.json  1h.json  15m.json
+├── klines/    1w.json  1d.json  4h.json  1h.json  15m.json   # storage.kline_store = json
+├── bamcp.db              # SQLite: bảng klines (storage.kline_store = sqlite)
 ├── bias/      2026-09-12.json
 ├── rules.json            # rule chung + phần đặt riêng từng cặp + khối orb (rule ORB) + lịch sử đổi
 ├── settings.json         # username/password (hash) + credential sàn — chmod 600
@@ -509,6 +511,30 @@ Mỗi chu kỳ (mặc định 15 phút) server gọi Binance, merge theo `openTi
 Nếu bạn có pipeline khác ghi vào cùng thư mục thì đặt `fetcher.enabled: false` để tắt phần pull tích hợp.
 
 **Quan trọng — `fetcher.market`:** để `futures` nếu bạn trade perpetual swap. Volume spot và volume perp khác nhau, mà VSA thì sống bằng volume.
+
+## Lưu nến trong SQLite
+
+Nến đọc/ghi qua một interface (`kline_store.IKlineStore`) với hai bản: `json` (file như trên, hành vi giữ nguyên) và `sqlite` (`<data_root>/bamcp.db`, bảng `klines`). Bias, journal, rules vẫn là JSON.
+
+```yaml
+storage:
+  kline_store: "json"      # json | sqlite — hoặc biến môi trường BAMCP_KLINE_STORE
+  sqlite_path: "bamcp.db"  # tương đối so với data_root
+```
+
+Bản `sqlite` chỉ lưu nến **đã đóng** (nến có `close_time > now` bị bỏ ngay ở tầng store), nên `current_bar` của `get_context` luôn rỗng. Không cắt theo `retention`. Bảng tự tạo khi khởi động.
+
+Rollout:
+
+1. Deploy với `kline_store: json`, chạy import: `python kline_migrate.py import` (hoặc bảo Claude gọi `migrate_klines(action="import")`). Chạy lại nhiều lần không sinh trùng.
+2. Kiểm tra song song: `python kline_migrate.py verify` / `migrate_klines(action="verify")` — so số nến, `open_time` đầu/cuối và OHLCV từng nến cho mỗi cặp × khung. Phải ra `mismatches: 0`. Nến JSON mới về sau lần import cũng tính là lệch — chạy lại import rồi verify.
+3. Đổi `kline_store: sqlite` (hoặc `BAMCP_KLINE_STORE=sqlite`), restart. Giữ thư mục `klines/` 4 tuần để rollback, sau đó mới xoá.
+
+Backup — cron trên VPS mỗi đêm, giữ 14 bản. Không copy thẳng file khi DB đang mở:
+
+```
+0 3 * * * sqlite3 /data/bamcp.db ".backup /backup/bamcp-$(date +\%F).db" && ls -1t /backup/bamcp-*.db | tail -n +15 | xargs -r rm --
+```
 
 ## Deploy: GitHub Actions → ghcr.io → panel + Traefik
 

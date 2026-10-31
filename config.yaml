@@ -3,7 +3,8 @@
 # Bien moi truong thang config: BAMCP_HOST, BAMCP_PORT, BAMCP_ALLOWED_HOSTS,
 # BAMCP_DATA_ROOT, BAMCP_USERNAME, BAMCP_PASSWORD, BAMCP_SYMBOL, BAMCP_MARKET, TZ,
 # BAMCP_ACCOUNT_ENABLED (true/false - tat nhanh phan doc tai khoan khi test),
-# BAMCP_ORB_ENABLED (true/false - bat/tat module ORB).
+# BAMCP_ORB_ENABLED (true/false - bat/tat module ORB),
+# BAMCP_KLINE_STORE (json/sqlite - TM - #KL-SQL - Kline storage SQLite).
 
 server:
   host: "0.0.0.0"            # 0.0.0.0 khi chay trong container; 127.0.0.1 khi chay truc tiep sau Caddy
@@ -39,6 +40,11 @@ paths:
   kline_filename: "{timeframe}.json"   # vd: 4h.json
   rules_file: "rules.json"      # tuong doi so voi data_root; sinh tu `rules:` ben duoi o lan doi dau
   settings_file: "settings.json" # username/password va credential san, do trang admin ghi
+
+# TM - #KL-SQL - Kline storage SQLite
+storage:
+  kline_store: "json"          # json | sqlite. Bien moi truong BAMCP_KLINE_STORE thang gia tri nay
+  sqlite_path: "bamcp.db"      # tuong doi so voi data_root (Docker: /data/bamcp.db)
 
 fetcher:
   enabled: true
