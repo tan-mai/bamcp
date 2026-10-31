@@ -208,6 +208,18 @@ class SqliteKlineStore(IKlineStore):
         return [{k: (int(r[k]) if k in ("open_time", "close_time") else float(r[k]))
                  for k in BAR_KEYS} for r in rows]
 
+    def raw_rows(self, symbol: str, tf: str, limit: int | None = None) -> list[list[Any]]:
+        sql = ("SELECT open_time, open, high, low, close, volume, close_time, quote_volume, "
+               "trades, taker_buy_volume FROM klines WHERE symbol = ? AND tf = ? "
+               "ORDER BY open_time DESC")
+        params: list[Any] = [symbol.upper(), tf]
+        if limit:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        with closing(sqlite_db.connect(self.path)) as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [list(r) for r in rows[::-1]]
+
     def upsert(self, symbol: str, tf: str, klines: list[Any]) -> dict[str, Any]:
         sym = symbol.upper()
         now = self.now_ms()
@@ -261,6 +273,17 @@ def import_json(src: JsonKlineStore, dst: SqliteKlineStore) -> dict[str, Any]:
                         "written": result["written"],
                         "skipped_forming": result["skipped_forming"],
                         "sqlite_total": result["total"]})
+    return {"pairs": len(details), "rows_written": sum(d["written"] for d in details),
+            "details": details}
+
+
+def export_json(src: SqliteKlineStore, dst: JsonKlineStore) -> dict[str, Any]:
+    details = []
+    for cov in src.get_coverage():
+        rows = src.raw_rows(cov["symbol"], cov["tf"], limit=dst.retention(cov["tf"]))
+        result = dst.upsert(cov["symbol"], cov["tf"], rows)
+        details.append({"symbol": cov["symbol"], "tf": cov["tf"], "sqlite_rows": cov["count"],
+                        "written": result["written"], "json_total": result["total"]})
     return {"pairs": len(details), "rows_written": sum(d["written"] for d in details),
             "details": details}
 

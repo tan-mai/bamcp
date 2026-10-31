@@ -102,9 +102,6 @@ if _env("BAMCP_SYMBOL"):
     FETCH["symbol"] = _env("BAMCP_SYMBOL")
 if _env("BAMCP_MARKET"):
     FETCH["market"] = _env("BAMCP_MARKET")
-# TM - #KL-SQL - Kline storage SQLite
-if _env("BAMCP_KLINE_STORE"):
-    STORAGE["kline_store"] = _env("BAMCP_KLINE_STORE")
 
 # Gia tri KHOI TAO tu env/config.yaml. Chung chi duoc dung de nap settings.json
 # lan dau; sau do trang admin la nguon su that. Neu khong lam vay thi bam Luu
@@ -1000,8 +997,11 @@ def _kline_sqlite() -> kline_store.SqliteKlineStore:
     return _KLINE_SQLITE
 
 
-KLINE_STORE: kline_store.IKlineStore = (_kline_sqlite() if KLINE_STORE_KIND == "sqlite"
-                                        else KLINE_JSON)
+def _kline_store_for(kind: str) -> kline_store.IKlineStore:
+    return _kline_sqlite() if kind == "sqlite" else KLINE_JSON
+
+
+KLINE_STORE: kline_store.IKlineStore = _kline_store_for(STORE.kline_store() or KLINE_STORE_KIND)
 
 
 def _kline_coverage(symbol: str | None = None) -> dict[tuple[str, str], dict[str, Any]]:
@@ -1017,6 +1017,39 @@ def _kline_migrate(action: str) -> dict[str, Any]:
         return {"action": action, "sqlite_path": str(SQLITE_PATH),
                 **kline_store.verify(KLINE_JSON, _kline_sqlite(), span_ms=_tf_ms)}
     raise ValueError("action phai la import hoac verify")
+
+
+def _kline_sync(kind: str) -> dict[str, Any]:
+    sqlite = _kline_sqlite()
+    copied = (kline_store.import_json(KLINE_JSON, sqlite) if kind == "sqlite"
+              else kline_store.export_json(sqlite, KLINE_JSON))
+    report = kline_store.verify(KLINE_JSON, sqlite, span_ms=_tf_ms)
+    if kind == "sqlite":
+        bad = [p for p in report["pairs"] if p["missing_in_dst"] or p["ohlcv_mismatch"]]
+    else:
+        bad = [p for p in report["pairs"] if p["count"][1] and (
+            p["ohlcv_mismatch"] or p["last_open_time"][0] != p["last_open_time"][1])]
+    return {"ok": not bad, "copied": {"pairs": copied["pairs"], "rows_written": copied["rows_written"]},
+            "mismatched": [{k: p[k] for k in ("symbol", "tf", "count", "last_open_time",
+                                              "missing_in_dst", "ohlcv_mismatch")} for p in bad]}
+
+
+async def _kline_switch(kind: str) -> dict[str, Any]:
+    global KLINE_STORE
+    kind = str(kind or "").strip().lower()
+    if kind not in ("json", "sqlite"):
+        raise ValueError("kline_store phai la json hoac sqlite")
+    if kind == KLINE_STORE.kind:
+        return {"ok": True, "kind": kind, "changed": False}
+    keys = [(c["symbol"], c["tf"]) for c in KLINE_STORE.get_coverage()]
+    async with _fetch_locks(keys):
+        result = await asyncio.to_thread(_kline_sync, kind)
+        if not result["ok"]:
+            return {**result, "kind": KLINE_STORE.kind, "changed": False}
+        STORE.set_kline_store(kind)
+        KLINE_STORE = _kline_store_for(kind)
+    print(f"BAMCP kline_store -> {kind}", file=sys.stderr)
+    return {**result, "kind": kind, "changed": True}
 
 
 async def _fetch_one(client: httpx.AsyncClient, symbol: str,
@@ -4473,7 +4506,7 @@ async def http_admin(request):
         # TM - #GANN-TW - Gann Time Windows
         gann_path=ADMIN_GANN_PATH if GANN_ENABLED else "",
         # TM - #M5-FETCH - Per-timeframe schedules + M5
-        extra_links=[("Kéo nến", ADMIN_SCHEDULES_PATH, "lịch kéo nến theo từng khung"),
+        extra_links=[("Kéo nến", ADMIN_SCHEDULES_PATH, "lưu nến JSON/SQLite, lịch kéo theo khung"),
                      # TM - #ENTRY-ALERT - Entry setups & alerts
                      ("Vào lệnh", ADMIN_ALERTS_PATH, "setups, watcher, thông báo Discord/Telegram")],
     )
@@ -5256,7 +5289,27 @@ def _schedules_view() -> dict[str, Any]:
             "symbols": [r["symbol"] for r in STORE.symbols(DEFAULT_SYMBOL)],
             "mode": FETCH_MODE, "running": FETCH_SCHEDULER.running,
             "reload_seconds": FETCH.get("reload_seconds", 30),
-            "watcher_enabled": _watcher_active()}
+            "watcher_enabled": _watcher_active(), "storage": _kline_storage_view()}
+
+
+# TM - #KL-SQL - Kline storage SQLite
+def _kline_storage_view() -> dict[str, Any]:
+    stores = {"json": {(c["symbol"], c["tf"]): c for c in KLINE_JSON.get_coverage()},
+              "sqlite": {(c["symbol"], c["tf"]): c for c in _kline_sqlite().get_coverage()}}
+    order = {tf: i for i, tf in enumerate(SUPPORTED_TIMEFRAMES)}
+    keys = sorted(set(stores["json"]) | set(stores["sqlite"]),
+                  key=lambda k: (k[0], order.get(k[1], len(order)), k[1]))
+    rows = []
+    for key in keys:
+        row = {"symbol": key[0], "tf": key[1]}
+        for name, cov in stores.items():
+            item = cov.get(key)
+            row[name] = ({"count": item["count"],
+                          "last": (_run_time(item["last_open_time"]) or {}).get("local")}
+                         if item else None)
+        rows.append(row)
+    return {"kind": KLINE_STORE.kind, "source": "settings.json" if STORE.kline_store() else "config.yaml",
+            "sqlite_path": str(SQLITE_PATH), "retention_5m": _retention_for("5m"), "rows": rows}
 
 
 async def _schedules_action(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -5286,6 +5339,9 @@ async def _schedules_action(payload: dict[str, Any]) -> tuple[int, dict[str, Any
             item = SCHEDULES.get(str(payload.get("id") or ""))
             result = await FETCH_SCHEDULER.execute(item)
             return 200, {"ok": True, "result": result}
+        # TM - #KL-SQL - Kline storage SQLite
+        if action == "storage_switch":
+            return 200, await _kline_switch(str(payload.get("kind") or ""))
         return 400, {"error": f"action khong ho tro: {action!r}"}
     except ValueError as exc:
         return 400, {"error": str(exc)}

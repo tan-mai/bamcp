@@ -585,9 +585,11 @@ Nến đọc/ghi qua một interface (`kline_store.IKlineStore`) với hai bản
 
 ```yaml
 storage:
-  kline_store: "json"      # json | sqlite — hoặc biến môi trường BAMCP_KLINE_STORE
+  kline_store: "json"      # json | sqlite — giá trị mặc định, trang /admin/schedules thắng
   sqlite_path: "bamcp.db"  # tương đối so với data_root
 ```
+
+Đổi store ở mục **Nơi lưu nến** đầu trang `/admin/schedules`. Bảng ở đó cho thấy số nến và nến cuối của từng cặp × khung ở cả hai bên. Bấm chuyển thì server giữ khoá fetch của các cặp, chép nến sang store đích (JSON → SQLite: chép hết; SQLite → JSON: chép theo `retention` của từng khung), đối chiếu, khớp mới đổi. Lựa chọn lưu vào `settings.json`, có hiệu lực ngay, không cần restart, giữ nguyên qua redeploy. Còn lệch thì không đổi và trang liệt kê cặp × khung bị lệch.
 
 Bản `sqlite` chỉ lưu nến **đã đóng** (nến có `close_time > now` bị bỏ ngay ở tầng store), nên `current_bar` của `get_context` luôn rỗng. Không cắt theo `retention`. Bảng tự tạo khi khởi động.
 
@@ -595,7 +597,7 @@ Rollout:
 
 1. Deploy với `kline_store: json`, chạy import: `python kline_migrate.py import` (hoặc bảo Claude gọi `migrate_klines(action="import")`). Chạy lại nhiều lần không sinh trùng.
 2. Kiểm tra song song: `python kline_migrate.py verify` / `migrate_klines(action="verify")` — so số nến, `open_time` đầu/cuối và OHLCV từng nến cho mỗi cặp × khung. Phải ra `mismatches: 0`. Nến JSON mới về sau lần import cũng tính là lệch — chạy lại import rồi verify.
-3. Đổi `kline_store: sqlite` (hoặc `BAMCP_KLINE_STORE=sqlite`), restart. Giữ thư mục `klines/` 4 tuần để rollback, sau đó mới xoá.
+3. Bấm **Chuyển sang SQLite** ở `/admin/schedules` (bước này tự import + verify lại lần cuối). Giữ thư mục `klines/` 4 tuần để rollback bằng nút **Chuyển về JSON**, sau đó mới xoá.
 
 Backup — cron trên VPS mỗi đêm, giữ 14 bản. Không copy thẳng file khi DB đang mở:
 

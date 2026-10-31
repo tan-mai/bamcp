@@ -256,6 +256,16 @@ class SettingsStore:
         data["symbols"] = rows
         self._write(data)
 
+    # TM - #KL-SQL - Kline storage SQLite
+    def kline_store(self) -> str | None:
+        value = str(self.load().get("kline_store") or "").strip().lower()
+        return value if value in ("json", "sqlite") else None
+
+    def set_kline_store(self, kind: str) -> None:
+        data = self.load()
+        data["kline_store"] = kind
+        self._write(data)
+
     # ------------------------------------------------------------ hien thi
 
     def masked(self) -> dict[str, Any]:

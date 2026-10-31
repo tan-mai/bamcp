@@ -3,8 +3,7 @@
 # Bien moi truong thang config: BAMCP_HOST, BAMCP_PORT, BAMCP_ALLOWED_HOSTS,
 # BAMCP_DATA_ROOT, BAMCP_USERNAME, BAMCP_PASSWORD, BAMCP_SYMBOL, BAMCP_MARKET, TZ,
 # BAMCP_ACCOUNT_ENABLED (true/false - tat nhanh phan doc tai khoan khi test),
-# BAMCP_ORB_ENABLED (true/false - bat/tat module ORB),
-# BAMCP_KLINE_STORE (json/sqlite - TM - #KL-SQL - Kline storage SQLite).
+# BAMCP_ORB_ENABLED (true/false - bat/tat module ORB).
 
 server:
   host: "0.0.0.0"            # 0.0.0.0 khi chay trong container; 127.0.0.1 khi chay truc tiep sau Caddy
@@ -45,7 +44,7 @@ paths:
 
 # TM - #KL-SQL - Kline storage SQLite
 storage:
-  kline_store: "json"          # json | sqlite. Bien moi truong BAMCP_KLINE_STORE thang gia tri nay
+  kline_store: "json"          # json | sqlite. Mac dinh; doi o trang /admin/schedules (luu settings.json) thi trang do thang
   sqlite_path: "bamcp.db"      # tuong doi so voi data_root (Docker: /data/bamcp.db)
 
 fetcher:

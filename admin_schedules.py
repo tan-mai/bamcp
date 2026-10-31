@@ -74,6 +74,19 @@ PAGE = """<!doctype html>
   __MODE_WARNING__
 
   <div class="card">
+    <h2>Nơi lưu nến</h2>
+    <p class="hint">Đang dùng <strong>__STORE_KIND__</strong> (chọn ở __STORE_SOURCE__). Đổi ở đây có hiệu lực ngay,
+      không cần restart. SQLite: <code>__SQLITE_PATH__</code></p>
+    <div class="scroll"><table>
+      <thead><tr><th>Cặp</th><th>Khung</th>__STORE_HEAD__</tr></thead>
+      <tbody>__STORE_ROWS__</tbody>
+    </table></div>
+    <div class="actions">
+      <button type="button" class="primary" id="b_store" data-kind="__STORE_TARGET__">__STORE_BUTTON__</button>
+    </div>
+  </div>
+
+  <div class="card">
     <h2>Danh sách</h2>
     <p class="hint">Thay đổi có hiệu lực ngay. Scheduler tự đọc lại bảng mỗi __RELOAD__ giây.
       Xoá schedule không xoá nến đã lưu.</p>
@@ -111,6 +124,7 @@ PAGE = """<!doctype html>
 const ACTION = __ACTION_PATH__;
 const SCHEDULES = __SCHEDULES_JSON__;
 const WATCHER_ON = __WATCHER_ON__;
+const RETENTION_5M = __RETENTION_5M__;
 const $ = (id) => document.getElementById(id);
 
 function say(text, ok) {
@@ -171,6 +185,27 @@ $("b_save").addEventListener("click", async (e) => {
   const warns = (data.warnings || []).length ? "\\nCảnh báo: " + data.warnings.join("; ") : "";
   say("Đã lưu " + data.schedule.name + warns, true);
   setTimeout(() => location.reload(), warns ? 2500 : 600);
+});
+
+$("b_store").addEventListener("click", async (e) => {
+  const kind = e.target.dataset.kind;
+  const text = kind === "sqlite"
+    ? "Chuyển sang SQLite?\\n\\nChép toàn bộ nến JSON vào SQLite, đối chiếu từng nến, khớp hết mới chuyển. "
+      + "SQLite chỉ lưu nến đã đóng nên get_context không còn current_bar."
+    : "Chuyển về JSON?\\n\\nChép nến từ SQLite về file JSON rồi mới chuyển. File JSON chỉ giữ theo retention"
+      + (RETENTION_5M ? " (5m: " + RETENTION_5M + " nến gần nhất)" : "") + ", phần cũ hơn vẫn nằm trong SQLite.";
+  if (!confirm(text)) return;
+  say("Đang chép và đối chiếu nến…", true);
+  const data = await act({action: "storage_switch", kind: kind}, "", e.target);
+  if (!data) return;
+  if (!data.ok) {
+    say("Chưa chuyển — " + data.mismatched.length + " cặp×khung còn lệch sau khi chép: "
+        + data.mismatched.map((m) => m.symbol + " " + m.tf).join(", "), false);
+    return;
+  }
+  say("Đã chuyển sang " + data.kind + (data.copied ? " · chép " + data.copied.rows_written + " nến, "
+      + data.copied.pairs + " cặp×khung" : ""), true);
+  setTimeout(() => location.reload(), 1500);
 });
 
 $("b_reset").addEventListener("click", () => {
@@ -273,9 +308,32 @@ def _rows(items: list[dict[str, Any]]) -> str:
     return "".join(out)
 
 
+# TM - #KL-SQL - Kline storage SQLite
+STORE_NAMES = {"json": "JSON", "sqlite": "SQLite"}
+
+
+def _store_head(kind: str) -> str:
+    active = ' <span class="pill ok">đang dùng</span>'
+    return "".join(f"<th>{name}{active if key == kind else ''}</th>"
+                   for key, name in STORE_NAMES.items())
+
+
+def _store_rows(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return '<tr><td colspan="4" class="small">Chưa có nến nào.</td></tr>'
+    out = []
+    for row in rows:
+        cells = "".join(
+            f'<td>{_e(row[key]["count"])} nến<div class="small">cuối {_e(row[key]["last"])}</div></td>'
+            if row.get(key) else '<td class="small">—</td>' for key in STORE_NAMES)
+        out.append(f'<tr><td>{_e(row["symbol"])}</td><td><code>{_e(row["tf"])}</code></td>{cells}</tr>')
+    return "".join(out)
+
+
 def render(view: dict[str, Any], *, action_path: str, admin_path: str,
            setup_required: bool) -> str:
     items = view.get("schedules") or []
+    storage = view.get("storage") or {}
     mode_warning = ""
     if view.get("mode") != "schedules":
         mode_warning = ('<div class="warn">fetcher.mode đang là <code>interval</code>: vòng lặp cũ '
@@ -297,6 +355,15 @@ def render(view: dict[str, Any], *, action_path: str, admin_path: str,
         "__SCHEDULES_JSON__": _js([{k: i[k] for k in ("id", "name", "timeframe", "symbols", "cron",
                                                        "overlap_candles", "enabled")} for i in items]),
         "__WATCHER_ON__": _js(bool(view.get("watcher_enabled"))),
+        "__STORE_KIND__": _e(STORE_NAMES.get(storage.get("kind"), storage.get("kind"))),
+        "__STORE_SOURCE__": ("trang này, lưu trong settings.json" if storage.get("source") == "settings.json"
+                             else "config.yaml, storage.kline_store"),
+        "__SQLITE_PATH__": _e(storage.get("sqlite_path")),
+        "__STORE_HEAD__": _store_head(storage.get("kind")),
+        "__STORE_ROWS__": _store_rows(storage.get("rows") or []),
+        "__STORE_TARGET__": "json" if storage.get("kind") == "sqlite" else "sqlite",
+        "__STORE_BUTTON__": "Chuyển về JSON" if storage.get("kind") == "sqlite" else "Chuyển sang SQLite",
+        "__RETENTION_5M__": _js(storage.get("retention_5m")),
     }
     page = PAGE
     for needle, value in replacements.items():
