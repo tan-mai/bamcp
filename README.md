@@ -386,13 +386,18 @@ Lúc này `/admin` mở công khai nhưng **không ghi được gì nếu thiế
 
 ### Sau khi đăng nhập
 
-Trang admin có ba mục, làm hết trong một lần:
+Thanh trên cùng của mọi trang admin dẫn tới: **Cài đặt** (`/admin`), **Phiên ORB** (`/admin/orb`), **Gann** (`/admin/gann`), **Kéo nến** (`/admin/schedules`), **Vào lệnh** (`/admin/alerts`). Phiên ORB và Gann chỉ hiện khi module tương ứng bật (`orb.enabled`, `time_windows.enabled`).
+
+Trang **Cài đặt** chia hai cột — bên trái là kết nối, bên phải là quy định:
 
 1. **Truy cập API** — đổi username/mật khẩu về sau
 2. **Tài khoản sàn** — chọn binance/bybit/okx, dán API key read-only, bấm *Kiểm tra kết nối sàn* để xác nhận ngay tại chỗ
-3. **Quy định giao dịch** — 5 rule + ô lý do, kèm lịch sử 5 lần đổi gần nhất
+3. **Cặp giao dịch** — thêm / tắt / bỏ cặp theo dõi; các nút này có hiệu lực ngay khi bấm, không chờ Lưu
+4. **Quy định chung** — 4 rule áp cho cả tài khoản (quota, margin, margin swing, dừng ngày)
+5. **Quy định theo từng cặp** — 5 ngưỡng riêng của từng cặp (SL/TP theo điểm giá, ngưỡng swing, R:R); sửa được nhiều cặp rồi Lưu một lần
+6. **Lý do & lịch sử** — ô lý do (bắt buộc khi đổi rule), kèm lịch sử 5 lần đổi gần nhất
 
-Bấm Lưu một lần là cả ba mục cùng ghi. Mọi thay đổi có hiệu lực ngay, không cần khởi động lại.
+Nút **Lưu thay đổi** nằm trên thanh dính ở đáy màn hình, bấm một lần là mục 1, 2, 4, 5 cùng ghi. Mọi thay đổi có hiệu lực ngay, không cần khởi động lại.
 
 Xong bước này, `.env` và biến môi trường không còn vai trò gì nữa. Từ đó bạn quản lý theo hai đường, cùng đọc ghi một chỗ:
 

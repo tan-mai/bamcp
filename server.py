@@ -4432,6 +4432,18 @@ ADMIN_TEST_PATH = ADMIN_PATH.rstrip("/") + "/test"
 ADMIN_SYMBOL_PATH = ADMIN_PATH.rstrip("/") + "/symbols"
 
 
+def _admin_nav() -> list[tuple[str, str, str]]:
+    """Thanh dieu huong chung cua cac trang admin. Module dang tat thi an trang cua no."""
+    items = [("admin", "Cài đặt", ADMIN_PATH)]
+    if ORB_ENABLED:
+        items.append(("orb", "Phiên ORB", ADMIN_ORB_PATH))
+    if GANN_ENABLED:
+        items.append(("gann", "Gann", ADMIN_GANN_PATH))
+    items.append(("schedules", "Kéo nến", ADMIN_SCHEDULES_PATH))
+    items.append(("alerts", "Vào lệnh", ADMIN_ALERTS_PATH))
+    return items
+
+
 def _setup_ok(payload: dict[str, Any]) -> bool:
     """Truoc khi co mat khau, moi thao tac ghi phai kem setup token."""
     if STORE.has_auth():
@@ -4501,14 +4513,8 @@ async def http_admin(request):
         symbol_overrides={s: sorted(o) for s, o in doc["symbols"].items()},
         global_rule_keys=GLOBAL_RULE_KEYS,
         symbol_rule_keys=SYMBOL_RULE_KEYS,
-        # TM - #ORB - ORB Enhancement
-        orb_path=ADMIN_ORB_PATH if ORB_ENABLED else "",
-        # TM - #GANN-TW - Gann Time Windows
-        gann_path=ADMIN_GANN_PATH if GANN_ENABLED else "",
-        # TM - #M5-FETCH - Per-timeframe schedules + M5
-        extra_links=[("Kéo nến", ADMIN_SCHEDULES_PATH, "lưu nến JSON/SQLite, lịch kéo theo khung"),
-                     # TM - #ENTRY-ALERT - Entry setups & alerts
-                     ("Vào lệnh", ADMIN_ALERTS_PATH, "setups, watcher, thông báo Discord/Telegram")],
+        initial_timeframes=KL["timeframes"],
+        nav=_admin_nav(),
     )
     return HTMLResponse(page, headers={"Cache-Control": "no-store"})
 
@@ -4771,6 +4777,7 @@ def _orb_admin_page() -> str:
         # TM - #ORB-RULES - ORB Rule Set
         rules_view=_orb_rules_view(),
         rules_path=ADMIN_ORB_RULES_PATH,
+        nav=_admin_nav(),
     )
 
 
@@ -5232,7 +5239,8 @@ async def http_admin_gann(request):
             status_code=404, headers={"Cache-Control": "no-store"})
     view = await asyncio.to_thread(_gann_admin_view)
     page = admin_gann.render(view, action_path=ADMIN_GANN_ACTION_PATH,
-                             admin_path=ADMIN_PATH, setup_required=not STORE.has_auth())
+                             admin_path=ADMIN_PATH, setup_required=not STORE.has_auth(),
+                             nav=_admin_nav())
     return HTMLResponse(page, headers={"Cache-Control": "no-store"})
 
 
@@ -5351,7 +5359,8 @@ async def _schedules_action(payload: dict[str, Any]) -> tuple[int, dict[str, Any
 async def http_admin_schedules(request):
     from starlette.responses import HTMLResponse
     page = admin_schedules.render(_schedules_view(), action_path=ADMIN_SCHEDULES_ACTION_PATH,
-                                  admin_path=ADMIN_PATH, setup_required=not STORE.has_auth())
+                                  admin_path=ADMIN_PATH, setup_required=not STORE.has_auth(),
+                                  nav=_admin_nav())
     return HTMLResponse(page, headers={"Cache-Control": "no-store"})
 
 
@@ -5516,7 +5525,7 @@ async def http_admin_alerts(request):
     status = str(request.query_params.get("status") or "").strip()
     page = admin_entry.render(_alerts_view(date_text, status), action_path=ADMIN_ALERTS_ACTION_PATH,
                               admin_path=ADMIN_PATH, schedules_path=ADMIN_SCHEDULES_PATH,
-                              setup_required=not STORE.has_auth())
+                              setup_required=not STORE.has_auth(), nav=_admin_nav())
     return HTMLResponse(page, headers={"Cache-Control": "no-store"})
 
 

@@ -289,8 +289,10 @@ class OrbRuleSetServerTest(unittest.TestCase):
     def test_ac07_orb_quota_is_separate(self):
         self.log_orb("ldn")
         self.log_orb("ny")
+        # Cham cung or_date voi luc ghi: bo trong thi lay or_date cua phien ny (gio
+        # New York), lech voi ngay server tu 00:00 VN toi nua dem New York.
         self.assertIn(f"vuot orb.max_trades_per_day (2): da co 2 lenh ORB ngay {self.day}",
-                      self.check_orb()["orb_rule_violations"])
+                      self.check_orb(or_date=self.day)["orb_rule_violations"])
         other = self.check_other_ok()
         self.assertTrue(other["would_pass"], other["rule_violations"])
         status = run(server.get_today_status())
@@ -300,7 +302,7 @@ class OrbRuleSetServerTest(unittest.TestCase):
 
     def test_ac08_orb_daily_stop_is_separate(self):
         self.log_orb("ny", pnl=-25.5)
-        violations = self.check_orb()["orb_rule_violations"]
+        violations = self.check_orb(or_date=self.day)["orb_rule_violations"]   # nhu ac07
         self.assertTrue(any(v.startswith("da cham orb.daily_stop_loss") for v in violations),
                         violations)
         status = run(server.get_today_status())

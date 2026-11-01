@@ -28,7 +28,7 @@ RUN groupadd --system --gid 10001 bamcp \
 COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
-COPY server.py exchanges.py settings.py admin.py probe.py config.yaml ./
+COPY server.py exchanges.py settings.py admin.py admin_ui.py probe.py config.yaml ./
 # ORB: logic thuan, M5 lich su, scheduler + state, backtest, trang quan ly phien
 COPY orb.py orb_history.py orb_runtime.py orb_backtest.py admin_orb.py ./
 # TM - #ORB-RULES - ORB Rule Set: bo rule ORB rieng (orb.py import module nay)

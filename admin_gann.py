@@ -10,6 +10,8 @@ import html
 import json
 from typing import Any
 
+import admin_ui
+
 # symbols KHONG nam o day: no co o bat/tat rieng (muc "Cap phan tich Gann").
 SECTIONS = ("pivots", "projections", "scoring", "backtest", "context")
 SECTION_HINTS = {
@@ -20,86 +22,13 @@ SECTION_HINTS = {
     "context": "Hai field Gann trong get_context. time_windows đang tắt vì backtest chưa thấy hiệu ứng.",
 }
 
-PAGE = """<!doctype html>
-<html lang="vi">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BAMCP — Gann Time Windows</title>
-<style>
-  :root {
-    --bg: #f6f7f9; --card: #fff; --ink: #16181d; --muted: #6b7280;
-    --line: #e3e6ea; --accent: #1f6feb; --ok: #0f7b47; --err: #b4232c;
-    --warn-bg: #fff8e6; --warn-line: #f0d089;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #0f1115; --card: #171a20; --ink: #e6e8ec; --muted: #9aa3af;
-      --line: #262b33; --accent: #4a90e2; --ok: #49c17e; --err: #ef6b73;
-      --warn-bg: #2a2415; --warn-line: #5c4d20;
-    }
-  }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--ink);
-    font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
-  .wrap { max-width: 980px; margin: 0 auto; padding: 32px 16px 64px; }
-  h1 { font-size: 21px; margin: 0 0 4px; }
-  .sub { color: var(--muted); font-size: 13px; margin: 0 0 24px; }
-  .sub a { color: var(--accent); }
-  .card { background: var(--card); border: 1px solid var(--line);
-    border-radius: 10px; padding: 20px; margin-bottom: 18px; }
-  .card h2 { font-size: 15px; margin: 0 0 6px; }
-  .card > .hint:first-of-type { margin-bottom: 14px; }
-  label { display:block; font-size:13px; color:var(--muted); margin:12px 0 5px; }
-  input[type=text], input[type=date], input[type=number], select, textarea {
-    width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:7px;
-    background:var(--bg); color:var(--ink); font:inherit; font-size:14px; }
-  textarea { font-family: ui-monospace,"Cascadia Code",Consolas,monospace; font-size:12.5px;
-    min-height: 120px; resize: vertical; }
-  input:focus, select:focus, textarea:focus { outline:2px solid var(--accent); outline-offset:-1px; }
-  .row { display:flex; gap:12px; flex-wrap:wrap; } .row > * { flex:1; min-width:140px; }
-  .hint { font-size:12px; color:var(--muted); margin-top:4px; }
-  .actions { display:flex; gap:10px; align-items:center; margin-top:14px; flex-wrap:wrap; }
-  button { font:inherit; font-size:13px; padding:7px 14px; border-radius:7px;
-    border:1px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; }
-  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
-  button.danger { color:var(--err); }
-  button:disabled { opacity:.55; cursor:default; }
-  #msg { position: sticky; top: 0; z-index: 2; font-size:13px; white-space:pre-wrap;
-    padding: 8px 12px; border-radius: 8px; margin-bottom: 14px; display:none; }
-  #msg.ok { display:block; color:var(--ok); background:var(--card); border:1px solid var(--ok); }
-  #msg.err { display:block; color:var(--err); background:var(--card); border:1px solid var(--err); }
-  .warn { background:var(--warn-bg); border:1px solid var(--warn-line);
-    border-radius:8px; padding:12px 14px; font-size:13px; margin-bottom:18px; }
-  code { font-family: ui-monospace,"Cascadia Code",Consolas,monospace; font-size:12.5px; }
-  .scroll { overflow-x:auto; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th { text-align:left; font-weight:600; color:var(--muted); font-size:12px;
-    padding:6px 8px 6px 0; border-bottom:1px solid var(--line); white-space:nowrap; }
-  td { padding:7px 8px 7px 0; border-bottom:1px solid var(--line); vertical-align:top; }
-  tr:last-child td { border-bottom:none; }
-  td.num { font-variant-numeric: tabular-nums; white-space:nowrap; }
-  td.act { text-align:right; white-space:nowrap; }
-  td.act button { padding:3px 9px; font-size:12px; margin-left:4px; }
-  .pill { display:inline-block; font-size:11px; padding:1px 8px; border-radius:99px;
-    border:1px solid var(--line); white-space:nowrap; }
-  .pill.ok { color:var(--ok); border-color:var(--ok); }
-  .pill.err { color:var(--err); border-color:var(--err); }
-  .small { font-size:12px; color:var(--muted); }
-  details { margin-top:14px; border-top:1px solid var(--line); padding-top:10px; }
-  summary { cursor:pointer; font-size:13px; font-weight:600; }
-  .tabs { display:flex; gap:6px; flex-wrap:wrap; margin: 4px 0 12px; }
-  .tabs button.on { border-color:var(--accent); color:var(--accent); font-weight:600; }
-</style>
-</head>
-<body>
-<div class="wrap">
+PAGE = """<div class="page-head">
   <h1>Gann Time Windows</h1>
-  <p class="sub">Pivot, cửa sổ thời gian, backtest. <a href="__ADMIN_PATH__">← cài đặt chung</a>
-    · config đang chạy: <code>__CONFIG_VERSION__</code></p>
-  <div id="msg"></div>
-  __SETUP_BANNER__
-  __CFG_WARNING__
+  <p class="sub">Pivot, cửa sổ thời gian, backtest · config đang chạy: <code>__CONFIG_VERSION__</code></p>
+</div>
+<div id="msg" data-msg="toast"></div>
+__SETUP_BANNER__
+__CFG_WARNING__
 
   <div class="card">
     <h2>Cặp phân tích Gann</h2>
@@ -150,7 +79,7 @@ PAGE = """<!doctype html>
       <div class="hint">Khung 1w: ngày là thứ Hai mở tuần.</div>
       <div class="actions"><button class="primary" id="mp_add">Thêm</button></div>
     </details>
-    <h2 style="margin-top:18px">Đang áp dụng</h2>
+    <h3>Đang áp dụng</h3>
     <div class="scroll"><table>
       <thead><tr><th>Cặp</th><th>Khung</th><th>Thao tác</th><th>Loại</th><th>Ngày</th>
         <th>Bậc</th><th>Ghi chú</th><th></th></tr></thead>
@@ -190,7 +119,6 @@ PAGE = """<!doctype html>
   </div>
 
   __SETUP_FIELD__
-</div>
 
 <script>
 const ACTION_PATH = __ACTION_PATH__;
@@ -200,7 +128,6 @@ function say(text, ok) {
   const m = $("msg");
   m.textContent = text;
   m.className = ok ? "ok" : "err";
-  if (!ok) window.scrollTo({top: 0, behavior: "smooth"});
 }
 
 async function send(payload) {
@@ -284,8 +211,6 @@ $("ev_add").addEventListener("click", (e) => {
        weight: Number($("ev_weight").value || 1), symbols: symbols}, "Đã thêm sự kiện", e.target);
 });
 </script>
-</body>
-</html>
 """
 
 SETUP_BANNER = """<div class="warn">
@@ -386,7 +311,7 @@ def _pivot_lists(symbols: list[dict[str, Any]]) -> str:
         hidden = "" if n == 0 else ' style="display:none"'
         blocks.append(
             f'<div data-symbol="{sym}"{hidden}>'
-            f'<div class="scroll"><table><thead><tr><th>Khung</th><th>Loại</th><th>Ngày</th>'
+            f'<div class="scroll tall"><table><thead><tr><th>Khung</th><th>Loại</th><th>Ngày</th>'
             f'<th>Giá</th><th>Bậc</th><th>Biên độ</th><th></th></tr></thead>'
             f'<tbody>{body}</tbody></table></div>'
             f'<div class="hint">20 pivot 1d gần nhất + 10 pivot 1w gần nhất.</div></div>')
@@ -484,7 +409,7 @@ def _backtest(result: dict[str, Any] | None) -> str:
         + '<p class="hint">p (dịch ±): mỗi cửa sổ dịch ngẫu nhiên ±shift_days, giữ chế độ biến động — '
           'con số chính. p (toàn cục) nhỏ mà p (dịch ±) lớn nghĩa là hiệu ứng đến từ chế độ biến động, '
           'không phải từ thời điểm Gann.</p>'
-        + '<h2 style="margin-top:16px">Theo loại chiếu (range_atr)</h2>'
+        + '<h3>Theo loại chiếu (range_atr)</h3>'
         + '<div class="scroll"><table><thead><tr><th>Loại</th><th>Lift</th><th>p</th>'
           '<th>Ngày chạm</th><th>Trọng số đề xuất</th><th></th></tr></thead><tbody>'
         + "".join(types) + '</tbody></table></div>'
@@ -517,8 +442,8 @@ def _config_sections(config: dict[str, Any]) -> str:
 
 
 def render(view: dict[str, Any], *, action_path: str, admin_path: str,
-           setup_required: bool) -> str:
-    """view = server._gann_admin_view()."""
+           setup_required: bool, nav: list[admin_ui.NavItem] | None = None) -> str:
+    """view = server._gann_admin_view(); nav = thanh dieu huong chung (server._admin_nav())."""
     symbols = view.get("symbols") or []
     options = "".join(f'<option>{_e(r["symbol"])}</option>' for r in symbols)
     warning = view.get("config_warning")
@@ -545,4 +470,5 @@ def render(view: dict[str, Any], *, action_path: str, admin_path: str,
     page = PAGE
     for needle, value in replacements.items():
         page = page.replace(needle, value)
-    return page
+    return admin_ui.page(title="Gann Time Windows", active="gann", body=page,
+                         nav=nav or admin_ui.fallback_nav(admin_path))

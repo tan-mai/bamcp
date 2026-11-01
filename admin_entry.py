@@ -5,125 +5,32 @@ import html
 import json
 from typing import Any
 
-PAGE = """<!doctype html>
-<html lang="vi">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BAMCP — Setups &amp; cảnh báo</title>
-<style>
-  :root { --bg:#f6f7f9; --card:#fff; --ink:#16181d; --muted:#6b7280; --line:#e3e6ea;
-    --accent:#1f6feb; --ok:#0f7b47; --err:#b4232c; --warn-bg:#fff8e6; --warn-line:#f0d089; }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg:#0f1115; --card:#171a20; --ink:#e6e8ec; --muted:#9aa3af; --line:#262b33;
-      --accent:#4a90e2; --ok:#49c17e; --err:#ef6b73; --warn-bg:#2a2415; --warn-line:#5c4d20; }
-  }
-  * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--ink);
-    font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
-  .wrap { max-width:1180px; margin:0 auto; padding:32px 16px 64px; }
-  h1 { font-size:21px; margin:0 0 4px; }
-  .sub { color:var(--muted); font-size:13px; margin:0 0 24px; }
-  .sub a { color:var(--accent); }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
-    padding:20px; margin-bottom:18px; }
-  .card h2 { font-size:15px; margin:0 0 6px; }
-  label { display:block; font-size:13px; color:var(--muted); margin:12px 0 5px; }
-  input[type=text], input[type=number], input[type=date], input[type=password], select, textarea {
-    width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:7px;
-    background:var(--bg); color:var(--ink); font:inherit; font-size:14px; }
-  textarea { font-family:ui-monospace,"Cascadia Code",Consolas,monospace; font-size:12.5px; min-height:60px; }
-  select[multiple] { min-height:80px; }
-  .row { display:flex; gap:12px; flex-wrap:wrap; } .row > * { flex:1; min-width:130px; }
-  .hint { font-size:12px; color:var(--muted); margin-top:4px; }
-  .actions { display:flex; gap:10px; align-items:center; margin-top:14px; flex-wrap:wrap; }
-  button { font:inherit; font-size:13px; padding:7px 14px; border-radius:7px;
-    border:1px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; }
-  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
-  button.danger { color:var(--err); }
-  button:disabled { opacity:.55; cursor:default; }
-  #msg { position:sticky; top:0; z-index:2; font-size:13px; white-space:pre-wrap;
-    padding:8px 12px; border-radius:8px; margin-bottom:14px; display:none; }
-  #msg.ok { display:block; color:var(--ok); background:var(--card); border:1px solid var(--ok); }
-  #msg.err { display:block; color:var(--err); background:var(--card); border:1px solid var(--err); }
-  .warn { background:var(--warn-bg); border:1px solid var(--warn-line); border-radius:8px;
-    padding:12px 14px; font-size:13px; margin-bottom:18px; }
-  code { font-family:ui-monospace,"Cascadia Code",Consolas,monospace; font-size:12.5px; }
-  .scroll { overflow-x:auto; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th { text-align:left; font-weight:600; color:var(--muted); font-size:12px;
-    padding:6px 8px 6px 0; border-bottom:1px solid var(--line); white-space:nowrap; }
-  td { padding:7px 8px 7px 0; border-bottom:1px solid var(--line); vertical-align:top; }
-  td.num { font-variant-numeric:tabular-nums; white-space:nowrap; }
-  td.act { text-align:right; white-space:nowrap; }
-  td.act button { padding:3px 9px; font-size:12px; margin-left:4px; }
-  table.params input { padding:4px 6px; font-size:13px; }
-  .pill { display:inline-block; font-size:11px; padding:1px 8px; border-radius:99px;
-    border:1px solid var(--line); white-space:nowrap; }
-  .pill.go { color:var(--ok); border-color:var(--ok); }
-  .pill.no { color:var(--err); border-color:var(--err); }
-  .small { font-size:12px; color:var(--muted); }
-  tr.timeline td { background:var(--bg); }
-</style>
-</head>
-<body>
-<div class="wrap">
+import admin_ui
+
+CSS = """
+  table.params td { vertical-align:middle; }
+  table.params input[type=text] { min-width:90px; }
+  tr.timeline > td { background:var(--surface-2); }
+  .row > .end.pad { padding-bottom:9px; }
+"""
+
+PAGE = """<div class="page-head">
   <h1>Setups &amp; cảnh báo vào lệnh</h1>
-  <p class="sub">Watcher xét setup trên mỗi nến M5 đã đóng và báo qua Discord / Telegram.
-    <a href="__ADMIN_PATH__">← cài đặt chung</a> · <a href="__SCHEDULES_PATH__">lịch kéo nến</a></p>
-  <div id="msg"></div>
-  __SETUP_BANNER__
-  __CFG_WARNING__
-
-  <div class="card">
-    <h2>Thông báo</h2>
-    <p class="hint">Secret hiển thị dạng che; để trống ô thì giữ giá trị cũ. Lưu ở <code>__ALERTS_FILE__</code>,
-      có hiệu lực ngay.</p>
-    <div class="row">
-      <div><label for="n_channel">Kênh</label><select id="n_channel">__CHANNEL_OPTIONS__</select></div>
-      <div><label for="n_tz">Giờ hiển thị trong tin</label>
-        <input type="text" id="n_tz" value="__DISPLAY_TZ__"></div>
-    </div>
-    <label for="n_webhook">Discord webhook URL <span class="small">__WEBHOOK_MASK__</span></label>
-    <input type="password" id="n_webhook" autocomplete="off" placeholder="https://discord.com/api/webhooks/...">
-    <div class="row">
-      <div><label for="n_token">Telegram bot token <span class="small">__TOKEN_MASK__</span></label>
-        <input type="password" id="n_token" autocomplete="off"></div>
-      <div><label for="n_chat">Telegram chat id <span class="small">__CHAT_MASK__</span></label>
-        <input type="password" id="n_chat" autocomplete="off"></div>
-    </div>
-    <div class="actions">
-      <button type="button" class="primary" id="b_notify">Lưu thông báo</button>
-      <button type="button" id="b_test">Gửi tin thử</button>
-    </div>
-  </div>
-
-  <div class="card">
-    <h2>Watcher</h2>
-    <p class="hint">Chạy ở giây thứ 20 sau mỗi mốc 5 phút. Lần quét gần nhất: __LAST_SCAN__</p>
-    <div class="row">
-      <div><label><input type="checkbox" id="w_enabled"__W_ENABLED__> Bật watcher</label></div>
-      <div><label for="w_deadline">plan_deadline_utc (HH:MM UTC)</label>
-        <input type="text" id="w_deadline" value="__W_DEADLINE__"></div>
-    </div>
-    <label for="w_symbols">watch_symbols</label>
-    <select id="w_symbols" multiple>__W_SYMBOL_OPTIONS__</select>
-    <label>Tham số mặc định và override theo cặp (ô trống = kế thừa mặc định)</label>
-    <div class="scroll"><table class="params"><thead><tr><th>Tham số</th><th>Mặc định</th>__PARAM_HEAD__</tr></thead>
-      <tbody>__PARAM_ROWS__</tbody></table></div>
-    <p class="hint">Thứ tự ưu tiên: trigger_params của setup → override theo cặp → mặc định.
-      max_chase không có mặc định: watcher tự tính cho từng setup.</p>
-    <div class="actions"><button type="button" class="primary" id="b_watcher">Lưu watcher</button></div>
-  </div>
+  <p class="sub">Watcher xét setup trên mỗi nến M5 đã đóng (xem <a href="__SCHEDULES_PATH__">lịch kéo nến</a>)
+    và báo qua Discord / Telegram.</p>
+</div>
+<div id="msg" data-msg="toast"></div>
+__SETUP_BANNER__
+__CFG_WARNING__
 
   <div class="card">
     <h2>Setups</h2>
     <form class="row" method="get">
       <div><label for="q_date">bias_date</label><input type="date" id="q_date" name="date" value="__Q_DATE__"></div>
       <div><label for="q_status">Trạng thái</label><select id="q_status" name="status">__STATUS_OPTIONS__</select></div>
-      <div><label>&nbsp;</label><button type="submit">Lọc</button></div>
+      <div class="end" style="flex:0 0 auto"><button type="submit">Lọc</button></div>
     </form>
-    <div class="scroll"><table>
+    <div class="scroll" style="margin-top:16px"><table>
       <thead><tr><th>Code</th><th>Hướng</th><th>Trạng thái</th><th>Vùng</th><th>Entry / SL / TP</th>
         <th>Trigger</th><th>Hết hạn</th><th>Event gần nhất</th><th></th></tr></thead>
       <tbody id="setup_rows">__SETUP_ROWS__</tbody>
@@ -151,17 +58,59 @@ PAGE = """<!doctype html>
       <div><label for="s_ctype">confirm_type</label><select id="s_ctype"><option value="">không</option>
         <option>close_above</option><option>close_below</option></select></div>
       <div><label for="s_clevel">confirm_level</label><input type="number" step="any" id="s_clevel"></div>
-      <div><label for="s_chase">max_chase (trống = tự tính)</label><input type="number" step="any" id="s_chase"></div>
-      <div><label for="s_expires">expires_at (YYYY-MM-DD HH:MM, trống = hết ngày)</label><input type="text" id="s_expires"></div>
-      <div><label><input type="checkbox" id="s_m15" checked> m15_filter</label></div>
+      <div><label for="s_chase">max_chase</label><input type="number" step="any" id="s_chase" placeholder="trống = tự tính"></div>
+      <div><label for="s_expires">expires_at <span class="small">· trống = hết ngày</span></label>
+        <input type="text" id="s_expires" placeholder="YYYY-MM-DD HH:MM"></div>
+      <div class="end pad"><label class="check"><input type="checkbox" id="s_m15" checked> m15_filter</label></div>
     </div>
     <label for="s_params">trigger_params (JSON, tuỳ chọn)</label>
-    <textarea id="s_params" placeholder='{"vol_mult": 1.8, "ref_low": 67100}'></textarea>
+    <textarea id="s_params" rows="3" placeholder='{"vol_mult": 1.8, "ref_low": 67100}'></textarea>
     <label for="s_note">Ghi chú</label><input type="text" id="s_note">
     <div class="actions"><button type="button" class="primary" id="b_create">Tạo setup</button></div>
   </div>
+
+  <div class="card">
+    <h2>Watcher</h2>
+    <p class="hint">Chạy ở giây thứ 20 sau mỗi mốc 5 phút. Lần quét gần nhất: __LAST_SCAN__</p>
+    <div class="row">
+      <div><label for="w_deadline">plan_deadline_utc (HH:MM UTC)</label>
+        <input type="text" id="w_deadline" value="__W_DEADLINE__"></div>
+      <div class="end pad"><label class="check"><input type="checkbox" id="w_enabled"__W_ENABLED__> Bật watcher</label></div>
+    </div>
+    <label for="w_symbols">watch_symbols</label>
+    <select id="w_symbols" multiple>__W_SYMBOL_OPTIONS__</select>
+    <div class="hint">Giữ Ctrl / Cmd để chọn nhiều.</div>
+    <label>Tham số mặc định và override theo cặp (ô trống = kế thừa mặc định)</label>
+    <div class="scroll"><table class="params"><thead><tr><th>Tham số</th><th>Mặc định</th>__PARAM_HEAD__</tr></thead>
+      <tbody>__PARAM_ROWS__</tbody></table></div>
+    <p class="hint">Thứ tự ưu tiên: trigger_params của setup → override theo cặp → mặc định.
+      max_chase không có mặc định: watcher tự tính cho từng setup.</p>
+    <div class="actions"><button type="button" class="primary" id="b_watcher">Lưu watcher</button></div>
+  </div>
+
+  <div class="card">
+    <h2>Thông báo</h2>
+    <p class="hint">Secret hiển thị dạng che; để trống ô thì giữ giá trị cũ. Lưu ở <code>__ALERTS_FILE__</code>,
+      có hiệu lực ngay.</p>
+    <div class="row">
+      <div><label for="n_channel">Kênh</label><select id="n_channel">__CHANNEL_OPTIONS__</select></div>
+      <div><label for="n_tz">Giờ hiển thị trong tin</label>
+        <input type="text" id="n_tz" value="__DISPLAY_TZ__"></div>
+    </div>
+    <label for="n_webhook">Discord webhook URL <span class="small">__WEBHOOK_MASK__</span></label>
+    <input type="password" id="n_webhook" autocomplete="off" placeholder="https://discord.com/api/webhooks/...">
+    <div class="row">
+      <div><label for="n_token">Telegram bot token <span class="small">__TOKEN_MASK__</span></label>
+        <input type="password" id="n_token" autocomplete="off"></div>
+      <div><label for="n_chat">Telegram chat id <span class="small">__CHAT_MASK__</span></label>
+        <input type="password" id="n_chat" autocomplete="off"></div>
+    </div>
+    <div class="actions">
+      <button type="button" class="primary" id="b_notify">Lưu thông báo</button>
+      <button type="button" id="b_test">Gửi tin thử</button>
+    </div>
+  </div>
   __SETUP_FIELD__
-</div>
 <script>
 const ACTION = __ACTION_PATH__;
 const PARAM_KEYS = __PARAM_KEYS__;
@@ -276,8 +225,6 @@ document.addEventListener("click", async (e) => {
   }
 });
 </script>
-</body>
-</html>
 """
 
 SETUP_BANNER = """<div class="warn">
@@ -362,7 +309,7 @@ def _param_rows(keys: list[str], defaults: dict[str, Any], overrides: dict[str, 
 
 
 def render(view: dict[str, Any], *, action_path: str, admin_path: str, schedules_path: str,
-           setup_required: bool) -> str:
+           setup_required: bool, nav: list[admin_ui.NavItem] | None = None) -> str:
     notify = view["notify"]
     watcher = view["watcher"]
     override_symbols = view["override_symbols"]
@@ -370,7 +317,6 @@ def render(view: dict[str, Any], *, action_path: str, admin_path: str, schedules
     scan_text = (f'{scan.get("at_text")} · cặp {", ".join(scan.get("symbols") or []) or "—"}'
                  + (f' · lỗi {scan["errors"]}' if scan.get("errors") else "")) if scan else "chưa quét"
     replacements = {
-        "__ADMIN_PATH__": _e(admin_path),
         "__SCHEDULES_PATH__": _e(schedules_path),
         "__SETUP_BANNER__": SETUP_BANNER if setup_required else "",
         "__SETUP_FIELD__": SETUP_FIELD if setup_required else "",
@@ -403,4 +349,5 @@ def render(view: dict[str, Any], *, action_path: str, admin_path: str, schedules
     page = PAGE
     for needle, value in replacements.items():
         page = page.replace(needle, value)
-    return page
+    return admin_ui.page(title="Setups & cảnh báo", active="alerts", body=page, css=CSS,
+                         nav=nav or admin_ui.fallback_nav(admin_path))

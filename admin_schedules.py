@@ -5,89 +5,22 @@ import html
 import json
 from typing import Any
 
-PAGE = """<!doctype html>
-<html lang="vi">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BAMCP — Fetch schedules</title>
-<style>
-  :root { --bg:#f6f7f9; --card:#fff; --ink:#16181d; --muted:#6b7280; --line:#e3e6ea;
-    --accent:#1f6feb; --ok:#0f7b47; --err:#b4232c; --warn-bg:#fff8e6; --warn-line:#f0d089; }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg:#0f1115; --card:#171a20; --ink:#e6e8ec; --muted:#9aa3af; --line:#262b33;
-      --accent:#4a90e2; --ok:#49c17e; --err:#ef6b73; --warn-bg:#2a2415; --warn-line:#5c4d20; }
-  }
-  * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--ink);
-    font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
-  .wrap { max-width:1080px; margin:0 auto; padding:32px 16px 64px; }
-  h1 { font-size:21px; margin:0 0 4px; }
-  .sub { color:var(--muted); font-size:13px; margin:0 0 24px; }
-  .sub a { color:var(--accent); }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
-    padding:20px; margin-bottom:18px; }
-  .card h2 { font-size:15px; margin:0 0 6px; }
-  label { display:block; font-size:13px; color:var(--muted); margin:12px 0 5px; }
-  input[type=text], input[type=number], select { width:100%; padding:8px 10px;
-    border:1px solid var(--line); border-radius:7px; background:var(--bg); color:var(--ink);
-    font:inherit; font-size:14px; }
-  select[multiple] { min-height:96px; }
-  .row { display:flex; gap:12px; flex-wrap:wrap; } .row > * { flex:1; min-width:150px; }
-  .hint { font-size:12px; color:var(--muted); margin-top:4px; }
-  .actions { display:flex; gap:10px; align-items:center; margin-top:14px; flex-wrap:wrap; }
-  button { font:inherit; font-size:13px; padding:7px 14px; border-radius:7px;
-    border:1px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; }
-  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
-  button.danger { color:var(--err); }
-  button:disabled { opacity:.55; cursor:default; }
-  #msg { position:sticky; top:0; z-index:2; font-size:13px; white-space:pre-wrap;
-    padding:8px 12px; border-radius:8px; margin-bottom:14px; display:none; }
-  #msg.ok { display:block; color:var(--ok); background:var(--card); border:1px solid var(--ok); }
-  #msg.err { display:block; color:var(--err); background:var(--card); border:1px solid var(--err); }
-  .warn { background:var(--warn-bg); border:1px solid var(--warn-line); border-radius:8px;
-    padding:12px 14px; font-size:13px; margin-bottom:18px; }
-  code { font-family:ui-monospace,"Cascadia Code",Consolas,monospace; font-size:12.5px; }
-  .scroll { overflow-x:auto; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th { text-align:left; font-weight:600; color:var(--muted); font-size:12px;
-    padding:6px 8px 6px 0; border-bottom:1px solid var(--line); white-space:nowrap; }
-  td { padding:7px 8px 7px 0; border-bottom:1px solid var(--line); vertical-align:top; }
-  tr:last-child td { border-bottom:none; }
-  td.act { text-align:right; white-space:nowrap; }
-  td.act button { padding:3px 9px; font-size:12px; margin-left:4px; }
-  .pill { display:inline-block; font-size:11px; padding:1px 8px; border-radius:99px;
-    border:1px solid var(--line); white-space:nowrap; }
-  .pill.ok { color:var(--ok); border-color:var(--ok); }
-  .pill.err { color:var(--err); border-color:var(--err); }
-  .small { font-size:12px; color:var(--muted); }
-  ul.runs { margin:6px 0 0; padding-left:18px; font-size:13px; }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <h1>Fetch schedules</h1>
-  <p class="sub">Mỗi khung một lịch kéo nến riêng, cron 6 trường có giây, giờ UTC.
-    <a href="__ADMIN_PATH__">← cài đặt chung</a></p>
-  <div id="msg"></div>
-  __SETUP_BANNER__
-  __MODE_WARNING__
+import admin_ui
+
+CSS = """
+  ul.runs { margin:10px 0 0; padding-left:18px; font-size:13px; }
+"""
+
+PAGE = """<div class="page-head">
+  <h1>Kéo nến</h1>
+  <p class="sub">Mỗi khung một lịch kéo nến riêng, cron 6 trường có giây, giờ UTC.</p>
+</div>
+<div id="msg" data-msg="toast"></div>
+__SETUP_BANNER__
+__MODE_WARNING__
 
   <div class="card">
-    <h2>Nơi lưu nến</h2>
-    <p class="hint">Đang dùng <strong>__STORE_KIND__</strong> (chọn ở __STORE_SOURCE__). Đổi ở đây có hiệu lực ngay,
-      không cần restart. SQLite: <code>__SQLITE_PATH__</code></p>
-    <div class="scroll"><table>
-      <thead><tr><th>Cặp</th><th>Khung</th>__STORE_HEAD__</tr></thead>
-      <tbody>__STORE_ROWS__</tbody>
-    </table></div>
-    <div class="actions">
-      <button type="button" class="primary" id="b_store" data-kind="__STORE_TARGET__">__STORE_BUTTON__</button>
-    </div>
-  </div>
-
-  <div class="card">
-    <h2>Danh sách</h2>
+    <h2>Lịch kéo nến</h2>
     <p class="hint">Thay đổi có hiệu lực ngay. Scheduler tự đọc lại bảng mỗi __RELOAD__ giây.
       Xoá schedule không xoá nến đã lưu.</p>
     <div class="scroll"><table>
@@ -113,13 +46,25 @@ PAGE = """<!doctype html>
     <div class="hint">Giữ Ctrl / Cmd để chọn nhiều.</div>
     <div id="preview" class="small"></div>
     <div class="actions">
-      <button type="button" id="b_preview">Xem 3 lần chạy kế tiếp</button>
       <button type="button" class="primary" id="b_save">Lưu</button>
+      <button type="button" id="b_preview">Xem 3 lần chạy kế tiếp</button>
       <button type="button" id="b_reset">Huỷ sửa</button>
     </div>
   </div>
+
+  <div class="card">
+    <h2>Nơi lưu nến <span class="pill ok">__STORE_KIND__</span></h2>
+    <p class="hint">Đang dùng <strong>__STORE_KIND__</strong> (chọn ở __STORE_SOURCE__). Đổi ở đây có hiệu lực ngay,
+      không cần restart. SQLite: <code>__SQLITE_PATH__</code></p>
+    <div class="scroll"><table>
+      <thead><tr><th>Cặp</th><th>Khung</th>__STORE_HEAD__</tr></thead>
+      <tbody>__STORE_ROWS__</tbody>
+    </table></div>
+    <div class="actions">
+      <button type="button" id="b_store" data-kind="__STORE_TARGET__">__STORE_BUTTON__</button>
+    </div>
+  </div>
   __SETUP_FIELD__
-</div>
 <script>
 const ACTION = __ACTION_PATH__;
 const SCHEDULES = __SCHEDULES_JSON__;
@@ -253,8 +198,6 @@ document.addEventListener("change", async (e) => {
   say((box.checked ? "Đã bật " : "Đã tắt ") + item.name, true);
 });
 </script>
-</body>
-</html>
 """
 
 SETUP_BANNER = """<div class="warn">
@@ -331,7 +274,7 @@ def _store_rows(rows: list[dict[str, Any]]) -> str:
 
 
 def render(view: dict[str, Any], *, action_path: str, admin_path: str,
-           setup_required: bool) -> str:
+           setup_required: bool, nav: list[admin_ui.NavItem] | None = None) -> str:
     items = view.get("schedules") or []
     storage = view.get("storage") or {}
     mode_warning = ""
@@ -343,7 +286,6 @@ def render(view: dict[str, Any], *, action_path: str, admin_path: str,
         mode_warning = ('<div class="warn">Scheduler chưa chạy (fetcher.enabled = false hoặc server '
                         'chưa khởi động xong).</div>')
     replacements = {
-        "__ADMIN_PATH__": _e(admin_path),
         "__SETUP_BANNER__": SETUP_BANNER if setup_required else "",
         "__SETUP_FIELD__": SETUP_FIELD if setup_required else "",
         "__MODE_WARNING__": mode_warning,
@@ -368,4 +310,5 @@ def render(view: dict[str, Any], *, action_path: str, admin_path: str,
     page = PAGE
     for needle, value in replacements.items():
         page = page.replace(needle, value)
-    return page
+    return admin_ui.page(title="Kéo nến", active="schedules", body=page, css=CSS,
+                         nav=nav or admin_ui.fallback_nav(admin_path))

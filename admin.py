@@ -10,84 +10,21 @@ import html
 import json
 from typing import Any
 
-PAGE = """<!doctype html>
-<html lang="vi">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BAMCP — Cài đặt</title>
-<style>
-  :root {
-    --bg: #f6f7f9; --card: #fff; --ink: #16181d; --muted: #6b7280;
-    --line: #e3e6ea; --accent: #1f6feb; --ok: #0f7b47; --err: #b4232c;
-    --warn-bg: #fff8e6; --warn-line: #f0d089;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #0f1115; --card: #171a20; --ink: #e6e8ec; --muted: #9aa3af;
-      --line: #262b33; --accent: #4a90e2; --ok: #49c17e; --err: #ef6b73;
-      --warn-bg: #2a2415; --warn-line: #5c4d20;
-    }
-  }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--ink);
-    font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
-  .wrap { max-width: 680px; margin: 0 auto; padding: 32px 20px 64px; }
-  h1 { font-size: 21px; margin: 0 0 4px; }
-  .sub { color: var(--muted); font-size: 13px; margin: 0 0 24px; }
-  .card { background: var(--card); border: 1px solid var(--line);
-    border-radius: 10px; padding: 20px; margin-bottom: 18px; }
-  .card h2 { font-size: 15px; margin: 0 0 16px; letter-spacing: .01em; }
-  label { display:block; font-size:13px; color:var(--muted); margin:14px 0 5px; }
-  label:first-of-type { margin-top: 0; }
-  input[type=text], input[type=password], select {
-    width:100%; padding:9px 11px; border:1px solid var(--line); border-radius:7px;
-    background:var(--bg); color:var(--ink); font:inherit; font-size:14px; }
-  input:focus, select:focus { outline:2px solid var(--accent); outline-offset:-1px; }
-  .row { display:flex; gap:14px; } .row > * { flex:1; }
-  .hint { font-size:12px; color:var(--muted); margin-top:5px; }
-  .check { display:flex; align-items:center; gap:9px; margin-bottom:4px; }
-  .check input { width:16px; height:16px; accent-color:var(--accent); }
-  .check label { margin:0; color:var(--ink); font-size:14px; }
-  .actions { display:flex; gap:10px; align-items:center; margin-top:22px; }
-  button { font:inherit; font-size:14px; padding:9px 18px; border-radius:7px;
-    border:1px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; }
-  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
-  button:disabled { opacity:.55; cursor:default; }
-  #msg { margin-top:16px; font-size:13px; white-space:pre-wrap; }
-  #msg.ok { color:var(--ok); } #msg.err { color:var(--err); }
-  .warn { background:var(--warn-bg); border:1px solid var(--warn-line);
-    border-radius:8px; padding:13px 15px; font-size:13px; margin-bottom:18px; }
-  code { font-family: ui-monospace,"Cascadia Code",Consolas,monospace; font-size:12.5px; }
-  .meta { font-size:12px; color:var(--muted); margin-top:20px; }
-  .hist { margin-top:16px; border-top:1px solid var(--line); padding-top:12px; }
-  .hist h3 { font-size:12px; color:var(--muted); margin:0 0 8px; font-weight:600; }
-  .hist ul { list-style:none; margin:0; padding:0; }
-  .hist li { font-size:12px; color:var(--muted); padding:3px 0; }
-  .hist b { color:var(--ink); font-weight:600; }
-  table.syms { width:100%; border-collapse:collapse; }
-  table.syms td { padding:7px 0; border-bottom:1px solid var(--line); font-size:14px; }
-  table.syms tr:last-child td { border-bottom:none; }
-  table.syms td.sym { font-weight:600; font-family:ui-monospace,Consolas,monospace; }
-  table.syms td.st { color:var(--muted); font-size:12px; }
-  table.syms td.act { text-align:right; white-space:nowrap; }
-  table.syms button { padding:4px 10px; font-size:12px; margin-left:6px; }
-  .off td.sym, .off td.st { opacity:.45; }
-</style>
-</head>
-<body><div class="wrap">
+import admin_ui
 
-<h1>BAMCP — Cài đặt</h1>
-<p class="sub">Lưu vào <code>__SETTINGS_PATH__</code>, tồn tại qua mọi lần tạo lại container.</p>
-__ORB_LINK__
-__GANN_LINK__
-__EXTRA_LINKS__
+PAGE = """<div class="page-head">
+  <h1>Cài đặt</h1>
+  <p class="sub">Lưu vào <code>__SETTINGS_PATH__</code>, tồn tại qua mọi lần tạo lại container.</p>
+</div>
 
 __SETUP_BANNER__
 
 <form id="f">
-  <div class="card">
+<div class="cols">
+<div>
+  <section class="card">
     <h2>Truy cập API</h2>
+    <p class="desc">Basic auth cho <code>/mcp</code> và chính các trang admin này.</p>
     <label for="username">Tên đăng nhập</label>
     <input type="text" id="username" name="username" value="__USERNAME__" autocomplete="username">
     <div class="row">
@@ -101,16 +38,14 @@ __SETUP_BANNER__
         <input type="password" id="password2" name="password2" autocomplete="new-password">
       </div>
     </div>
-    <div class="hint">Tối thiểu 8 ký tự. Để trống nếu không muốn đổi. Dùng cho Basic auth của <code>/mcp</code> và chính trang này.</div>
-  </div>
+    <div class="hint">Tối thiểu 8 ký tự. Để trống nếu không muốn đổi.</div>
+  </section>
 
-  <div class="card">
+  <section class="card">
     <h2>Tài khoản sàn</h2>
-    <div class="check">
-      <input type="checkbox" id="exchange_enabled" name="exchange_enabled" __EX_CHECKED__>
-      <label for="exchange_enabled">Đọc dữ liệu tài khoản thật</label>
-    </div>
-    <div class="hint">Tắt thì mọi số liệu lệnh và PnL chỉ đến từ nhật ký bạn tự ghi.</div>
+    <p class="desc">Tắt thì mọi số liệu lệnh và PnL chỉ đến từ nhật ký bạn tự ghi.</p>
+    <label class="check"><input type="checkbox" id="exchange_enabled" name="exchange_enabled" __EX_CHECKED__>
+      Đọc dữ liệu tài khoản thật</label>
 
     <div class="row">
       <div>
@@ -128,39 +63,46 @@ __SETUP_BANNER__
     <input type="password" id="api_key" name="api_key" autocomplete="off"
            placeholder="__KEY_PLACEHOLDER__">
 
-    <label for="api_secret">API Secret</label>
-    <input type="password" id="api_secret" name="api_secret" autocomplete="off"
-           placeholder="__SECRET_PLACEHOLDER__">
+    <div class="row">
+      <div>
+        <label for="api_secret">API Secret</label>
+        <input type="password" id="api_secret" name="api_secret" autocomplete="off"
+               placeholder="__SECRET_PLACEHOLDER__">
+      </div>
+      <div>
+        <label for="api_passphrase">Passphrase <span class="small">— chỉ OKX</span></label>
+        <input type="password" id="api_passphrase" name="api_passphrase" autocomplete="off"
+               placeholder="__PASS_PLACEHOLDER__">
+      </div>
+    </div>
 
-    <label for="api_passphrase">Passphrase <span class="hint" style="display:inline">— chỉ OKX</span></label>
-    <input type="password" id="api_passphrase" name="api_passphrase" autocomplete="off"
-           placeholder="__PASS_PLACEHOLDER__">
+    <div class="warn">Key phải là <strong>read-only</strong>: tắt quyền trade, tắt quyền rút tiền, bật IP whitelist. Ba ô trên để trống nghĩa là giữ nguyên giá trị đang lưu.</div>
+  </section>
 
-    <div class="hint">Key phải là <strong>read-only</strong>: tắt quyền trade, tắt quyền rút tiền, bật IP whitelist. Ba ô trên để trống nghĩa là giữ nguyên giá trị đang lưu.</div>
-  </div>
-
-  <div class="card">
+  <section class="card">
     <h2>Cặp giao dịch</h2>
-    <div class="hint" style="margin-bottom:14px">Mỗi cặp được pull tự động ở cả 5 khung (W, D, H4, H1, M15) theo cùng chu kỳ, và có bias riêng. Quy định giao dịch thì dùng chung cho tất cả các cặp.</div>
+    <p class="desc">Nến của mỗi cặp được kéo theo lịch ở trang __SCHEDULES_LINK__, và mỗi cặp có bias riêng. Quota, margin và mức dừng ngày dùng chung cho cả tài khoản; ngưỡng SL/TP và R:R đặt riêng từng cặp ở mục <em>Quy định theo từng cặp</em>.</p>
 
-    <table class="syms"><tbody>__SYMBOL_ROWS__</tbody></table>
+    <div class="scroll"><table class="syms"><tbody>__SYMBOL_ROWS__</tbody></table></div>
 
-    <div class="row" style="margin-top:14px">
-      <div style="flex:2">
+    <div class="row">
+      <div style="flex:3 1 200px">
         <label for="new_symbol">Thêm cặp mới</label>
         <input type="text" id="new_symbol" placeholder="ETHUSDT, ADAUSDT, SOLUSDT..."
                autocomplete="off" style="text-transform:uppercase">
       </div>
-      <div style="flex:1;display:flex;align-items:flex-end">
-        <button type="button" id="add_symbol" style="width:100%">Thêm</button>
+      <div class="end" style="flex:1 1 100px">
+        <button type="button" id="add_symbol" class="w100">Thêm</button>
       </div>
     </div>
-    <div class="hint">Server hỏi Binance xem cặp có thật không trước khi thêm, rồi kéo dữ liệu ban đầu ngay — không phải chờ hết chu kỳ 15 phút.</div>
-  </div>
+    <div class="hint">Server hỏi Binance xem cặp có thật không trước khi thêm, rồi kéo ngay nến ban đầu các khung __INITIAL_TFS__ — không phải chờ tới lượt chạy kế tiếp của lịch. Khung khác (vd 5m) chỉ có nến khi lịch của khung đó kéo cả cặp này.</div>
+  </section>
+</div>
 
-  <div class="card">
-    <h2>Quy định chung — áp cho mọi cặp</h2>
-    <div class="hint" style="margin-bottom:14px">Tài khoản chỉ có một, nên ngân sách rủi ro cũng chỉ có một. Hết quota là hết, dù lệnh nằm ở cặp nào.</div>
+<div>
+  <section class="card">
+    <h2>Quy định chung <span class="pill">mọi cặp</span></h2>
+    <p class="desc">Tài khoản chỉ có một, nên ngân sách rủi ro cũng chỉ có một. Hết quota là hết, dù lệnh nằm ở cặp nào.</p>
     <div class="row">
       <div>
         <label for="max_trades_per_day">Số lệnh tối đa / ngày</label>
@@ -183,17 +125,17 @@ __SETUP_BANNER__
         <div class="hint"><strong>0 = không giới hạn.</strong></div>
       </div>
     </div>
-  </div>
+  </section>
 
-  <div class="card">
+  <section class="card">
     <h2>Quy định theo từng cặp</h2>
-    <div class="hint" style="margin-bottom:14px">Ngưỡng SL/TP đo bằng <strong>điểm giá</strong>, mà điểm của mỗi cặp là một thứ khác nhau — 300 điểm trên BTC với 300 điểm trên ADA không nói lên cùng một điều. Vì vậy mỗi cặp giữ ngưỡng riêng.</div>
+    <p class="desc">Ngưỡng SL/TP đo bằng <strong>điểm giá</strong>, mà điểm của mỗi cặp là một thứ khác nhau — 300 điểm trên BTC với 300 điểm trên ADA không nói lên cùng một điều. Vì vậy mỗi cặp giữ ngưỡng riêng.</p>
 
     <label for="rule_symbol">Đang sửa cặp</label>
     <select id="rule_symbol">__RULE_SYMBOL_OPTIONS__</select>
     <div class="hint" id="sr_note"></div>
 
-    <div class="row" style="margin-top:14px">
+    <div class="row">
       <div>
         <label for="sr_max_stop_points">SL tối đa (điểm)</label>
         <input type="text" inputmode="decimal" id="sr_max_stop_points">
@@ -218,33 +160,34 @@ __SETUP_BANNER__
       <div>
         <label for="sr_min_rr">R:R tối thiểu</label>
         <input type="text" inputmode="decimal" id="sr_min_rr">
-        <div class="hint">TP ÷ SL tính từ giá vào, phải &gt; 0. Áp cho mọi lệnh không phải ORB — lệnh ORB dùng <code>orb.min_rr</code> ở trang ORB.</div>
       </div>
       <div></div>
     </div>
+    <div class="hint">R:R = TP ÷ SL tính từ giá vào, phải &gt; 0. Áp cho mọi lệnh không phải ORB — lệnh ORB dùng <code>orb.min_rr</code> ở trang ORB.</div>
     <div class="hint">Dán nhãn "swing" không lách được hạn mức: lệnh chỉ được hưởng bộ hạn mức swing khi TP thực sự đạt ngưỡng của <em>chính cặp đó</em>, nếu không nó tự động bị hạ về scalp và việc đó được ghi lại.</div>
     <div class="hint">Đổi được nhiều cặp trong một lần — chuyển cặp ở ô trên, sửa tiếp, rồi bấm Lưu một lần.</div>
-  </div>
+  </section>
 
-  <div class="card">
+  <section class="card">
     <h2>Lý do &amp; lịch sử</h2>
     <label for="rules_reason">Lý do đổi</label>
     <input type="text" id="rules_reason" placeholder="bắt buộc khi có thay đổi — vd: siết lại sau tuần lỗ">
     <div class="hint">Mọi thay đổi đều vào sổ lịch sử kèm lý do và mốc thời gian, dù đổi ở đây hay qua Claude, dù là rule chung hay rule của một cặp. Đổi trong ngày đang giao dịch sẽ hiện lại trong <code>get_today_status</code>.</div>
 
     __RULES_HISTORY__
-  </div>
+  </section>
+</div>
+</div>
 
   __SETUP_FIELD__
 
-  <div class="actions">
-    <button type="submit" class="primary" id="save">Lưu</button>
+  <div class="actionbar">
+    <button type="submit" class="primary" id="save">Lưu thay đổi</button>
     <button type="button" id="test">Kiểm tra kết nối sàn</button>
+    <div id="msg" data-msg="inline"></div>
+    <span class="meta">Cập nhật lần cuối: __UPDATED__</span>
   </div>
-  <div id="msg"></div>
 </form>
-
-<p class="meta">Cập nhật lần cuối: __UPDATED__</p>
 
 <script>
 const GLOBAL_RULE_KEYS = __GLOBAL_RULE_KEYS__;
@@ -387,7 +330,6 @@ $("test").addEventListener("click", async () => {
   say(ok ? (out.message || "Kết nối được.") : (out.error || "Không kết nối được."), ok);
 });
 </script>
-</div></body></html>
 """
 
 SETUP_BANNER = """<div class="warn">
@@ -409,20 +351,24 @@ def _history_block(history: list[dict[str, Any]]) -> str:
     """Vai lan doi rule gan nhat. Hien ngay tren trang de viec doi rule khong am tham.
 
     Dong nao co ten cap thi gan nhan cap do - nhin lai phan biet duoc "siet ca
-    tai khoan" voi "chi siet mot cap".
+    tai khoan" voi "chi siet mot cap". Lan doi nhieu truong (vd migrate) chi
+    hien vai truong dau, phan con lai gap vao <details>.
     """
     if not history:
         return ""
     items = []
     for entry in reversed(history[-5:]):
-        parts = ", ".join(
-            f"{html.escape(k)} {info.get('from')} → {info.get('to')}"
+        parts = [
+            f"{html.escape(k)} {html.escape(str(info.get('from')))} → {html.escape(str(info.get('to')))}"
             for k, info in (entry.get("changes") or {}).items()
-        )
+        ]
+        more = (f'<details><summary>+{len(parts) - 4} thay đổi khác</summary>'
+                f'{", ".join(parts[4:])}</details>' if len(parts) > 4 else "")
         when = html.escape(str(entry.get("at", ""))[:16].replace("T", " "))
         why = html.escape(str(entry.get("reason", "")))
         scope = html.escape(str(entry.get("symbol") or "")) or "chung"
-        items.append(f"<li><b>{when}</b> <b>[{scope}]</b> — {parts}<br>{why}</li>")
+        items.append(f'<li><b>{when}</b> <span class="pill">{scope}</span> {why}'
+                     f'<div>{", ".join(parts[:4])}</div>{more}</li>')
     return ('<div class="hist"><h3>Thay đổi gần đây</h3><ul>'
             + "".join(items) + "</ul></div>")
 
@@ -440,23 +386,23 @@ def _symbol_rows(symbols: list[dict[str, Any]], ready: dict[str, bool]) -> str:
     """Bang cac cap dang theo doi. Chi con mot cap thi an nut Bo - server cung
     tu choi, nhung an di thi nguoi dung khong phai thu moi biet."""
     if not symbols:
-        return '<tr><td class="st">Chưa có cặp nào.</td></tr>'
+        return '<tr><td class="small">Chưa có cặp nào.</td></tr>'
     rows = []
     for item in symbols:
         sym = html.escape(item["symbol"])
         on = item["enabled"]
         has_data = ready.get(item["symbol"], False)
-        status = ("đang theo dõi" if on else "đã tắt")
+        status, css = ("đang theo dõi", "ok") if on else ("đã tắt", "")
         if on and not has_data:
-            status = "đang chờ dữ liệu về"
+            status, css = "đang chờ dữ liệu về", "warn"
         toggle = "disable" if on else "enable"
         toggle_label = "Tắt" if on else "Bật"
         remove = ("" if len(symbols) <= 1 else
-                  f'<button type="button" data-sym="{sym}" data-act="remove">Bỏ</button>')
+                  f'<button type="button" class="danger" data-sym="{sym}" data-act="remove">Bỏ</button>')
         rows.append(
             f'<tr class="{"" if on else "off"}">'
             f'<td class="sym">{sym}</td>'
-            f'<td class="st">{status}</td>'
+            f'<td><span class="pill {css}">{status}</span></td>'
             f'<td class="act">'
             f'<button type="button" data-sym="{sym}" data-act="{toggle}">{toggle_label}</button>'
             f'{remove}</td></tr>'
@@ -477,15 +423,18 @@ def render(state: dict[str, Any], *, settings_path: str, save_path: str,
            symbol_overrides: dict[str, list[str]],
            global_rule_keys: tuple[str, ...],
            symbol_rule_keys: tuple[str, ...],
-           orb_path: str = "", gann_path: str = "",
-           extra_links: list[tuple[str, str, str]] | None = None) -> str:
+           initial_timeframes: list[str] | tuple[str, ...] = (),
+           nav: list[admin_ui.NavItem] | None = None) -> str:
     """Dung HTML tu trang thai da duoc che giau. Khong nhan secret that.
 
     `rules` la rule chung + mac dinh; `symbol_rules` la gia tri da giai cho tung
     cap. Hai bo di hai duong rieng vi chung duoc luu o hai cho khac nhau.
+    `initial_timeframes` = cac khung keo ngay khi them cap (klines.timeframes).
+    `nav` = thanh dieu huong chung (server._admin_nav()).
     """
     configured = bool(state.get("auth_configured"))
     current = state.get("exchange_name") or ""
+    schedules_path = next((path for key, _label, path in nav or [] if key == "schedules"), "")
 
     rule_symbols = [row["symbol"] for row in symbols if row["symbol"] in symbol_rules]
     rule_symbol_options = "".join(
@@ -521,8 +470,7 @@ def render(state: dict[str, Any], *, settings_path: str, save_path: str,
         "__EX_CHECKED__": "checked" if state.get("exchange_enabled") else "",
         "__EX_OPTIONS__": options,
         "__EX_SYMBOL__": html.escape(state.get("exchange_symbol") or ""),
-        "__KEY_HINT__": (f'<span class="hint" style="display:inline">— '
-                         f'{html.escape(state["key_hint"])}</span>'
+        "__KEY_HINT__": (f'<span class="small">— {html.escape(state["key_hint"])}</span>'
                          if state.get("key_hint") else ""),
         "__KEY_PLACEHOLDER__": placeholder(state.get("key_hint") or ""),
         "__SECRET_PLACEHOLDER__": placeholder(state.get("secret_set") or ""),
@@ -541,19 +489,12 @@ def render(state: dict[str, Any], *, settings_path: str, save_path: str,
         "__SYMBOL_PATH__": html.escape(symbol_path),
         "__SYMBOL_ROWS__": _symbol_rows(symbols, symbol_ready),
         "__RULES_HISTORY__": _history_block(rules_history),
-        # TM - #ORB - ORB Enhancement: loi vao trang quan ly phien ORB
-        "__ORB_LINK__": (f'<p class="sub">Phiên ORB: <a href="{html.escape(orb_path)}">'
-                         f'quản lý phiên giao dịch ORB</a></p>' if orb_path else ""),
-        # TM - #GANN-TW - Gann Time Windows: loi vao trang Gann
-        "__GANN_LINK__": (f'<p class="sub">Gann: <a href="{html.escape(gann_path)}">'
-                          f'pivot, cửa sổ thời gian, backtest</a></p>' if gann_path else ""),
-        # TM - #M5-FETCH - Per-timeframe schedules + M5
-        "__EXTRA_LINKS__": "".join(
-            f'<p class="sub">{html.escape(label)}: <a href="{html.escape(path)}">'
-            f'{html.escape(text)}</a></p>' for label, path, text in (extra_links or [])),
+        "__SCHEDULES_LINK__": (f'<a href="{html.escape(schedules_path)}">Kéo nến</a>'
+                               if schedules_path else "Kéo nến"),
+        "__INITIAL_TFS__": html.escape(", ".join(initial_timeframes) or "chính"),
     }
 
     page = PAGE
     for needle, value in replacements.items():
         page = page.replace(needle, value)
-    return page
+    return admin_ui.page(title="Cài đặt", active="admin", nav=nav or [], body=page)

@@ -22,6 +22,7 @@ import json
 from typing import Any, Callable
 from zoneinfo import available_timezones
 
+import admin_ui
 import orb
 from orb import iso_utc, iso_vn
 
@@ -139,104 +140,27 @@ def handle(payload: dict[str, Any], *, sessions: Any, now_ms: int,
 
 # ---------------------------------------------------------------- HTML
 
-PAGE = """<!doctype html>
-<html lang="vi">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BAMCP — Phiên ORB</title>
-<style>
-  :root {
-    --bg: #f6f7f9; --card: #fff; --ink: #16181d; --muted: #6b7280;
-    --line: #e3e6ea; --accent: #1f6feb; --ok: #0f7b47; --err: #b4232c;
-    --warn-bg: #fff8e6; --warn-line: #f0d089;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #0f1115; --card: #171a20; --ink: #e6e8ec; --muted: #9aa3af;
-      --line: #262b33; --accent: #4a90e2; --ok: #49c17e; --err: #ef6b73;
-      --warn-bg: #2a2415; --warn-line: #5c4d20;
-    }
-  }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--ink);
-    font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
-  .wrap { max-width: 980px; margin: 0 auto; padding: 32px 16px 64px; }
-  h1 { font-size: 21px; margin: 0 0 4px; }
-  .sub { color: var(--muted); font-size: 13px; margin: 0 0 24px; }
-  .sub a { color: var(--accent); }
-  .card { background: var(--card); border: 1px solid var(--line);
-    border-radius: 10px; padding: 20px; margin-bottom: 18px; }
-  .card h2 { font-size: 15px; margin: 0 0 16px; letter-spacing: .01em; }
-  label { display:block; font-size:13px; color:var(--muted); margin:14px 0 5px; }
-  input[type=text], input[type=time], input[type=password], select {
-    width:100%; padding:9px 11px; border:1px solid var(--line); border-radius:7px;
-    background:var(--bg); color:var(--ink); font:inherit; font-size:14px; }
-  input:focus, select:focus { outline:2px solid var(--accent); outline-offset:-1px; }
-  input:disabled { opacity:.6; }
-  .row { display:flex; gap:14px; flex-wrap:wrap; } .row > * { flex:1; min-width:180px; }
-  .hint { font-size:12px; color:var(--muted); margin-top:5px; }
-  .ferr { font-size:12px; color:var(--err); margin-top:4px; min-height:0; }
-  .days { display:flex; flex-wrap:wrap; gap:6px 14px; }
-  .days label, .check label { display:inline-flex; align-items:center; gap:6px; margin:0;
-    color:var(--ink); font-size:14px; }
-  .check { margin-top:16px; }
-  input[type=checkbox] { width:16px; height:16px; accent-color:var(--accent); }
-  .actions { display:flex; gap:10px; align-items:center; margin-top:22px; flex-wrap:wrap; }
-  button { font:inherit; font-size:14px; padding:9px 18px; border-radius:7px;
-    border:1px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; }
-  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
-  button.danger { color:var(--err); }
-  button:disabled { opacity:.55; cursor:default; }
-  #msg { margin-top:16px; font-size:13px; white-space:pre-wrap; }
-  #msg.ok { color:var(--ok); } #msg.err { color:var(--err); }
-  .warn { background:var(--warn-bg); border:1px solid var(--warn-line);
-    border-radius:8px; padding:13px 15px; font-size:13px; margin-bottom:18px; }
-  code { font-family: ui-monospace,"Cascadia Code",Consolas,monospace; font-size:12.5px; }
-  .scroll { overflow-x:auto; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th { text-align:left; font-weight:600; color:var(--muted); font-size:12px;
-    padding:6px 8px 6px 0; border-bottom:1px solid var(--line); white-space:nowrap; }
-  td { padding:8px 8px 8px 0; border-bottom:1px solid var(--line); vertical-align:top; }
-  tr:last-child td { border-bottom:none; }
-  td.id { font-family:ui-monospace,Consolas,monospace; font-weight:600; }
-  td.act { text-align:right; white-space:nowrap; }
-  td.act button { padding:4px 10px; font-size:12px; margin-left:4px; }
-  .off td:not(.act) { opacity:.5; }
-  .pill { display:inline-block; font-size:11px; padding:1px 8px; border-radius:99px;
-    border:1px solid var(--line); white-space:nowrap; }
-  .pill.ok { color:var(--ok); border-color:var(--ok); }
-  .pill.err { color:var(--err); border-color:var(--err); }
-  .small { font-size:12px; color:var(--muted); }
-  details { margin-top:18px; border-top:1px solid var(--line); padding-top:12px; }
-  summary { cursor:pointer; font-size:13px; font-weight:600; }
+CSS = """
+  .days { display:flex; flex-wrap:wrap; gap:8px 18px; padding:4px 0; }
+  .days label { display:inline-flex; align-items:center; gap:6px; margin:0; color:var(--ink);
+    font-size:14px; font-weight:400; cursor:pointer; }
+  form .check { margin-top:16px; }
+  .ferr { font-size:12px; color:var(--err); margin-top:4px; }
+  .ferr:empty { display:none; }
   #preview { margin-top:18px; }
-  .hist li { font-size:12px; color:var(--muted); padding:3px 0; }
-  .hist ul { list-style:none; margin:0; padding:0; }
-  .hist b { color:var(--ink); }
-  /* TM - #ORB-RULES - ORB Rule Set */
-  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px;
-    margin:14px 0 4px; }
-  .stat { border:1px solid var(--line); border-radius:8px; padding:9px 11px; }
-  .stat b { display:block; font-size:16px; }
-  .stat span { font-size:12px; color:var(--muted); }
-  .stat.bad b { color:var(--err); }
   table.rules td { vertical-align:middle; }
-  table.rules input, table.rules select { padding:6px 9px; font-size:13px; min-width:110px; }
+  table.rules input, table.rules select { min-width:120px; }
   table.rules tr.lock td { opacity:.55; }
   td.eff { white-space:nowrap; }
   td.eff.changed { color:var(--accent); font-weight:600; }
-  .warn ul { margin:6px 0 0; padding-left:18px; }
   .okbox { font-size:13px; color:var(--ok); margin-top:10px; }
-  #r_msg, #n_msg { margin-top:12px; font-size:13px; white-space:pre-wrap; }
-  #r_msg.ok, #n_msg.ok { color:var(--ok); } #r_msg.err, #n_msg.err { color:var(--err); }
-</style>
-</head>
-<body><div class="wrap">
+"""
 
-<h1>BAMCP — Phiên ORB</h1>
-<p class="sub">Lưu vào <code>__STORE_PATH__</code>. <a href="__ADMIN_PATH__">← Cài đặt chung</a>
- · Giờ server lúc tải trang: __NOW__</p>
+PAGE = """<div class="page-head">
+  <h1>Phiên ORB</h1>
+  <p class="sub">Lưu vào <code>__STORE_PATH__</code> · Giờ server lúc tải trang: __NOW__</p>
+</div>
+
 
 __SETUP_BANNER__
 
@@ -325,17 +249,18 @@ __RULES_CARD__
     <button type="button" id="btn_preview">Xem trước 3 lần mở</button>
     <button type="button" id="btn_new">Thêm phiên mới</button>
   </div>
-  <div id="msg"></div>
+  <div id="msg" data-msg="inline"></div>
 </form>
-
-<div class="card hist">
-  <h2>Thay đổi gần đây</h2>
-  __HISTORY__
-</div>
 
 __NEWS_CARD__
 
+<div class="cols">
+<div class="card hist">
+  <h2>Lịch sử phiên</h2>
+  __HISTORY__
+</div>
 __RULES_HISTORY__
+</div>
 
 <script>
 const SESSIONS = __SESSIONS_JSON__;
@@ -605,7 +530,6 @@ if (RULES) {
   });
 }
 </script>
-</div></body></html>
 """
 
 SETUP_BANNER = """<div class="warn">
@@ -729,9 +653,9 @@ def _rules_card(view: dict[str, Any]) -> str:
                       for s in view.get("scopes") or [])
     return f"""<div class="card" id="rules_card">
   <h2>Rule ORB <span class="pill {"ok" if on else "err"}">{"đang bật" if on else "đang tắt"}</span></h2>
-  <div class="small">Bộ rule riêng cho lệnh ORB, tách khỏi rule scalp/swing — chỉ <code>max_margin_per_trade</code>
+  <p class="desc">Bộ rule riêng cho lệnh ORB, tách khỏi rule scalp/swing — chỉ <code>max_margin_per_trade</code>
   dùng chung. Lưu trong <code>{_e(view.get("rules_file"))}</code> (khối <code>orb</code>); sửa ở đây hay qua
-  <code>update_rules(orb=true)</code> đều ghi lịch sử và có hiệu lực ngay, không cần restart.</div>
+  <code>update_rules(orb=true)</code> đều ghi lịch sử và có hiệu lực ngay, không cần restart.</p>
   <div class="stats">{stats}</div>
   {_warnings_box(missing, "Thiếu rule bắt buộc — lệnh ORB sẽ bị chặn:")}
   {_warnings_box(view.get("warnings") or [], "Cảnh báo cấu hình:")}
@@ -755,7 +679,7 @@ def _rules_card(view: dict[str, Any]) -> str:
     <button type="button" id="r_preview_btn">Xem trước</button>
     <button type="button" class="{"danger" if on else ""}" id="r_toggle">{"Tắt ORB" if on else "Bật ORB"}</button>
   </div>
-  <div id="r_msg"></div>
+  <div id="r_msg" data-msg="inline"></div>
 </div>"""
 
 
@@ -770,8 +694,8 @@ def _news_card(view: dict[str, Any]) -> str:
         rows = '<tr><td colspan="3" class="small">Chưa có ngày tin nào.</td></tr>'
     return f"""<div class="card" id="news_card">
   <h2>Ngày tin lớn (news days)</h2>
-  <div class="small">Ngày theo lịch của phiên (or_date). Khi <code>skip_news_days</code> bật, phiên của ngày này
-  bị lọc <code>news_day</code> và không có plan. Lưu trong <code>{_e(view.get("news_file"))}</code>.</div>
+  <p class="desc">Ngày theo lịch của phiên (or_date). Khi <code>skip_news_days</code> bật, phiên của ngày này
+  bị lọc <code>news_day</code> và không có plan. Lưu trong <code>{_e(view.get("news_file"))}</code>.</p>
   <div class="scroll"><table><thead><tr><th>Ngày</th><th>Ghi chú</th><th></th></tr></thead>
   <tbody>{rows}</tbody></table></div>
   <div class="row">
@@ -779,7 +703,7 @@ def _news_card(view: dict[str, Any]) -> str:
     <div><label for="n_note">Ghi chú</label><input type="text" id="n_note" maxlength="200" placeholder="vd: FOMC, CPI"></div>
   </div>
   <div class="actions"><button type="button" id="n_add">Thêm ngày tin</button></div>
-  <div id="n_msg"></div>
+  <div id="n_msg" data-msg="inline"></div>
 </div>"""
 
 
@@ -830,10 +754,11 @@ def render(*, rows: list[dict[str, Any]], sessions: list[dict[str, Any]],
            history: list[dict[str, Any]], action_path: str, admin_path: str,
            store_path: str, global_params: dict[str, Any], setup_required: bool,
            now_ms: int, rules_view: dict[str, Any] | None = None,
-           rules_path: str = "") -> str:
+           rules_path: str = "", nav: list[admin_ui.NavItem] | None = None) -> str:
     """rows = OrbService.list_sessions(True); sessions = ban goc de do vao form sua.
     TM - #ORB-RULES - ORB Rule Set: rules_view = server._orb_rules_view() (None -> an
-    muc Rule ORB), rules_path = POST luu rule / news days."""
+    muc Rule ORB), rules_path = POST luu rule / news days.
+    nav = thanh dieu huong chung (server._admin_nav()); bo trong = chi link ve admin_path."""
     tz_options = "".join(f'<option value="{_e(z)}">' for z in sorted(available_timezones())
                          if "/" in z and not z.startswith(("Etc/", "SystemV/", "posix/", "right/")))
     day_boxes = "".join(
@@ -841,7 +766,6 @@ def render(*, rows: list[dict[str, Any]], sessions: list[dict[str, Any]],
         for d in orb.DAY_NAMES)
     replacements = {
         "__STORE_PATH__": _e(store_path),
-        "__ADMIN_PATH__": _e(admin_path),
         "__NOW__": _e(f"{iso_utc(now_ms)} / {iso_vn(now_ms)}"),
         "__SETUP_BANNER__": SETUP_BANNER if setup_required else "",
         "__SETUP_FIELD__": SETUP_FIELD if setup_required else "",
@@ -867,4 +791,5 @@ def render(*, rows: list[dict[str, Any]], sessions: list[dict[str, Any]],
     page = PAGE
     for needle, value in replacements.items():
         page = page.replace(needle, value)
-    return page
+    return admin_ui.page(title="Phiên ORB", active="orb", body=page, css=CSS,
+                         nav=nav or admin_ui.fallback_nav(admin_path))
