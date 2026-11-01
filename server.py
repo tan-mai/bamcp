@@ -5478,9 +5478,15 @@ async def _alerts_action(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             _alerts_save("notify", block)
             return 200, {"ok": True}
         if action == "notify_test":
-            alert = notifier.system_alert("TEST", {"at": int(time.time() * 1000)}, WATCHER.display_tz())
-            error = await notifier.deliver(cfg["notify"], alert)
-            return 200, {"ok": not error, "error": error, "channel": cfg["notify"].get("channel")}
+            # target = discord / telegram: thu rieng mot kenh bat ke notify.channel dang chon
+            target = str(payload.get("target") or cfg["notify"].get("channel") or "discord").strip().lower()
+            if target not in notifier.CHANNELS:
+                raise ValueError(f"target phai la mot trong {list(notifier.CHANNELS)}")
+            alert = notifier.system_alert("TEST", {"at": int(time.time() * 1000), "channel": target},
+                                          WATCHER.display_tz())
+            # Khong retry: sai webhook / token thi bao ngay, khong treo nut ~40s
+            error = await notifier.deliver({**cfg["notify"], "channel": target}, alert, backoff=())
+            return 200, {"ok": not error, "error": error, "channel": target}
         if action == "watcher_save":
             block = copy.deepcopy(cfg["watcher"])
             deadline = str(payload.get("plan_deadline_utc") or "00:30").strip()

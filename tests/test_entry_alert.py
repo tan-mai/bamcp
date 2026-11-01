@@ -348,6 +348,15 @@ class ServerToolsTest(unittest.TestCase):
         server.save_setups(server.DEFAULT_SYMBOL, [], replace=True)
         (server.JOURNAL_DIR / "2026-09-02.json").unlink(missing_ok=True)
 
+    def test_notify_test_per_channel(self):
+        code, out = asyncio.run(server._alerts_action({"action": "notify_test", "target": "telegram"}))
+        self.assertEqual((code, out["ok"], out["channel"]), (200, False, "telegram"))
+        self.assertIn("telegram: chua dat bot_token", out["error"])
+        code, out = asyncio.run(server._alerts_action({"action": "notify_test", "target": "sms"}))
+        self.assertEqual(code, 400)
+        alert = notifier.system_alert("TEST", {"at": T0, "channel": "discord"}, VN)
+        self.assertTrue(alert.text.startswith("✅ BAMCP test — kênh discord hoạt động"))
+
 
 if __name__ == "__main__":
     unittest.main()

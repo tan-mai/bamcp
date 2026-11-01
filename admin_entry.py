@@ -105,10 +105,15 @@ __CFG_WARNING__
       <div><label for="n_chat">Telegram chat id <span class="small">__CHAT_MASK__</span></label>
         <input type="password" id="n_chat" autocomplete="off"></div>
     </div>
-    <div class="actions">
-      <button type="button" class="primary" id="b_notify">Lưu thông báo</button>
-      <button type="button" id="b_test">Gửi tin thử</button>
+    <div class="actions"><button type="button" class="primary" id="b_notify">Lưu thông báo</button></div>
+    <h3>Gửi tin thử</h3>
+    <div class="hint">Gửi bằng cấu hình <b>đã lưu</b>, từng kênh riêng (không phụ thuộc ô Kênh).
+      Vừa sửa ô nào thì bấm Lưu thông báo trước.</div>
+    <div class="actions" style="margin-top:10px">
+      <button type="button" data-test="discord">Gửi thử Discord</button>
+      <button type="button" data-test="telegram">Gửi thử Telegram</button>
     </div>
+    <div id="n_msg" data-msg="inline"></div>
   </div>
   __SETUP_FIELD__
 <script>
@@ -117,9 +122,9 @@ const PARAM_KEYS = __PARAM_KEYS__;
 const OVERRIDE_SYMBOLS = __OVERRIDE_SYMBOLS__;
 const $ = (id) => document.getElementById(id);
 
-function say(text, ok) { const b = $("msg"); b.textContent = text; b.className = ok ? "ok" : "err"; }
+function say(text, ok, box) { const b = $(box || "msg"); b.textContent = text; b.className = ok ? "ok" : "err"; }
 
-async function act(body, button) {
+async function act(body, button, box) {
   if (button) button.disabled = true;
   const token = $("setup_token");
   if (token) body.setup_token = token.value;
@@ -129,7 +134,7 @@ async function act(body, button) {
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
     return data;
-  } catch (e) { say(e.message, false); return null; }
+  } catch (e) { say(e.message, false, box); return null; }
   finally { if (button) button.disabled = false; }
 }
 
@@ -140,14 +145,22 @@ $("b_notify").addEventListener("click", async (e) => {
   const data = await act({action: "notify_save", channel: $("n_channel").value,
     display_timezone: $("n_tz").value.trim(), discord_webhook_url: $("n_webhook").value.trim(),
     telegram_bot_token: $("n_token").value.trim(), telegram_chat_id: $("n_chat").value.trim()}, e.target);
-  if (data) { say("Đã lưu thông báo", true); setTimeout(() => location.reload(), 700); }
+  if (data) { say("Đã lưu thông báo — giờ có thể Gửi thử", true); setTimeout(() => location.reload(), 900); }
 });
 
-$("b_test").addEventListener("click", async (e) => {
-  say("Đang gửi…", true);
-  const data = await act({action: "notify_test"}, e.target);
-  if (data) say(data.error ? "Gửi lỗi: " + data.error : "Đã gửi tin thử qua " + data.channel, !data.error);
-});
+const NOTIFY_SAVED = {channel: $("n_channel").value, tz: $("n_tz").value.trim()};
+const CHANNEL_NAMES = {discord: "Discord", telegram: "Telegram"};
+
+document.querySelectorAll("button[data-test]").forEach((b) => b.addEventListener("click", async () => {
+  const name = CHANNEL_NAMES[b.dataset.test];
+  const dirty = ["n_webhook", "n_token", "n_chat"].some((id) => $(id).value.trim())
+    || $("n_channel").value !== NOTIFY_SAVED.channel || $("n_tz").value.trim() !== NOTIFY_SAVED.tz;
+  if (dirty) { say("Có thay đổi chưa lưu — bấm \\"Lưu thông báo\\" trước, tin thử dùng cấu hình đã lưu.", false, "n_msg"); return; }
+  say("Đang gửi qua " + name + "…", true, "n_msg");
+  const data = await act({action: "notify_test", target: b.dataset.test}, b, "n_msg");
+  if (data) say(data.error ? name + " lỗi: " + data.error
+                           : "Đã gửi tin thử qua " + name + " — kiểm tra kênh / chat.", !data.error, "n_msg");
+}));
 
 $("b_watcher").addEventListener("click", async (e) => {
   const defaults = {}, overrides = {};

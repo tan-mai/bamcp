@@ -580,7 +580,7 @@ Thông báo: `notify.channel` = `discord` (webhook) / `telegram` (bot, `parse_mo
 
 Khớp lệnh OKX: mỗi lượt quét, cặp có setup từ TRIGGERED trở đi thì đọc vị thế; vị thế mới mở sau lúc trigger, cùng hướng → FILLED cho setup có entry gần giá mở nhất, không setup nào khớp → tin "lệnh mở ngoài kế hoạch". Mã OKX theo `watcher.okx_symbol_map`.
 
-Trang `/admin/alerts`: kênh + webhook / bot token / chat id (che, chỉ ghi đè khi nhập mới), nút Gửi tin thử; watcher bật/tắt, `watch_symbols`, `plan_deadline_utc`, bảng tham số mặc định + override theo cặp; danh sách setup theo ngày/trạng thái, timeline event, huỷ, form tạo setup tay. Lưu vào `alerts/config.json`, có hiệu lực ngay.
+Trang `/admin/alerts`: kênh + webhook / bot token / chat id (che, chỉ ghi đè khi nhập mới), nút Gửi thử Discord / Gửi thử Telegram (dùng cấu hình đã lưu, thử riêng từng kênh, không retry); watcher bật/tắt, `watch_symbols`, `plan_deadline_utc`, bảng tham số mặc định + override theo cặp; danh sách setup theo ngày/trạng thái, timeline event, huỷ, form tạo setup tay. Lưu vào `alerts/config.json`, có hiệu lực ngay.
 
 Sau deploy, phía Claude: dời task phân tích bias sang 00:05 UTC và kết thúc bằng `save_setups(..., replace=true)` cho từng cặp; khi hỏi "vào được chưa" thì đọc `get_setups` + `get_setup_events` trước, rồi mới đọc nến M5/M15 đã đóng.
 

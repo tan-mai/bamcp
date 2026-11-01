@@ -290,7 +290,8 @@ def system_alert(event: str, details: dict[str, Any], tz: ZoneInfo) -> Alert:
                 f"{_num(pos.get('size'))} @ {_num(pos.get('entry_price'))} "
                 f"(mở {_when(pos.get('opened_ms'), tz)})")
     elif event == "TEST":
-        text = f"BAMCP test — kênh thông báo hoạt động ({_when(details.get('at'), tz)})"
+        text = (f"✅ BAMCP test — kênh {details.get('channel') or 'thông báo'} hoạt động "
+                f"({_when(details.get('at'), tz)})")
     else:
         text = f"{event}: {details}"
     return Alert(text, title=event, meta={"event": event})
