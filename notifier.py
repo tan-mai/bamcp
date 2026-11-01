@@ -97,19 +97,23 @@ class TelegramBotNotifier(INotifier):
             raise RuntimeError(f"telegram HTTP {resp.status_code}: {resp.text[:200]}")
 
 
-def build(cfg: dict[str, Any]) -> list[INotifier]:
+def _channels(cfg: dict[str, Any]) -> list[str]:
     channel = str(cfg.get("channel") or "discord").strip().lower()
     if channel not in CHANNELS:
         raise NotifyConfigError(f"notify.channel phai la mot trong {list(CHANNELS)}")
-    out: list[INotifier] = []
-    if channel in ("discord", "both"):
+    return ["discord", "telegram"] if channel == "both" else [channel]
+
+
+def _make(name: str, cfg: dict[str, Any]) -> INotifier:
+    if name == "discord":
         d = cfg.get("discord") or {}
-        out.append(DiscordWebhookNotifier(str(d.get("webhook_url") or ""),
-                                          embed=bool(d.get("embed"))))
-    if channel in ("telegram", "both"):
-        t = cfg.get("telegram") or {}
-        out.append(TelegramBotNotifier(str(t.get("bot_token") or ""), str(t.get("chat_id") or "")))
-    return out
+        return DiscordWebhookNotifier(str(d.get("webhook_url") or ""), embed=bool(d.get("embed")))
+    t = cfg.get("telegram") or {}
+    return TelegramBotNotifier(str(t.get("bot_token") or ""), str(t.get("chat_id") or ""))
+
+
+def build(cfg: dict[str, Any]) -> list[INotifier]:
+    return [_make(name, cfg) for name in _channels(cfg)]
 
 
 async def send_with_retry(notifier: INotifier, alert: Alert, *,
@@ -135,10 +139,17 @@ async def send_with_retry(notifier: INotifier, alert: Alert, *,
 
 async def deliver(cfg: dict[str, Any], alert: Alert, **kwargs: Any) -> str | None:
     try:
-        targets = build(cfg)
+        names = _channels(cfg)
     except NotifyConfigError as exc:
         return str(exc)
+    # channel = both ma mot kenh chua cau hinh: van gui kenh con lai, chi ghi loi kenh thieu
+    targets: list[INotifier] = []
     errors: list[str] = []
+    for name in names:
+        try:
+            targets.append(_make(name, cfg))
+        except NotifyConfigError as exc:
+            errors.append(str(exc))
     results = await asyncio.gather(*[send_with_retry(n, alert, **kwargs) for n in targets],
                                    return_exceptions=True)
     for notifier, result in zip(targets, results):

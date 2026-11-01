@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -214,6 +215,18 @@ class NotifierTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             asyncio.run(notifier.send_with_retry(FakeNotifier(9), notifier.Alert("x"), sleep=sleep))
         self.assertEqual(waits, [2.0, 10.0, 30.0])
+
+    def test_both_with_one_channel_missing(self):
+        sent = []
+
+        async def send(self, alert):
+            sent.append((self.chat_id, alert.text))
+
+        cfg = {"channel": "both", "telegram": {"bot_token": "1:x", "chat_id": "42"}}
+        with mock.patch.object(notifier.TelegramBotNotifier, "send", send):
+            err = asyncio.run(notifier.deliver(cfg, notifier.Alert("x")))
+        self.assertEqual(sent, [("42", "x")])
+        self.assertEqual(err, "discord: chua dat webhook_url")
 
     def test_config_error_and_message(self):
         err = asyncio.run(notifier.deliver({"channel": "telegram"}, notifier.Alert("x")))
