@@ -8,6 +8,7 @@ import contextlib
 import copy
 import csv
 import functools
+import gzip  # TM - #DASHBOARD - Setup dashboard
 import hashlib
 import inspect
 import json
@@ -17,9 +18,11 @@ import secrets
 import sys
 import threading
 import time
+from collections import OrderedDict  # TM - #DASHBOARD - Setup dashboard
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, quote, urlencode  # TM - #DASHBOARD - Setup dashboard
 from zoneinfo import ZoneInfo
 
 import httpx2 as httpx
@@ -33,9 +36,14 @@ from starlette.responses import JSONResponse
 
 import admin       # module cuc bo: trang cai dat
 import admin_gann  # TM - #GANN-TW - Gann Time Windows: trang admin Gann
+import admin_dashboard  # TM - #DASHBOARD - Setup dashboard
 import admin_entry  # TM - #ENTRY-ALERT - Entry setups & alerts
 import admin_schedules  # TM - #M5-FETCH - Per-timeframe schedules + M5
 import cron_utc  # TM - #M5-FETCH - Per-timeframe schedules + M5
+import dashboard_auth  # TM - #DASHBOARD - Setup dashboard
+import dashboard_logic  # TM - #DASHBOARD - Setup dashboard
+import dashboard_store  # TM - #DASHBOARD - Setup dashboard
+import dashboard_ui  # TM - #DASHBOARD - Setup dashboard
 import entry_logic  # TM - #ENTRY-ALERT - Entry setups & alerts
 import entry_store  # TM - #ENTRY-ALERT - Entry setups & alerts
 import entry_watcher  # TM - #ENTRY-ALERT - Entry setups & alerts
@@ -2579,8 +2587,10 @@ def save_bias(
         "history": history[-10:],
     }
     _write_json(path, payload)
+    # TM - #DASHBOARD - Setup dashboard
     return {"saved": True, "symbol": sym, "date": day, "file": str(path),
-            "revisions": len(history)}
+            "revisions": len(history), "plan_revision": _plan_snapshot(sym, day, "save_bias"),
+            **_dash_link(sym, day)}
 
 
 @mcp.tool()
@@ -4310,7 +4320,9 @@ WATCHER = entry_watcher.EntryWatcher(
     SETUPS, klines=lambda: KLINE_STORE, cfg=_alerts_cfg,
     min_rr=lambda symbol: float(_load_rules(symbol)["min_rr"]),
     check=_setup_check, positions=_setup_positions, tz=TZ, span_ms=_tf_ms,
-    refresh=_watcher_refresh)
+    refresh=_watcher_refresh,
+    # TM - #DASHBOARD - Setup dashboard
+    link=lambda setup: _dash_url(setup["symbol"], setup["bias_date"]))
 
 
 def _setup_view(setup: dict[str, Any], last: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -4330,9 +4342,12 @@ def _setup_view(setup: dict[str, Any], last: dict[str, Any] | None = None) -> di
     # TM - #ENTRY-VOL - Dieu kien volume dang co hieu luc cua setup nay
     out["volume_rule"] = entry_logic.volume_rule(setup["trigger_type"],
                                                  WATCHER.params_for(setup["symbol"], setup))
+    # TM - #DASHBOARD - Setup dashboard
+    out["invalidate_after_confirm"] = bool(setup.get("invalidate_after_confirm"))
     out["state"] = {k: state[k] for k in ("max_chase", "x_max", "min_rr", "last_price",
                                           "came_from", "zone_alerted", "confirm_count",
-                                          "entry_valid_count", "trigger", "confirm") if k in state}
+                                          "entry_valid_count", "trigger", "confirm",
+                                          "confirm_reached") if k in state}
     if state.get("last_candle"):
         out["state"]["last_candle"] = _stamp(state["last_candle"])
     if state.get("triggered_at"):
@@ -4391,21 +4406,32 @@ def _save_setups(symbol: str, setups: list[dict[str, Any]], replace: bool,
     min_rr = float(_load_rules(symbol)["min_rr"])
     params = WATCHER.params_for(symbol)
     now = int(time.time() * 1000)
+    # TM - #DASHBOARD - Setup dashboard: invalidate_level da bi pha thi setup se huy ngay nen gio dau
+    price = _last_price(symbol)
+    warnings = [] if price is not None or not setups else [
+        f"chua co gia dong cua {symbol} - bo qua kiem tra invalidate_level theo gia hien tai"]
     cleaned, rejected = [], []
     for index, raw in enumerate(setups):
         try:
-            cleaned.append((index, entry_logic.validate(
+            clean = entry_logic.validate(
                 raw, min_rr=min_rr, now_ms=now, parse_time=_parse_moment,
                 default_expiry=lambda day: _parse_moment(day, end=True),
-                default_day=_today(), default_m15=bool(params.get("m15_filter", True)))))
+                default_day=_today(), default_m15=bool(params.get("m15_filter", True)))
+            if (price is not None and not clean["invalidate_after_confirm"]
+                    and entry_logic.invalidate_broken(clean["direction"], clean["invalidate_level"], price)):
+                raise ValueError(f"invalidate_level {clean['invalidate_level']:.10g} da bi pha tai gia "
+                                 f"hien tai {price:.10g} - setup se huy ngay")
+            cleaned.append((index, clean))
         except ValueError as exc:
             rejected.append({"index": index, "error": str(exc)})
     replaced = []
+    plan_days: set[str] = set()
     if replace and (cleaned or not setups):
         for old in SETUPS.active(symbol):
             _setup_finish(old, "CANCELLED", "CANCELLED",
                           {"reason": "thay boi save_setups(replace=true)", "by": created_by})
             replaced.append(old["code"])
+            plan_days.add(old["bias_date"])
     saved = []
     trends = _setup_trends(symbol) if cleaned else {}
     for index, clean in cleaned:
@@ -4421,9 +4447,14 @@ def _save_setups(symbol: str, setups: list[dict[str, Any]], replace: bool,
                       "htf_counter": entry_logic.htf_counter(row["direction"], row["htf"]),
                       "check_trade": {k: verdict[k] for k in ("would_pass", "rule_violations",
                                                               "rr", "trade_type")}})
+    # TM - #DASHBOARD - Setup dashboard
+    plan_days.update(s["bias_date"] for s in saved)
+    revisions = {day: _plan_snapshot(symbol, day, "save_setups") for day in sorted(plan_days)}
+    link_day = saved[0]["bias_date"] if saved else (max(plan_days) if plan_days else "")
     return {"symbol": symbol, "min_rr": min_rr, "saved": saved, "rejected": rejected,
             "replaced": replaced, "ids": [s["id"] for s in saved],
-            "codes": [s["code"] for s in saved]}
+            "codes": [s["code"] for s in saved], "warnings": warnings,
+            "plan_revisions": revisions, **_dash_link(symbol, link_day)}
 
 
 @_tool_with_reasons()
@@ -4453,6 +4484,10 @@ def save_setups(symbol: str, setups: list[dict[str, Any]], replace: bool = False
     Server tu luu htf {w, d, h4, bias}: huong W/D/H4 tinh tu swing nen da dong (up/down/range)
     va bias cua bias_date. htf_counter liet ke cac khung nguoc huong setup - khong chan luu,
     chi gan nhan trong tin va trong ket qua.
+    TM - #DASHBOARD: invalidate_level da bi pha tai gia hien tai (long: gia <= muc, short: gia >=
+    muc) thi setup bi tu choi. Setup co confirm_type thi invalidate_after_confirm mac dinh true:
+    chi xet invalidate_level sau khi co nen dong dat confirm, nen setup breakout khong bi huy som.
+    Tra them dashboard_url va plan_revisions (snapshot ke hoach moi ngay). Goi tiep save_scenarios.
     """
     return _save_setups(_resolve_symbol(symbol), setups, bool(replace), "claude")
 
@@ -4507,8 +4542,16 @@ def cancel_setup(id: str, reason: str) -> dict[str, Any]:
     """Huy DUNG MOT setup (id hoac code). Khong dong vao setup khac cung huong. Bat buoc ly do."""
     if not (reason or "").strip():
         raise ValueError("reason la bat buoc")
-    return _setup_finish(SETUPS.get(id.strip()), "CANCELLED", "CANCELLED",
-                         {"reason": reason.strip(), "by": "claude"})
+    # TM - #DASHBOARD - Setup dashboard
+    return _cancel_setup(id.strip(), reason.strip(), "claude")
+
+
+# TM - #DASHBOARD - Setup dashboard
+def _cancel_setup(ref: str, reason: str, by: str) -> dict[str, Any]:
+    setup = SETUPS.get(ref)
+    out = _setup_finish(setup, "CANCELLED", "CANCELLED", {"reason": reason, "by": by})
+    return {**out, "plan_revision": _plan_snapshot(setup["symbol"], setup["bias_date"], "cancel_setup"),
+            **_dash_link(setup["symbol"], setup["bias_date"])}
 
 
 @_tool_with_reasons()
@@ -4525,6 +4568,606 @@ def get_setup_events(setup_id: str = "", symbol: str = "", date: str = "") -> di
     rows = SETUPS.events(setup_id=sid, symbol=_resolve_symbol(symbol) if symbol else None,
                          start_ms=start, end_ms=end)
     return {"count": len(rows), "events": [_event_view(e) for e in rows]}
+
+
+# ---------------------------------------------------------------- setup dashboard
+# TM - #DASHBOARD - Setup dashboard
+# Tool MCP va API cua trang goi chung cac ham o day, khong viet logic hai lan.
+
+DASH_PATH = "/setup-dashboard"
+DASH_COOKIE = "bamcp_dash"
+DASH_TFS = ("1d", "4h", "1h", "15m", "5m")
+DASH_FILE = DATA_ROOT / str(PATHS.get("dashboard_config_file") or "dashboard/config.json")
+DASH_DEFAULTS: dict[str, Any] = {
+    "enabled": False, "base_url": "", "session_hours": 12, "remember_days": 30,
+    "login_max_attempts": 5, "login_lockout_minutes": 15, "poll_seconds": 60,
+    "vol_spike_mult": 2.0, "default_tf": "1h", "default_bars": 96, "hide_pnl": False,
+}
+DASH_EXCHANGE_TTL = 30.0
+DASH_CHART_CACHE_SIZE = 64
+CHART_BIAS_KEYS = ("direction", "summary", "phase", "key_levels", "action_zone", "updated_at")
+POSITION_KEYS = ("side", "size", "entry_price", "mark_price", "unrealized_pnl", "leverage", "opened_ms")
+
+PLANS = dashboard_store.PlanStore(SQLITE_PATH)
+DASH_AUTH = dashboard_auth.DashAuth(SQLITE_PATH)
+_DASH_CFG_CACHE: dict[str, Any] = {"key": None, "cfg": None}
+_DASH_CHART_CACHE: OrderedDict[tuple, tuple[tuple, dict[str, Any]]] = OrderedDict()
+_DASH_EXCHANGE_CACHE: dict[tuple, tuple[float, Any]] = {}
+
+
+def _dash_cfg() -> dict[str, Any]:
+    """Config.yaml la gia tri khoi tao; sua o trang admin thi file tren volume thang."""
+    try:
+        stat = DASH_FILE.stat()
+        key = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        key = None
+    if _DASH_CFG_CACHE["cfg"] is not None and _DASH_CFG_CACHE["key"] == key:
+        return _DASH_CFG_CACHE["cfg"]
+    cfg = {**DASH_DEFAULTS, **(CFG.get("dashboard") or {})}
+    if key is not None:
+        try:
+            override = _read_json(DASH_FILE, {})
+        except Exception as exc:
+            override = {}
+            print(f"CANH BAO: {DASH_FILE.name} loi ({type(exc).__name__}) - dang dung config.yaml",
+                  file=sys.stderr)
+        if isinstance(override, dict):
+            cfg.update({k: v for k, v in override.items() if k in DASH_DEFAULTS})
+    _DASH_CFG_CACHE.update(key=key, cfg=cfg)
+    return cfg
+
+
+def _dash_clean_cfg(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("config phai la object")
+    out = dict(_dash_cfg())
+
+    def number(name: str, low: float, high: float, whole: bool = True) -> None:
+        if name not in raw:
+            return
+        try:
+            value = float(raw[name])
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} phai la so, nhan duoc {raw[name]!r}") from None
+        if not low <= value <= high or (whole and value != int(value)):
+            raise ValueError(f"{name} phai tu {low:g} den {high:g}" + (" va la so nguyen" if whole else ""))
+        out[name] = int(value) if whole else value
+
+    for flag in ("enabled", "hide_pnl"):
+        if flag in raw:
+            out[flag] = raw[flag] in (True, 1, "1", "true", "on")
+    number("session_hours", 1, 720)
+    number("remember_days", 1, 365)
+    number("login_max_attempts", 1, 100)
+    number("login_lockout_minutes", 1, 1440)
+    number("poll_seconds", 5, 3600)
+    number("vol_spike_mult", 0.1, 100, whole=False)
+    number("default_bars", 10, dashboard_logic.MAX_BARS)
+    if "default_tf" in raw:
+        if raw["default_tf"] not in DASH_TFS:
+            raise ValueError(f"default_tf phai la mot trong {list(DASH_TFS)}")
+        out["default_tf"] = raw["default_tf"]
+    if "base_url" in raw:
+        base = str(raw["base_url"] or "").strip().rstrip("/")
+        if base and not base.startswith(("https://", "http://")):
+            raise ValueError("base_url phai bat dau bang https://")
+        out["base_url"] = base
+    return out
+
+
+def _dash_url(symbol: str, day: str = "", mode: str = "live", tf: str = "") -> str | None:
+    cfg = _dash_cfg()
+    base = str(cfg.get("base_url") or "").rstrip("/")
+    if not cfg["enabled"] or not base:
+        return None
+    query = urlencode({"symbol": symbol, "date": day or _today(), "mode": mode,
+                       "tf": tf or cfg["default_tf"]})
+    return f"{base}?{query}"
+
+
+def _dash_link(symbol: str, day: str = "", mode: str = "live", tf: str = "") -> dict[str, str]:
+    url = _dash_url(symbol, day, mode, tf)
+    return {"dashboard_url": url} if url else {}
+
+
+def _dash_day(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return _today()
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        raise ValueError(f"ngay phai dang YYYY-MM-DD, nhan duoc {text!r}") from None
+
+
+def _last_closed(symbol: str, timeframe: str) -> dict[str, Any] | None:
+    closed, _ = _split_closed(KLINE_STORE.get_klines(symbol, timeframe, limit=3), timeframe)
+    if not closed:
+        return None
+    bar = closed[-1]
+    return {"t": int(bar["open_time"]), "o": bar["open"], "h": bar["high"], "l": bar["low"],
+            "c": bar["close"], "v": bar["volume"]}
+
+
+def _last_price(symbol: str) -> float | None:
+    """Gia dong moi nhat, cung nguon nen da dong watcher dang xet."""
+    bars = [(bar["t"] + _tf_ms(tf), float(bar["c"])) for tf in ("5m", "15m", "1h")
+            if (bar := _last_closed(symbol, tf))]
+    return max(bars)[1] if bars else None
+
+
+def _dash_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Khong tra details va noi dung loi gui tin: co the chua vi the, webhook hoac token."""
+    return {"id": event.get("id"), "event": event["event"], "from_status": event.get("from_status"),
+            "to_status": event.get("to_status"), "price": event.get("price"),
+            "t": event.get("candle_open_time"), "at": int(event["at"]), "code": event.get("code"),
+            "notify": "error" if event.get("notify_error") else "sent" if event.get("notified") else None,
+            "repeat": bool((event.get("details") or {}).get("repeat"))}
+
+
+def _dash_setup(setup: dict[str, Any], last: dict[str, Any] | None = None) -> dict[str, Any]:
+    out = _setup_view(setup)
+    verdict = check_trade(side=setup["direction"], entry=setup["entry"], stop=setup["stop"],
+                          target=setup["target"], margin_usd=0.0, symbol=setup["symbol"])
+    out.update(rr=verdict["rr"], created_ms=int(setup["created_at"]), expires_ms=int(setup["expires_at"]),
+               last_event=_dash_event(last) if last else None)
+    return out
+
+
+def _plan_state(symbol: str, day: str) -> dict[str, Any]:
+    """Ke hoach dang hieu luc cua mot ngay: cung mot dang cho chart va cho snapshot."""
+    rows = SETUPS.list(symbol=symbol, bias_date=day)
+    last = SETUPS.last_events([r["id"] for r in rows])
+    bias = _orb_bias(symbol, day)
+    tr = PLANS.tr_at(symbol, _day_window_ms(day)[1])
+    if tr is None:
+        # Setup luu truoc khi co save_scenarios van khai TR ngay trong setup
+        declared = next((r for r in rows if r.get("tr_high") and r.get("tr_low")), None)
+        if declared:
+            tr = {"timeframe": "15m", "tr_high": declared["tr_high"], "tr_low": declared["tr_low"],
+                  "since": declared.get("tr_since"), "events": [], "redraw_rule": None, "source": "setup"}
+    return {"bias": {k: v for k, v in bias.items() if k != "history"} if bias else None,
+            "setups": [_dash_setup(r, last.get(r["id"])) for r in rows],
+            "scenarios": [s for s in PLANS.scenarios(symbol, day) if s["status"] != "cancelled"],
+            "tr": tr}
+
+
+def _plan_snapshot(symbol: str, day: str, trigger: str) -> int | None:
+    """Snapshot la phan phu: loi thi ghi log, khong duoc lam hong viec luu chinh da xong."""
+    try:
+        payload = {**_plan_state(symbol, day),
+                   "last_closed_bar": {tf: _last_closed(symbol, tf) for tf in DASH_TFS}}
+        return PLANS.add_snapshot(symbol, day, trigger, payload)
+    except Exception as exc:
+        print(f"BAMCP snapshot {symbol} {day} loi: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return None
+
+
+def _chart_revision(value: Any) -> int | str | None:
+    if value in (None, "", 0, "0"):
+        return None
+    if str(value).strip().lower() == "origin":
+        return "origin"
+    try:
+        revision = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"revision phai la so hoac 'origin', nhan duoc {value!r}") from None
+    if revision < 1:
+        raise ValueError("revision bat dau tu 1")
+    return revision
+
+
+def _forming_bar(symbol: str, tf: str, now: int) -> dict[str, Any] | None:
+    """Kho SQLite khong luu nen chua dong: ghep nen dang chay tu cac nen M5 da dong."""
+    span, five = _tf_ms(tf), _tf_ms("5m")
+    if tf not in DASH_TFS or span <= five:
+        return None
+    closed, _ = _split_closed(KLINE_STORE.get_klines(symbol, "5m", limit=span // five), "5m")
+    return dashboard_logic.forming_from_lower(closed, now // span * span)
+
+
+def _chart_htf(symbol: str, price: float | None) -> list[dict[str, Any]]:
+    swings: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for tf in ("1w", "1d"):
+        try:
+            swings[tf] = _build_context(symbol, tf)
+        except (FileNotFoundError, ValueError):
+            continue
+    return dashboard_logic.htf_levels(swings, price)
+
+
+def _chart_markers(setups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    events = SETUPS.events_of([s["id"] for s in setups])
+    out = []
+    for setup in setups:
+        for event in events.get(setup["id"]) or []:
+            if event["event"] in dashboard_logic.MARKER_EVENTS and not (event.get("details") or {}).get("repeat"):
+                out.append({"t": int(event.get("candle_open_time") or event["at"]), "event": event["event"],
+                            "code": setup["code"], "direction": setup["direction"], "price": event.get("price")})
+    return sorted(out, key=lambda m: m["t"])
+
+
+def _chart_build(symbol: str, tf: str, bars: int, day: str, include_forming: bool,
+                 revision: int | str | None) -> dict[str, Any]:
+    cfg = _dash_cfg()
+    now = int(time.time() * 1000)
+    start_ms, end_ms = _day_window_ms(day)
+    past = day < _today()
+    # Ngay da qua: nen toi het ngay bias + 24h de thay dien bien that
+    until = end_ms + 86_400_000 if past else None
+    period = dashboard_logic.VOL_PERIOD
+    closed, forming = _split_closed(
+        KLINE_STORE.get_klines(symbol, tf, limit=bars + period + 2, end_time=until), tf)
+    if include_forming and forming is None and not past:
+        forming = _forming_bar(symbol, tf, now)
+    mult = float(cfg["vol_spike_mult"])
+    window = closed[-bars:]
+    averages, spikes = dashboard_logic.volume_stats(closed, bars, mult, period=period)
+    candles = [[int(b["open_time"]), b["open"], b["high"], b["low"], b["close"], b["volume"], True]
+               for b in window]
+    if include_forming and forming is not None:
+        candles.append([int(forming["open_time"]), forming["open"], forming["high"], forming["low"],
+                        forming["close"], forming["volume"], False])
+        tail = closed[-period:]
+        averages.append(round(sum(float(b["volume"]) for b in tail) / period, 4)
+                        if len(tail) == period else None)
+
+    source, used = "live", None
+    plan = None
+    if revision == "origin":
+        plan = dashboard_logic.origin_plan(PLANS.snapshots(symbol, day, payload=True))
+        if plan is not None:
+            source, used = "origin", plan["revisions_used"]
+    elif revision is not None:
+        plan = PLANS.snapshot(symbol, day, int(revision))["payload"]
+        source = "revision"
+    if plan is None:
+        plan = _plan_state(symbol, day)
+        plan["scenarios"] = [s for s in plan["scenarios"] if s["status"] == "active"]
+    setups = plan.get("setups") or []
+    bias = plan.get("bias")
+    last_m5 = _last_closed(symbol, "5m")
+    price = float(last_m5["c"]) if last_m5 else (float(window[-1]["close"]) if window else None)
+    return {
+        "symbol": symbol, "timeframe": tf, "date": day, "time_zone": str(TZ),
+        "day_start_ms": start_ms, "candle_columns": ["t", "o", "h", "l", "c", "v", "is_closed"],
+        "candles": candles, "vol_avg": averages, "vol_spike": spikes, "vol_spike_mult": mult,
+        "bias": {k: bias.get(k) for k in CHART_BIAS_KEYS} if bias else None,
+        "setups": setups, "scenarios": plan.get("scenarios") or [], "tr": plan.get("tr"),
+        "htf_levels": _chart_htf(symbol, price), "markers": _chart_markers(setups), "last_m5": last_m5,
+        "plan": {"source": source, "revision": revision if source == "revision" else None,
+                 "revisions_used": used, "revisions": PLANS.snapshots(symbol, day)},
+        **_dash_link(symbol, day, "review" if revision is not None else "live", tf),
+    }
+
+
+def _chart_core(symbol: str, tf: str, bars: int, day: str, include_forming: bool,
+                revision: int | str | None) -> dict[str, Any]:
+    """Cache toi khi co nen moi dong hoac ke hoach / trang thai setup doi."""
+    key = (symbol, tf, bars, day, include_forming, revision)
+    cfg = _dash_cfg()
+    stamp = (KLINE_STORE.kind, KLINE_STORE.get_latest_open_time(symbol, tf), KLINE_STORE.written_at(symbol, tf),
+             KLINE_STORE.get_latest_open_time(symbol, "5m"), int(time.time() * 1000) // (_tf_ms(tf) or 1),
+             SETUPS.last_event_id(), PLANS.version(), _today(), cfg["vol_spike_mult"], cfg["enabled"],
+             cfg["base_url"], cfg["default_tf"])
+    hit = _DASH_CHART_CACHE.get(key)
+    if hit is not None and hit[0] == stamp:
+        _DASH_CHART_CACHE.move_to_end(key)
+        return hit[1]
+    data = _chart_build(symbol, tf, bars, day, include_forming, revision)
+    _DASH_CHART_CACHE[key] = (stamp, data)
+    while len(_DASH_CHART_CACHE) > DASH_CHART_CACHE_SIZE:
+        _DASH_CHART_CACHE.popitem(last=False)
+    return data
+
+
+def _chart_freshness(core: dict[str, Any], now: int) -> dict[str, Any]:
+    """Tinh moi lan goi, khong cache: nguon nen ngung chay thi van phai bao duoc."""
+    closed = [c for c in core["candles"] if c[6]]
+    span = _tf_ms(core["timeframe"])
+    last_end = closed[-1][0] + span if closed else None
+    m5 = core.get("last_m5")
+    m5_end = m5["t"] + _tf_ms("5m") if m5 else None
+    live = core["date"] >= _today()
+    stale = live and any(end is not None and now - end > 2 * width
+                         for end, width in ((last_end, span), (m5_end, _tf_ms("5m"))))
+    return {"last_closed_bar_age_minutes": round((now - last_end) / 60000, 1) if last_end else None,
+            "expected_bar_minutes": round(span / 60000) if span else None,
+            "m5_age_minutes": round((now - m5_end) / 60000, 1) if m5_end else None,
+            "stale": bool(stale)}
+
+
+async def _dash_exchange(key: tuple, loader) -> Any:
+    """Polling khong duoc dung rate limit cua san: moi khoa chi goi that mot lan moi 30 giay."""
+    now = time.monotonic()
+    hit = _DASH_EXCHANGE_CACHE.get(key)
+    if hit is not None and now - hit[0] < DASH_EXCHANGE_TTL:
+        return hit[1]
+    try:
+        value = await loader()
+    except Exception as exc:
+        print(f"BAMCP dashboard san {key[0]} loi: {type(exc).__name__}", file=sys.stderr)
+        value = None
+    if len(_DASH_EXCHANGE_CACHE) > 128:
+        _DASH_EXCHANGE_CACHE.clear()
+    _DASH_EXCHANGE_CACHE[key] = (now, value)
+    return value
+
+
+async def _dash_positions(symbol: str) -> dict[str, Any]:
+    """Chi doc. Loi san khong tra nguyen van cho client: chuoi loi co the chua URL da ky."""
+    if not _account_enabled():
+        return {"enabled": False, "positions": [], "unrealized_pnl": None}
+    data = await _dash_exchange(("positions", symbol), lambda: _open_positions([symbol]))
+    if data is None or data.get("errors"):
+        return {"enabled": True, "positions": [], "unrealized_pnl": None, "error": "khong doc duoc vi the tu san"}
+    rows = [{k: row.get(k) for k in POSITION_KEYS} for row in data["positions"]]
+    total = round(sum(float(r.get("unrealized_pnl") or 0) for r in rows), 4)
+    if _dash_cfg()["hide_pnl"]:
+        for row in rows:
+            row.pop("unrealized_pnl", None)
+        return {"enabled": True, "positions": rows, "unrealized_pnl": None, "pnl_hidden": True}
+    return {"enabled": True, "positions": rows, "unrealized_pnl": total}
+
+
+async def _chart_data(symbol: str, timeframe: str, bars: Any, day: Any, include_forming: bool,
+                      revision: Any, *, positions: bool = True) -> dict[str, Any]:
+    tf = _validate_timeframe(str(timeframe or "1h"))
+    try:
+        count = int(bars)
+    except (TypeError, ValueError):
+        raise ValueError(f"bars phai la so, nhan duoc {bars!r}") from None
+    count = max(1, min(count, dashboard_logic.MAX_BARS))
+    core = _chart_core(symbol, tf, count, _dash_day(day), bool(include_forming), _chart_revision(revision))
+    out = {**core, "freshness": _chart_freshness(core, int(time.time() * 1000))}
+    if positions:
+        out["positions"] = await _dash_positions(symbol)
+    return out
+
+
+@_tool_with_reasons()
+async def get_chart_data(symbol: str = "", timeframe: str = "1h", bars: int = 96, date: str = "",
+                         include_forming: bool = False, revision: int | str | None = None) -> dict[str, Any]:
+    """Mot lan goi du du lieu de ve bieu do: nen + bias + setup + kich ban + TR khoa + muc HTF + vi the.
+
+    Dung cai nay khi can ve bieu do, thay vi ghep nhieu tool. Cung nguon voi trang dashboard.
+    bars: toi da 500. date: ngay bias (bo trong = hom nay); ngay da qua thi nen toi het ngay do + 24h.
+    candles: [t, o, h, l, c, v, is_closed], t la epoch ms gio mo nen. include_forming=true them nen
+      dang chay is_closed=false: chi de biet gia, khong doc VSA tu no.
+    vol_avg: SMA20 volume cua 20 nen TRUOC moi nen, cung thu tu voi candles. vol_spike: t cua nen da
+      dong co vol >= dashboard.vol_spike_mult x vol_avg.
+    revision: so revision thi bias/setup/kich ban/TR lay tu snapshot do (nen van la that); 'origin' =
+      ke hoach goc, moi phan lay ban dau tien co noi dung. Bo trong = ke hoach dang hieu luc.
+    plan.revisions liet ke cac snapshot cua ngay. dashboard_url tro dung symbol/date/tf.
+    """
+    return await _chart_data(_resolve_symbol(symbol), timeframe, bars, date, include_forming, revision)
+
+
+def _scenario_anchor(symbol: str, tf: str) -> tuple[int, int]:
+    span = _tf_ms(tf)
+    if not span:
+        raise ValueError(f"offset co tf khong hop le: {tf!r}")
+    bar = _last_closed(symbol, tf)
+    return (bar["t"] if bar else int(time.time() * 1000) // span * span - span), span
+
+
+def _save_scenarios(symbol: str, scenarios: Any, replace: bool, day: str,
+                    tr: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(scenarios, list):
+        raise ValueError("scenarios phai la list")
+    timeframes = [t for t in SUPPORTED_TIMEFRAMES]
+    clean_tr = dashboard_logic.validate_tr(tr, parse_time=_parse_moment, timeframes=timeframes) if tr else None
+    known = {s["code"] for s in SETUPS.list(symbol=symbol)}
+    fresh, updates, rejected = [], [], []
+    for index, raw in enumerate(scenarios):
+        try:
+            if isinstance(raw, dict) and str(raw.get("code") or "").strip():
+                status = str(raw.get("status") or "").strip().lower()
+                if status not in dashboard_logic.SCENARIO_STATUSES:
+                    raise ValueError(f"status phai la mot trong {list(dashboard_logic.SCENARIO_STATUSES)}")
+                row = PLANS.scenario(str(raw["code"]))
+                if row["symbol"] != symbol:
+                    raise ValueError(f"kich ban {row['code']} la cua {row['symbol']}, khong phai {symbol}")
+                updates.append((row, status))
+            else:
+                fresh.append((index, dashboard_logic.validate_scenario(
+                    raw, parse_time=_parse_moment, anchor=lambda tf: _scenario_anchor(symbol, tf),
+                    setup_exists=known.__contains__)))
+        except ValueError as exc:
+            rejected.append({"index": index, "error": str(exc)})
+    cancelled = PLANS.cancel_active(symbol, day) if replace and (fresh or not scenarios) else []
+    last_close = _last_price(symbol)
+    saved, warnings = [], []
+    for index, clean in fresh:
+        row = PLANS.insert_scenario(symbol, day, clean)
+        saved.append({"index": index, "code": row["code"], "kind": row["kind"]})
+        warning = dashboard_logic.start_warning(row["code"], clean["points"], last_close)
+        if warning:
+            warnings.append(warning)
+    updated = [{"code": row["code"], "status": PLANS.set_scenario_status(row["id"], status)["status"]}
+               for row, status in updates]
+    tr_out = None
+    tr_changed = False
+    if clean_tr:
+        current = PLANS.active_tr(symbol)
+        tr_changed = dashboard_logic.tr_differs(current, clean_tr)
+        tr_out = (PLANS.replace_tr(symbol, clean_tr, current["id"] if current else None)
+                  if tr_changed else current)
+    changed = bool(saved or updated or cancelled or tr_changed)
+    return {"symbol": symbol, "bias_date": day, "codes": [s["code"] for s in saved], "saved": saved,
+            "updated": updated, "cancelled": cancelled, "rejected": rejected, "warnings": warnings,
+            "tr": tr_out, "plan_revision": _plan_snapshot(symbol, day, "save_scenarios") if changed else None,
+            **_dash_link(symbol, day)}
+
+
+@_tool_with_reasons()
+def save_scenarios(symbol: str, scenarios: list[dict[str, Any]], replace: bool = True, bias_date: str = "",
+                   tr: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Luu kich ban gia va TR khoa cua mot ngay. Goi ngay sau save_setups.
+
+    scenarios: moi kich ban {kind: main|alt, label, setup_codes: [...], points: [...], condition}.
+      points >= 2 diem {t, price, note?} theo thoi gian tang dan. t la epoch ms, 'YYYY-MM-DD HH:MM'
+      gio VN, hoac offset {bars, tf} tinh tu nen da dong cuoi luc luu, vd {"bars": 4, "tf": "1h"}.
+      setup_codes phai la setup co that cua cap nay. Diem dau cach gia dong cuoi > 2% chi canh bao.
+      Doi trang thai kich ban da co: {code, status: active|played_out|failed|cancelled}.
+    replace=true: kich ban active cua ngay chuyen sang cancelled truoc khi luu.
+    bias_date: bo trong = hom nay.
+    tr: {timeframe, tr_high, tr_low, since, events: [{type: SC|AR|ST|SPRING|TEST|SOS|LPS|UTAD|SOW|LPSY,
+      t, price}], redraw_rule}. Khac TR dang hieu luc thi TR cu duoc superseded_by, giu lai de review.
+    Tra ve codes, warnings, rejected, dashboard_url.
+    """
+    return _save_scenarios(_resolve_symbol(symbol), scenarios, bool(replace), _dash_day(bias_date), tr)
+
+
+def _review_bars(symbol: str, window: tuple[int, int | None]) -> list[dict[str, Any]]:
+    after, until = window
+    five = _tf_ms("5m")
+    end = until if until is not None else int(time.time() * 1000)
+    limit = min(20_000, max(0, end - after) // five + 3)
+    closed, _ = _split_closed(KLINE_STORE.get_klines(symbol, "5m", limit=limit, end_time=end), "5m")
+    # Kho khong con nen tu luc trigger thi khong ket luan: thieu nen de ra ket qua sai
+    if not closed or int(closed[0]["open_time"]) > after + five:
+        return []
+    return closed
+
+
+def _review_sync(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Tinh auto_outcome cho setup da ket thuc, luu mot lan. FILLED chua cham TP/SL thi tinh lai sau."""
+    reviews = PLANS.reviews([r["id"] for r in rows])
+    pending = [r for r in rows if r["status"] in entry_logic.TERMINAL
+               and (r["id"] not in reviews
+                    or (reviews[r["id"]]["auto_outcome"] is None and r["status"] == "FILLED"))]
+    if not pending:
+        return reviews
+    events = SETUPS.events_of([r["id"] for r in pending])
+    for setup in pending:
+        history = events[setup["id"]]
+        window = dashboard_logic.trigger_window(setup, history)
+        bars = _review_bars(setup["symbol"], window) if window else []
+        if window and not bars:
+            continue
+        outcome = dashboard_logic.auto_outcome(setup, history, bars)
+        if outcome is None and setup["status"] == "FILLED":
+            continue
+        reviews[setup["id"]] = PLANS.set_auto(setup["id"], outcome)
+    return reviews
+
+
+def _review_view(review: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not review:
+        return None
+    return {"outcome": review.get("outcome"), "auto_outcome": review.get("auto_outcome"),
+            "r_multiple": review.get("r_multiple"), "exchange_fill_ids": review.get("exchange_fill_ids") or [],
+            "note": review.get("note"), "reviewed_by": review.get("reviewed_by"),
+            "reviewed_at": _stamp(review["reviewed_at"]) if review.get("reviewed_at") else None}
+
+
+async def _dash_fills(symbol: str, day: str) -> dict[str, Any]:
+    """Vi the tren san trong ngay, kem setup_code; None = lenh khong gan setup nao."""
+    if not _account_enabled():
+        return {"enabled": False, "date": day, "positions": []}
+    data = await _dash_exchange(("fills", symbol, day), lambda: _account_day(day, [symbol]))
+    if data is None or data.get("errors"):
+        return {"enabled": True, "date": day, "positions": [], "error": "khong doc duoc lenh tu san"}
+    groups = []
+    for group in data["positions"]:
+        opening = [f for f in group["fills"] if abs(float(f.get("realized_pnl") or 0)) == 0]
+        qty = sum(float(f.get("qty") or 0) for f in opening)
+        groups.append({
+            "position_id": group["position_id"], "side": group["side"], "closed": group["closed"],
+            "carried_in": group["carried_in"], "fill_count": group["fill_count"],
+            "order_ids": group["order_ids"], "opened_at": group["opened_at"], "closed_at": group["closed_at"],
+            "opened_ms": int(group["fills"][0]["ts"]) if group["fills"] else None,
+            "qty": round(qty, 8),
+            "entry_price": round(sum(float(f["price"]) * float(f["qty"]) for f in opening) / qty, 8) if qty else None,
+            "realized_pnl": group["realized_pnl"], "fee": group["fee"]})
+    setups = SETUPS.list(symbol=symbol, bias_date=day)
+    ids = [s["id"] for s in setups]
+    reviews = PLANS.reviews(ids)
+    explicit = {s["code"]: reviews[s["id"]]["exchange_fill_ids"] for s in setups if s["id"] in reviews}
+    links = dashboard_logic.link_positions(groups, setups, SETUPS.events_of(ids), explicit)
+    hide = _dash_cfg()["hide_pnl"]
+    for group in groups:
+        group["setup_code"] = links.get(group["position_id"])
+        if hide:
+            group.pop("realized_pnl")
+            group.pop("fee")
+    return {"enabled": True, "date": day, "positions": groups,
+            "unlinked": sum(1 for g in groups if not g["setup_code"])}
+
+
+async def _save_review(setup_code: str, outcome: Any, r_multiple: Any, note: Any,
+                       reviewed_by: str) -> dict[str, Any]:
+    setup = SETUPS.get(str(setup_code or "").strip())
+    _review_sync([setup])
+    label = str(outcome).strip().lower() if outcome not in (None, "") else None
+    if label is not None and label not in dashboard_logic.OUTCOMES:
+        raise ValueError(f"outcome phai la mot trong {list(dashboard_logic.OUTCOMES)}")
+    r_value = None
+    if r_multiple not in (None, ""):
+        try:
+            r_value = float(r_multiple)
+        except (TypeError, ValueError):
+            raise ValueError(f"r_multiple phai la so, nhan duoc {r_multiple!r}") from None
+        if not math.isfinite(r_value):
+            raise ValueError("r_multiple khong hop le")
+    text = str(note).strip() if note is not None else None
+    if label is None and r_value is None and text is None:
+        raise ValueError("can it nhat mot trong outcome, r_multiple, note")
+    # Lien ket lenh san la phan them: san loi hoac dang tat thi van luu duoc review
+    fills = await _dash_fills(setup["symbol"], setup["bias_date"])
+    fill_ids = [oid for group in fills["positions"] if group.get("setup_code") == setup["code"]
+                for oid in group.get("order_ids") or []]
+    review = PLANS.save_review(setup["id"], outcome=label, r_multiple=r_value, note=text,
+                               reviewed_by=reviewed_by, fill_ids=fill_ids or None)
+    status = dashboard_logic.scenario_status_for(review.get("outcome"))
+    linked = PLANS.mark_linked(setup["symbol"], setup["bias_date"], setup["code"], status) if status else []
+    return {"setup_code": setup["code"], "review": _review_view(review), "scenarios_updated": linked,
+            **_dash_link(setup["symbol"], setup["bias_date"], "review")}
+
+
+@_tool_with_reasons()
+async def save_review(setup_code: str, outcome: str = "", r_multiple: float | None = None,
+                      note: str | None = None) -> dict[str, Any]:
+    """Gan ket qua review cho mot setup (id hoac code). Chi ghi de truong co truyen.
+
+    outcome: tp_hit | sl_hit | be | manual_exit | not_triggered | missed | invalidated.
+    auto_outcome do he thong tinh tu nen M5 sau TRIGGERED va giu nguyen du outcome bi ghi de.
+    r_multiple: R thuc te neu co lenh. Lenh san khop voi setup duoc tu luu vao exchange_fill_ids.
+    outcome tp_hit -> kich ban active gan voi setup sang played_out; sl_hit, invalidated -> failed.
+    """
+    return await _save_review(setup_code, outcome, r_multiple, note, "claude")
+
+
+def _review_stats(symbol: str, from_date: str, to_date: str, group_by: str) -> dict[str, Any]:
+    to_day = _dash_day(to_date)
+    from_day = (_dash_day(from_date) if str(from_date or "").strip() else
+                (datetime.strptime(to_day, "%Y-%m-%d") - timedelta(days=30)).strftime("%Y-%m-%d"))
+    if from_day > to_day:
+        raise ValueError(f"from ({from_day}) phai truoc to ({to_day})")
+    sym = _resolve_symbol(symbol) if str(symbol or "").strip() else None
+    setups = [s for s in SETUPS.list(symbol=sym) if from_day <= s["bias_date"] <= to_day]
+    reviews = _review_sync(setups)
+    events = SETUPS.events_of([s["id"] for s in setups])
+    rows = [{"symbol": s["symbol"], "trigger_type": s["trigger_type"], "direction": s["direction"],
+             "triggered": any(e["event"] == "TRIGGERED" for e in events[s["id"]]),
+             "outcome": (reviews.get(s["id"]) or {}).get("outcome"),
+             "r_multiple": (reviews.get(s["id"]) or {}).get("r_multiple")} for s in setups]
+    return {"symbol": sym, "from": from_day, "to": to_day, "group_by": group_by,
+            **dashboard_logic.review_stats(rows, group_by)}
+
+
+@_tool_with_reasons()
+def get_review_stats(symbol: str = "", from_date: str = "", to_date: str = "",
+                     group_by: str = "trigger_type") -> dict[str, Any]:
+    """Thong ke setup theo bias_date: so setup, ti le trigger, win rate, R trung binh.
+
+    symbol: bo trong = moi cap. to_date bo trong = hom nay; from_date bo trong = 30 ngay truoc to_date.
+    group_by: trigger_type | direction | symbol. win_rate = thang / lenh da dong (tp_hit, sl_hit, be,
+    manual_exit); thang la tp_hit, hoac be/manual_exit co R duong. avg_r chi tinh setup co r_multiple.
+    """
+    return _review_stats(symbol, from_date, to_date, group_by)
 
 
 # ---------------------------------------------------------------- admin
@@ -4544,6 +5187,8 @@ def _admin_nav() -> list[tuple[str, str, str]]:
         items.append(("gann", "Gann", ADMIN_GANN_PATH))
     items.append(("schedules", "Kéo nến", ADMIN_SCHEDULES_PATH))
     items.append(("alerts", "Vào lệnh", ADMIN_ALERTS_PATH))
+    # TM - #DASHBOARD - Setup dashboard
+    items.append(("dashboard", "Dashboard accounts", ADMIN_DASH_PATH))
     return items
 
 
@@ -5617,8 +6262,8 @@ async def _alerts_action(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             reason = str(payload.get("reason") or "").strip()
             if not reason:
                 raise ValueError("reason la bat buoc")
-            return 200, _setup_finish(SETUPS.get(str(payload.get("id") or "")), "CANCELLED",
-                                      "CANCELLED", {"reason": reason, "by": "admin"})
+            # TM - #DASHBOARD - Setup dashboard
+            return 200, _cancel_setup(str(payload.get("id") or ""), reason, "admin")
         if action == "setup_create":
             sym = _resolve_symbol(str(payload.get("symbol") or ""))
             return 200, _save_setups(sym, [payload.get("setup") or {}], False, "admin")
@@ -5661,6 +6306,402 @@ async def http_health(request):
     return JSONResponse({"status": "ok", "time": _now_iso()})
 
 
+# TM - #DASHBOARD - Setup dashboard: quan ly tai khoan tren trang admin (qua Basic auth nhu moi trang admin)
+ADMIN_DASH_PATH = ADMIN_PATH.rstrip("/") + "/dashboard-accounts"
+ADMIN_DASH_ACTION_PATH = ADMIN_DASH_PATH + "/action"
+
+
+def _dash_accounts_view() -> dict[str, Any]:
+    def when(ms: Any) -> str:
+        return _stamp(int(ms)) if ms else ""
+
+    return {
+        "users": [{**u, "last_login": when(u["last_login_at"]), "created": when(u["created_at"])}
+                  for u in DASH_AUTH.users()],
+        "audit": [{**a, "when": when(a["at"])} for a in DASH_AUTH.audit_log()],
+        "logins": [{**row, "when": when(row["at"])} for row in DASH_AUTH.login_log()],
+        "config": _dash_cfg(), "timeframes": list(DASH_TFS), "dashboard_path": DASH_PATH,
+        "config_file": str(DASH_FILE),
+    }
+
+
+def _dash_accounts_action(payload: dict[str, Any], ip: str | None) -> tuple[int, dict[str, Any]]:
+    action = str(payload.get("action") or "").strip().lower()
+    actor = STORE.username() or "setup-token"
+    ref = str(payload.get("id") or "")
+    try:
+        if action == "create":
+            generated = dashboard_auth.random_password() if payload.get("generate") else None
+            user = DASH_AUTH.create_user(str(payload.get("username") or ""),
+                                         generated or str(payload.get("password") or ""),
+                                         str(payload.get("role") or "viewer"), actor=actor, ip=ip)
+            return 200, {"ok": True, "username": user["username"], "generated_password": generated}
+        if action == "set_role":
+            DASH_AUTH.set_role(ref, str(payload.get("role") or ""), actor=actor, ip=ip)
+            return 200, {"ok": True}
+        if action == "reset_password":
+            generated = dashboard_auth.random_password() if payload.get("generate") else None
+            DASH_AUTH.reset_password(ref, generated or str(payload.get("password") or ""), actor=actor, ip=ip)
+            return 200, {"ok": True, "generated_password": generated}
+        if action == "set_active":
+            DASH_AUTH.set_active(ref, bool(payload.get("active")), actor=actor, ip=ip)
+            return 200, {"ok": True}
+        if action == "delete":
+            DASH_AUTH.delete_user(ref, actor=actor, ip=ip)
+            return 200, {"ok": True}
+        if action == "config_save":
+            clean = _dash_clean_cfg(payload.get("config"))
+            before = _dash_cfg()
+            _write_json(DASH_FILE, clean)
+            _DASH_CFG_CACHE.update(key=None, cfg=None)
+            DASH_AUTH.audit(actor, "config_save", "dashboard",
+                            {k: clean[k] for k in clean if clean[k] != before.get(k)}, ip)
+            return 200, {"ok": True}
+        return 400, {"error": f"action khong ho tro: {action!r}"}
+    except ValueError as exc:
+        return 400, {"error": str(exc)}
+
+
+@mcp.custom_route(ADMIN_DASH_PATH, methods=["GET"])
+async def http_admin_dashboard(request):
+    from starlette.responses import HTMLResponse
+    page = admin_dashboard.render(_dash_accounts_view(), action_path=ADMIN_DASH_ACTION_PATH,
+                                  admin_path=ADMIN_PATH, setup_required=not STORE.has_auth(), nav=_admin_nav())
+    return HTMLResponse(page, headers={"Cache-Control": "no-store"})
+
+
+@mcp.custom_route(ADMIN_DASH_ACTION_PATH, methods=["POST"])
+async def http_admin_dashboard_action(request):
+    # Trinh duyet tu gui kem Basic auth da luu. Bat buoc JSON de trang la khong gui ngam duoc
+    # (form cross-site khong dat duoc Content-Type nay ma khong qua preflight), tao owner gia.
+    if "application/json" not in (request.headers.get("content-type") or "").lower():
+        return JSONResponse({"error": "can Content-Type application/json"}, status_code=415)
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "body khong phai JSON"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "body phai la object"}, status_code=400)
+    if not _setup_ok(payload):
+        return JSONResponse({"error": "Setup token sai"}, status_code=403)
+    # Hash argon2 ton CPU, khong chay tren event loop
+    status, body = await asyncio.to_thread(_dash_accounts_action, payload, _dash_ip(request))
+    return JSONResponse(body, status_code=status, headers={"Cache-Control": "no-store"})
+
+
+# ---------------------------------------------------------------- setup dashboard: HTTP
+# TM - #DASHBOARD - Setup dashboard
+# Duong nay khong qua Basic auth (xem public_prefixes o build_app): dashboard co dang nhap rieng,
+# nen phien admin khong vao duoc day va cookie o day cung khong mo duoc trang admin.
+
+DASH_STATIC = Path(__file__).parent / "static"
+DASH_ASSETS = {
+    "dashboard.js": ("dashboard/dashboard.js", "text/javascript; charset=utf-8"),
+    "dashboard.css": ("dashboard/dashboard.css", "text/css; charset=utf-8"),
+    "lightweight-charts.js": ("vendor/lightweight-charts/lightweight-charts.standalone.production.js",
+                              "text/javascript; charset=utf-8"),
+}
+DASH_HEADERS = {
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
+    "Content-Security-Policy": ("default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+                                "img-src 'self' data:; connect-src 'self'; font-src 'self'; base-uri 'none'; "
+                                "form-action 'self'; frame-ancestors 'none'"),
+}
+DASH_LOGIN_BODY_MAX = 8192
+_DASH_ASSET_CACHE: dict[str, tuple[int, str, bytes, bytes]] = {}
+
+
+def _dash_ip(request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _dash_secure(response):
+    response.headers.update(DASH_HEADERS)
+    return response
+
+
+def _dash_json(body: Any, status: int = 200):
+    return _dash_secure(JSONResponse(body, status_code=status, headers={"Cache-Control": "no-store"}))
+
+
+def _dash_life_ms(remember: Any) -> int:
+    cfg = _dash_cfg()
+    return (int(cfg["remember_days"]) * 86_400_000 if remember
+            else int(cfg["session_hours"]) * 3_600_000)
+
+
+def _dash_set_cookie(response, token: str, life_ms: int) -> None:
+    response.set_cookie(DASH_COOKIE, token, max_age=life_ms // 1000, path=DASH_PATH, secure=True,
+                        httponly=True, samesite="lax")
+
+
+def _dash_login_url(target: str = "") -> str:
+    url = f"{DASH_PATH}/login"
+    return f"{url}?next={quote(target, safe='')}" if target else url
+
+
+def _dash_guard(*, page: bool = False, owner: bool = False):
+    """Dang ky route dashboard: 404 khi tat, kiem tra phien, quyen va CSRF ngay phia server."""
+    def decorator(fn):
+        async def endpoint(request):
+            if not _dash_cfg()["enabled"]:
+                return _dash_json({"error": "not found"}, 404)
+            token = request.cookies.get(DASH_COOKIE) or ""
+            session = DASH_AUTH.session(token)
+            if session is None:
+                if not page:
+                    return _dash_json({"error": "unauthorized"}, 401)
+                from starlette.responses import RedirectResponse
+                target = request.url.path + (f"?{request.url.query}" if request.url.query else "")
+                return _dash_secure(RedirectResponse(_dash_login_url(target), status_code=302))
+            if owner and session["role"] != "owner":
+                return _dash_json({"error": "forbidden"}, 403)
+            if request.method == "POST" and not secrets.compare_digest(
+                    request.headers.get("x-csrf-token") or "", session["csrf_token"]):
+                return _dash_json({"error": "csrf"}, 403)
+            try:
+                response = await fn(request, session)
+            except (ValueError, FileNotFoundError) as exc:
+                response = _dash_json({"error": str(exc)}, 400)
+            life = DASH_AUTH.touch(session, _dash_life_ms(session["remember"]))
+            if life:
+                _dash_set_cookie(response, token, life)
+            return _dash_secure(response)
+        endpoint.__name__ = fn.__name__
+        return endpoint
+    return decorator
+
+
+def _dash_route(path: str, methods: tuple[str, ...] = ("GET",), *, page: bool = False, owner: bool = False):
+    def decorator(fn):
+        mcp.custom_route(DASH_PATH + path, methods=list(methods))(_dash_guard(page=page, owner=owner)(fn))
+        return fn
+    return decorator
+
+
+def _dash_asset(name: str) -> tuple[int, str, bytes, bytes] | None:
+    item = DASH_ASSETS.get(name)
+    if item is None:
+        return None
+    path = DASH_STATIC / item[0]
+    mtime = path.stat().st_mtime_ns
+    hit = _DASH_ASSET_CACHE.get(name)
+    if hit is not None and hit[0] == mtime:
+        return hit
+    raw = path.read_bytes()
+    entry = (mtime, hashlib.sha256(raw).hexdigest()[:12], raw, gzip.compress(raw))
+    _DASH_ASSET_CACHE[name] = entry
+    return entry
+
+
+def _dash_asset_url(name: str) -> str:
+    return f"{DASH_PATH}/static/{name}?v={_dash_asset(name)[1]}"
+
+
+def _dash_symbol(request) -> str:
+    return _resolve_symbol(str(request.query_params.get("symbol") or ""))
+
+
+def _dash_for_role(session: dict[str, Any], setup: dict[str, Any]) -> dict[str, Any]:
+    """Viewer khong thay vi the: gia khop lay tu san, lenh OKX trong review, va moi ghi chu,
+    vi ghi chu la chu tu do, thuc te co nhac vi the that (vd note setup A ngay 07/11)."""
+    if session["role"] == "owner":
+        return setup
+    out = {k: v for k, v in setup.items() if k != "note"}
+    last = out.get("last_event")
+    if last and last["event"] == "FILLED":
+        out["last_event"] = {**last, "price": None}
+    if out.get("review"):
+        out["review"] = {k: v for k, v in out["review"].items() if k not in ("exchange_fill_ids", "note")}
+    return out
+
+
+@_dash_route("", page=True)
+async def http_dash_page(request, session):
+    from starlette.responses import HTMLResponse
+    cfg = _dash_cfg()
+    boot = {"base": DASH_PATH, "role": session["role"], "username": session["username"],
+            "csrf": session["csrf_token"], "tz": str(TZ), "today": _today(),
+            "poll_seconds": cfg["poll_seconds"], "default_tf": cfg["default_tf"],
+            "default_bars": cfg["default_bars"], "default_symbol": _resolve_symbol(""), "symbols": _symbols(),
+            "timeframes": list(DASH_TFS), "outcomes": list(dashboard_logic.OUTCOMES),
+            "group_by": list(dashboard_logic.GROUP_BY)}
+    page = dashboard_ui.app_page(boot, {name: _dash_asset_url(name) for name in DASH_ASSETS})
+    return HTMLResponse(page, headers={"Cache-Control": "no-store"})
+
+
+@_dash_route("/static/{name}")
+async def http_dash_static(request, session):
+    from starlette.responses import Response
+    asset = _dash_asset(request.path_params["name"])
+    if asset is None:
+        return _dash_json({"error": "not found"}, 404)
+    headers = {"Cache-Control": "private, max-age=604800, immutable", "ETag": f'"{asset[1]}"',
+               "Vary": "Accept-Encoding"}
+    if "gzip" in (request.headers.get("accept-encoding") or ""):
+        headers["Content-Encoding"] = "gzip"
+        body = asset[3]
+    else:
+        body = asset[2]
+    return Response(body, media_type=DASH_ASSETS[request.path_params["name"]][1], headers=headers)
+
+
+@_dash_route("/api/symbols")
+async def http_dash_symbols(request, session):
+    return _dash_json({"symbols": _symbols(), "default": _resolve_symbol("")})
+
+
+@_dash_route("/api/chart")
+async def http_dash_chart(request, session):
+    query = request.query_params
+    owner = session["role"] == "owner"
+    data = await _chart_data(_dash_symbol(request), query.get("tf") or _dash_cfg()["default_tf"],
+                             query.get("bars") or _dash_cfg()["default_bars"], query.get("date"),
+                             query.get("include_forming") in ("1", "true"), query.get("revision"),
+                             positions=owner)
+    if not owner:
+        data["setups"] = [_dash_for_role(session, s) for s in data["setups"]]
+        data["scenarios"] = [{**s, "points": [{k: v for k, v in p.items() if k != "note"} for p in s["points"]]}
+                             for s in data["scenarios"]]
+    return _dash_json(data)
+
+
+@_dash_route("/api/setups")
+async def http_dash_setups(request, session):
+    symbol, day = _dash_symbol(request), _dash_day(request.query_params.get("date"))
+    rows = SETUPS.list(symbol=symbol, bias_date=day)
+    reviews = _review_sync(rows)
+    last = SETUPS.last_events([r["id"] for r in rows])
+    setups = [_dash_for_role(session, {**_dash_setup(r, last.get(r["id"])),
+                                       "review": _review_view(reviews.get(r["id"]))}) for r in rows]
+    return _dash_json({"symbol": symbol, "date": day, "watcher_enabled": _watcher_active(),
+                       "price": _last_price(symbol), "setups": setups})
+
+
+@_dash_route("/api/events")
+async def http_dash_events(request, session):
+    symbol, day = _dash_symbol(request), _dash_day(request.query_params.get("date"))
+    start, end = _day_window_ms(day)
+    rows = [_dash_event(e) for e in SETUPS.events(symbol=symbol, start_ms=start, end_ms=end)]
+    if session["role"] != "owner":
+        rows = [{**e, "price": None if e["event"] == "FILLED" else e["price"]}
+                for e in rows if e["event"] != "UNPLANNED_POSITION"]
+    return _dash_json({"symbol": symbol, "date": day, "events": rows[::-1]})
+
+
+@_dash_route("/api/snapshots")
+async def http_dash_snapshots(request, session):
+    symbol, day = _dash_symbol(request), _dash_day(request.query_params.get("date"))
+    return _dash_json({"symbol": symbol, "date": day, "snapshots": PLANS.snapshots(symbol, day)})
+
+
+@_dash_route("/api/positions", owner=True)
+async def http_dash_positions(request, session):
+    symbol = _dash_symbol(request)
+    return _dash_json({"symbol": symbol, **await _dash_positions(symbol)})
+
+
+@_dash_route("/api/fills", owner=True)
+async def http_dash_fills(request, session):
+    symbol = _dash_symbol(request)
+    return _dash_json({"symbol": symbol, **await _dash_fills(symbol, _dash_day(request.query_params.get("date")))})
+
+
+@_dash_route("/api/reviews", methods=("POST",), owner=True)
+async def http_dash_reviews(request, session):
+    try:
+        payload = await request.json()
+    except Exception:
+        raise ValueError("body khong phai JSON") from None
+    if not isinstance(payload, dict):
+        raise ValueError("body phai la object")
+    return _dash_json(await _save_review(payload.get("setup_code"), payload.get("outcome"),
+                                         payload.get("r_multiple"), payload.get("note"), session["username"]))
+
+
+@_dash_route("/api/review-stats")
+async def http_dash_review_stats(request, session):
+    query = request.query_params
+    return _dash_json(_review_stats(query.get("symbol") or "", query.get("from") or "", query.get("to") or "",
+                                    query.get("group_by") or "trigger_type"))
+
+
+@mcp.custom_route(DASH_PATH + "/login", methods=["GET", "POST"])
+async def http_dash_login(request):
+    from starlette.responses import HTMLResponse, RedirectResponse
+    cfg = _dash_cfg()
+    if not cfg["enabled"]:
+        return _dash_json({"error": "not found"}, 404)
+
+    def form_page(status: int = 200, error: str = "", next_url: str = "", username: str = ""):
+        return _dash_secure(HTMLResponse(
+            dashboard_ui.login_page(action=f"{DASH_PATH}/login", next_url=next_url, error=error,
+                                    username=username, remember_days=int(cfg["remember_days"])),
+            status_code=status, headers={"Cache-Control": "no-store"}))
+
+    token = request.cookies.get(DASH_COOKIE) or ""
+    if request.method == "GET":
+        target = dashboard_logic.safe_next(request.query_params.get("next"), DASH_PATH)
+        if DASH_AUTH.session(token):
+            return _dash_secure(RedirectResponse(target, status_code=302))
+        return form_page(next_url=target)
+
+    body = await request.body()
+    if len(body) > DASH_LOGIN_BODY_MAX:
+        return _dash_json({"error": "body qua lon"}, 413)
+    form = parse_qs(body.decode("utf-8", "replace"), keep_blank_values=True)
+
+    def field(name: str) -> str:
+        return (form.get(name) or [""])[0]
+
+    target = dashboard_logic.safe_next(field("next"), DASH_PATH)
+    username, ip = field("username").strip(), _dash_ip(request)
+    if DASH_AUTH.locked_until(ip):
+        DASH_AUTH.log_login(username, ip, False, "locked")
+        return form_page(429, f"Tạm khoá đăng nhập từ địa chỉ này do sai quá nhiều lần "
+                              f"(tối đa {cfg['login_lockout_minutes']} phút).", target, username)
+    user = await asyncio.to_thread(DASH_AUTH.authenticate, username, field("password"))
+    if user is None:
+        locked = DASH_AUTH.record_failure(ip, int(cfg["login_max_attempts"]), float(cfg["login_lockout_minutes"]))
+        DASH_AUTH.log_login(username, ip, False, "bad_credentials")
+        if locked:
+            return form_page(429, f"Sai quá {cfg['login_max_attempts']} lần, tạm khoá "
+                                  f"{cfg['login_lockout_minutes']} phút.", target, username)
+        return form_page(401, "Sai tên đăng nhập hoặc mật khẩu.", target, username)
+    DASH_AUTH.clear_failures(ip)
+    if token:
+        DASH_AUTH.destroy(token)
+    remember = bool(field("remember"))
+    life = _dash_life_ms(remember)
+    new_token, _ = DASH_AUTH.create_session(user, ip=ip, user_agent=request.headers.get("user-agent"),
+                                            remember=remember, life_ms=life)
+    DASH_AUTH.log_login(user["username"], ip, True)
+    response = RedirectResponse(target, status_code=303)
+    _dash_set_cookie(response, new_token, life)
+    return _dash_secure(response)
+
+
+@mcp.custom_route(DASH_PATH + "/logout", methods=["POST"])
+async def http_dash_logout(request):
+    from starlette.responses import RedirectResponse
+    if not _dash_cfg()["enabled"]:
+        return _dash_json({"error": "not found"}, 404)
+    token = request.cookies.get(DASH_COOKIE) or ""
+    session = DASH_AUTH.session(token)
+    if session is not None:
+        body = await request.body()
+        form = parse_qs(body[:DASH_LOGIN_BODY_MAX].decode("utf-8", "replace"))
+        if not secrets.compare_digest((form.get("csrf") or [""])[0], session["csrf_token"]):
+            return _dash_json({"error": "csrf"}, 403)
+        DASH_AUTH.destroy(token)
+    response = RedirectResponse(_dash_login_url(), status_code=303)
+    response.delete_cookie(DASH_COOKIE, path=DASH_PATH, secure=True, httponly=True, samesite="lax")
+    return _dash_secure(response)
+
+
 # ---------------------------------------------------------------- auth
 
 class BasicAuthMiddleware:
@@ -5672,11 +6713,14 @@ class BasicAuthMiddleware:
 
     def __init__(self, app, store, realm: str,
                  public_paths: tuple[str, ...] = (),
-                 setup_paths: tuple[str, ...] = ()):
+                 setup_paths: tuple[str, ...] = (),
+                 public_prefixes: tuple[str, ...] = ()):
         self.app = app
         self.store = store
         self.realm = realm
         self.public_paths = public_paths
+        # TM - #DASHBOARD - Setup dashboard: nhanh co dang nhap rieng, tu kiem tra phien
+        self.public_prefixes = public_prefixes
         # Duong chi mo khi CHUA co mat khau nao - de con vao dat mat khau lan dau.
         # Ban than chung van doi setup token moi ghi duoc gi.
         self.setup_paths = setup_paths
@@ -5698,8 +6742,11 @@ class BasicAuthMiddleware:
             return False
         return self.store.verify(raw, user, pwd)
 
+    def _own_login(self, path: str) -> bool:
+        return ".." not in path and any(path == p or path.startswith(p + "/") for p in self.public_prefixes)
+
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope["path"] in self.public_paths:
+        if scope["type"] != "http" or scope["path"] in self.public_paths or self._own_login(scope["path"]):
             await self.app(scope, receive, send)
             return
         # Chua cai dat gi: cho vao trang admin, moi duong khac van dong
@@ -5745,7 +6792,11 @@ def build_app():
                          # TM - #M5-FETCH - Per-timeframe schedules + M5
                          ADMIN_SCHEDULES_PATH, ADMIN_SCHEDULES_ACTION_PATH,
                          # TM - #ENTRY-ALERT - Entry setups & alerts
-                         ADMIN_ALERTS_PATH, ADMIN_ALERTS_ACTION_PATH),
+                         ADMIN_ALERTS_PATH, ADMIN_ALERTS_ACTION_PATH,
+                         # TM - #DASHBOARD - Setup dashboard
+                         ADMIN_DASH_PATH, ADMIN_DASH_ACTION_PATH),
+            # TM - #DASHBOARD - Setup dashboard
+            public_prefixes=(DASH_PATH,),
         )
 
     inner = app.router.lifespan_context

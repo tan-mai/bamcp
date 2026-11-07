@@ -224,7 +224,7 @@ def _htf_lines(setup: dict[str, Any]) -> list[str]:
 
 
 def setup_alert(setup: dict[str, Any], event: dict[str, Any], tz: ZoneInfo,
-                params: dict[str, Any] | None = None) -> Alert:
+                params: dict[str, Any] | None = None, *, link: str | None = None) -> Alert:
     state = setup.get("state") or {}
     details = event.get("details") or {}
     name = event["event"]
@@ -302,6 +302,9 @@ def setup_alert(setup: dict[str, Any], event: dict[str, Any], tz: ZoneInfo,
         # Tin MISSED co dong ma setup o dong 2; cac tin khac o dong 1
         at = 2 if name == "MISSED" else 1
         lines[at:at] = _htf_lines(setup)
+    # TM - #DASHBOARD - Setup dashboard
+    if link:
+        lines.append(f"📊 Dashboard: {link}")
     return Alert("\n".join(lines), title=f"{setup['code']} {name}",
                  meta={"setup_id": setup["id"], "event": name})
 

@@ -286,7 +286,16 @@ def step(setup: dict[str, Any], bar: dict[str, Any], ctx: dict[str, Any]
         return finish()
 
     inv = float(setup["invalidate_level"])
-    if (close < inv) if long else (close > inv):
+    # TM - #DASHBOARD - Setup dashboard: setup breakout co invalidate_level nam ben kia gia luc
+    # tao, nen chi xet sau khi da co nen dong dat confirm. Chot lai trong state, khong mat di.
+    armed = True
+    if setup.get("invalidate_after_confirm"):
+        if not state.get("confirm_reached"):
+            level = float(setup["confirm_level"])
+            if (close > level) if setup["confirm_type"] == "close_above" else (close < level):
+                state["confirm_reached"] = True
+        armed = bool(state.get("confirm_reached"))
+    if armed and ((close < inv) if long else (close > inv)):
         m15 = ctx.get("m15_close")
         m15_ok = (not setup.get("m15_filter")) or (
             m15 is not None and ((m15 < inv) if long else (m15 > inv)))
@@ -402,6 +411,12 @@ def validate(raw: dict[str, Any], *, min_rr: float, now_ms: int,
         if confirm not in CONFIRMS:
             raise ValueError(f"confirm_type phai la null hoac mot trong {list(CONFIRMS)}")
         confirm_level = num("confirm_level")
+    # TM - #DASHBOARD - Setup dashboard: mac dinh true khi co confirm_type
+    after_confirm = raw.get("invalidate_after_confirm")
+    after_confirm = (confirm is not None if after_confirm is None
+                     else after_confirm not in (False, 0, "0", "false"))
+    if after_confirm and confirm is None:
+        raise ValueError("invalidate_after_confirm chi dung duoc khi co confirm_type")
     max_chase = num("max_chase", required=False)
     if max_chase is not None and max_chase <= 0:
         raise ValueError("max_chase phai > 0 (bo trong = tu tinh)")
@@ -447,4 +462,10 @@ def validate(raw: dict[str, Any], *, min_rr: float, now_ms: int,
         "tr_low": num("tr_low", required=False), "tr_since": tr_since,
         "note": str(raw.get("note") or "") or None, "x_max": xm,
         "max_chase_effective": effective_max_chase(max_chase, xm),
+        "invalidate_after_confirm": after_confirm,
     }
+
+
+# TM - #DASHBOARD - Setup dashboard
+def invalidate_broken(direction: str, invalidate_level: float, price: float) -> bool:
+    return price <= invalidate_level if direction == "long" else price >= invalidate_level

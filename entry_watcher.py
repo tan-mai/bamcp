@@ -35,9 +35,12 @@ class EntryWatcher:
                  now_ms: Callable[[], int] | None = None,
                  sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
                  deliver: Callable[..., Awaitable[str | None]] = notifier.deliver,
-                 refresh: Callable[[str, str], Awaitable[None]] | None = None) -> None:
+                 refresh: Callable[[str, str], Awaitable[None]] | None = None,
+                 link: Callable[[dict[str, Any]], str | None] | None = None) -> None:
         self.store = store
         self.refresh = refresh
+        # TM - #DASHBOARD - Setup dashboard: link dashboard kem trong tin push
+        self.link = link
         self.klines = klines
         self.cfg = cfg
         self.min_rr = min_rr
@@ -87,7 +90,8 @@ class EntryWatcher:
         if event["setup_id"]:
             setup = setup or self.store.get(event["setup_id"])
             alert = notifier.setup_alert(setup, event, self.display_tz(),
-                                         self.params_for(setup["symbol"], setup))
+                                         self.params_for(setup["symbol"], setup),
+                                         link=self.link(setup) if self.link else None)
         else:
             alert = notifier.system_alert(event["event"], event["details"], self.display_tz())
         error = await self.deliver(self.cfg().get("notify") or {}, alert)

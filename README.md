@@ -42,6 +42,10 @@ Tuỳ chọn đọc tài khoản thật từ Binance, Bybit hoặc OKX bằng AP
 | `get_setup_params` | Tham số setup đang áp dụng cho một cặp, gồm ngưỡng volume gợi ý cho `rejection` |
 | `cancel_setup` | Huỷ đúng một setup (bắt buộc lý do) |
 | `get_setup_events` | Lịch sử chuyển trạng thái và tin đã gửi |
+| `save_scenarios` | Lưu kịch bản giá và TR khoá của một ngày, gọi ngay sau `save_setups` |
+| `get_chart_data` | Một lần gọi đủ dữ liệu vẽ biểu đồ: nến, `vol_spike`, bias, setup, kịch bản, TR, mức HTF, vị thế |
+| `save_review` | Gắn kết quả review cho một setup; `auto_outcome` của hệ thống giữ nguyên |
+| `get_review_stats` | Thống kê setup theo khoảng ngày: tỉ lệ trigger, win rate, R trung bình |
 | `migrate_klines` | `import` nến JSON sang SQLite / `verify` đối chiếu hai bên (xem [Lưu nến trong SQLite](#lưu-nến-trong-sqlite)) |
 
 Không có tool đặt lệnh. Cố ý. Plan của ORB chỉ là con số đề xuất — người dùng tự đặt lệnh trên sàn.
@@ -387,7 +391,7 @@ Lúc này `/admin` mở công khai nhưng **không ghi được gì nếu thiế
 
 ### Sau khi đăng nhập
 
-Thanh trên cùng của mọi trang admin dẫn tới: **Cài đặt** (`/admin`), **Phiên ORB** (`/admin/orb`), **Gann** (`/admin/gann`), **Kéo nến** (`/admin/schedules`), **Vào lệnh** (`/admin/alerts`). Phiên ORB và Gann chỉ hiện khi module tương ứng bật (`orb.enabled`, `time_windows.enabled`).
+Thanh trên cùng của mọi trang admin dẫn tới: **Cài đặt** (`/admin`), **Phiên ORB** (`/admin/orb`), **Gann** (`/admin/gann`), **Kéo nến** (`/admin/schedules`), **Vào lệnh** (`/admin/alerts`), **Dashboard accounts** (`/admin/dashboard-accounts`). Phiên ORB và Gann chỉ hiện khi module tương ứng bật (`orb.enabled`, `time_windows.enabled`).
 
 Trang **Cài đặt** chia hai cột — bên trái là kết nối, bên phải là quy định:
 
@@ -477,7 +481,7 @@ Server **từ chối khởi động** nếu `auth.enabled: true` mà thiếu cre
 
 So sánh credential dùng `secrets.compare_digest` cho cả hai vế, không short-circuit.
 
-`/healthz` là đường public duy nhất; `/mcp` cần auth.
+`/healthz` là đường public duy nhất; `/mcp` cần auth. Riêng `/setup-dashboard` không qua Basic auth vì có đăng nhập riêng, xem [Setup dashboard](#setup-dashboard).
 
 ## Bề mặt HTTP
 
@@ -495,10 +499,16 @@ Các đường chính:
 | `GET /admin/alerts` | có* | thông báo Discord/Telegram, watcher, setups |
 | `POST /admin/alerts/action` | có* | lưu thông báo / gửi thử / lưu watcher / huỷ, tạo setup, timeline — trang trên gọi |
 | `POST /admin/schedules/action` | có* | thêm / sửa / bật tắt / xoá / chạy ngay / xem trước cron — trang trên gọi |
+| `GET /admin/dashboard-accounts` | có* | tài khoản, cấu hình, audit log và lịch sử đăng nhập của dashboard |
+| `POST /admin/dashboard-accounts/action` | có* | tạo / sửa / bật tắt / xoá tài khoản, lưu cấu hình — trang trên gọi |
+| `GET, POST /setup-dashboard/login` | không | form đăng nhập dashboard, khoá theo IP khi sai nhiều lần |
+| `POST /setup-dashboard/logout` | phiên | xoá phiên |
+| `GET /setup-dashboard` | phiên | trang dashboard |
+| `/setup-dashboard/api/*` | phiên | API JSON cho trang, xem [Setup dashboard](#setup-dashboard) |
 
 `*` `/admin` mở công khai khi **chưa** đặt mật khẩu lần nào, nhưng lúc đó phải có setup token mới ghi được. Xem mục [Trang admin](#trang-admin).
 
-Không có REST API nào khác. Muốn pull dữ liệu ngay thì bảo Claude gọi tool `refresh_data`.
+Ngoài API của dashboard thì không có REST API nào khác. Muốn pull dữ liệu ngay thì bảo Claude gọi tool `refresh_data`.
 
 ## Cấu trúc thư mục dữ liệu
 
@@ -507,6 +517,7 @@ Không có REST API nào khác. Muốn pull dữ liệu ngay thì bảo Claude g
 ├── klines/    1w.json  1d.json  4h.json  1h.json  15m.json   # storage.kline_store = json
 ├── bamcp.db              # SQLite: bảng klines (storage.kline_store = sqlite), fetch_schedules, setups, setup_events, setup_params
 ├── alerts/config.json    # khối notify + watcher do /admin/alerts ghi (webhook, bot token)
+├── dashboard/config.json # khối dashboard do /admin/dashboard-accounts ghi
 ├── bias/      2026-09-12.json
 ├── rules.json            # rule chung + phần đặt riêng từng cặp + khối orb (rule ORB) + lịch sử đổi
 ├── settings.json         # username/password (hash) + credential sàn — chmod 600
@@ -592,6 +603,73 @@ Khớp lệnh OKX: mỗi lượt quét, cặp có setup từ TRIGGERED trở đi
 Trang `/admin/alerts`: kênh + webhook / bot token / chat id (che, chỉ ghi đè khi nhập mới), nút Gửi thử Discord / Gửi thử Telegram (dùng cấu hình đã lưu, thử riêng từng kênh, không retry); watcher bật/tắt, `watch_symbols`, `plan_deadline_utc`, bảng tham số mặc định + override theo cặp; danh sách setup theo ngày/trạng thái, timeline event, huỷ, form tạo setup tay. Tham số theo cặp lưu vào bảng `setup_params`, phần còn lại vào `alerts/config.json`, đều có hiệu lực ngay.
 
 Sau deploy, phía Claude: dời task phân tích bias sang 00:05 UTC và kết thúc bằng `save_setups(..., replace=true)` cho từng cặp; khi hỏi "vào được chưa" thì đọc `get_setups` + `get_setup_events` trước, rồi mới đọc nến M5/M15 đã đóng.
+
+`invalidate_level` đã bị phá tại giá hiện tại (long: giá ≤ mức, short: giá ≥ mức, lấy giá đóng mới nhất) thì `save_setups` từ chối setup đó, vì lưu vào cũng bị huỷ ngay nến đầu. Setup breakout có `invalidate_level` nằm bên kia giá thì khai `confirm_type`: cờ `invalidate_after_confirm` mặc định bật, mức này chỉ được xét sau khi đã có nến đóng đạt `confirm_level` (chốt vào `state.confirm_reached`, không mất đi). Setup lưu trước bản này giữ hành vi cũ.
+
+## Setup dashboard
+
+Trang `https://bamcp.online/setup-dashboard` vẽ bias, setup, kịch bản và TR của từng cặp lên biểu đồ nến, cập nhật theo watcher, kèm chế độ review theo ngày. Trang chỉ đọc: không endpoint nào đặt, sửa, huỷ lệnh hay setup. Ngoại lệ duy nhất là lưu kết quả review.
+
+Deep link, cũng là dạng `dashboard_url` mà tool và tin push trả về: `/setup-dashboard?symbol=ETHUSDT&date=2026-11-07&mode=review&tf=15m`.
+
+### Quy trình cho Claude
+
+1. `save_bias` → `save_setups` → `save_scenarios(symbol, scenarios, tr=...)`. Mỗi lần lưu sinh một snapshot bất biến (`plan_snapshots`).
+2. Cần vẽ biểu đồ inline thì gọi `get_chart_data`, cùng một nguồn với trang.
+3. Cuối ngày: `get_chart_data(date=..., revision="origin")` để so kế hoạch gốc với nến thật, rồi `save_review`.
+
+Kịch bản: `points` có ít nhất 2 điểm, thời gian tăng dần; `t` là epoch ms, `'YYYY-MM-DD HH:MM'` giờ VN, hoặc offset `{bars, tf}` tính từ nến đã đóng cuối lúc lưu. Đổi trạng thái một kịch bản đã có: `save_scenarios(symbol, [{code, status}], replace=false)`.
+
+### Tài khoản và đăng nhập
+
+Tài khoản nằm trong bảng `dashboard_users`, quản lý ở `/admin/dashboard-accounts`. Mật khẩu hash argon2, không dùng chung với admin: phiên admin không vào được dashboard và ngược lại. Mất quyền vào admin thì tạo lại owner bằng lệnh dự phòng:
+
+```bash
+docker exec -it bamcp bamcp dashboard create-owner <username>   # ngoài Docker: python bamcp_cli.py dashboard ...
+```
+
+Username đã có thì lệnh khôi phục thành owner đang hoạt động, đặt lại mật khẩu và đăng xuất mọi phiên của tài khoản đó.
+
+| Quyền | `owner` | `viewer` |
+|---|---|---|
+| Xem Live, Review, tab Thống kê | có | có |
+| Lưu kết quả review | có | không (API 403) |
+| Vị thế mở, PnL, lệnh OKX | có | không (API 403, `/api/chart` không có `positions`, timeline bỏ `UNPLANNED_POSITION` và giá khớp) |
+| Ghi chú: `note` của setup, ghi chú review, `note` của điểm kịch bản | có | không (API không trả) |
+
+Viewer vẫn đọc được `summary`, `action_zone` của bias và `label`, `condition` của kịch bản, nên không ghi số vị thế hay PnL vào các chỗ đó. `notes` của `save_bias` không gửi xuống trình duyệt với mọi tài khoản.
+
+Cookie `HttpOnly; Secure; SameSite=Lax`, hết hạn trượt `session_hours`, tick "Ghi nhớ" thì `remember_days`. DB chỉ lưu SHA-256 của token. Sai liên tiếp `login_max_attempts` lần theo IP thì khoá `login_lockout_minutes` phút; IP lấy từ `X-Forwarded-For` do proxy đặt (`server.behind_proxy`), nên proxy phải ghi đè header này từ client, Traefik và Caddy mặc định đã làm vậy. Cookie `Secure` nghĩa là chạy thử chỉ đăng nhập được qua HTTPS hoặc `http://localhost`, không qua IP LAN.
+
+### API của trang
+
+Tất cả dưới `/setup-dashboard/api`, cần phiên, trả JSON, dùng chung hàm với tool MCP. `POST` cần header `X-CSRF-Token`.
+
+| Method + path | Dùng cho | Quyền |
+|---|---|---|
+| `GET /symbols` | Danh sách cặp | mọi tài khoản |
+| `GET /chart?symbol&tf&bars&date&revision&include_forming` | Toàn bộ dữ liệu biểu đồ, cache tới khi có nến mới hoặc kế hoạch đổi | mọi tài khoản |
+| `GET /setups?symbol&date` | Thẻ setup + review | mọi tài khoản |
+| `GET /events?symbol&date` | Timeline | mọi tài khoản |
+| `GET /snapshots?symbol&date` | Danh sách revision | mọi tài khoản |
+| `GET /review-stats?symbol&from&to&group_by` | Tab Thống kê | mọi tài khoản |
+| `GET /positions?symbol` | Vị thế mở, gọi sàn cache 30 giây | owner |
+| `GET /fills?symbol&date` | Lệnh OKX trong ngày, `setup_code` rỗng là lệnh không gắn setup | owner |
+| `POST /reviews` | Lưu review `{setup_code, outcome, r_multiple, note}` | owner |
+
+### Review
+
+Mặc định Review vẽ **kế hoạch gốc**: mỗi phần (bias, setup, kịch bản, TR) lấy bản đầu tiên có nội dung trong ngày. Lý do: quy trình chuẩn là `save_bias` trước, nên revision 1 thường chỉ có bias. Dropdown vẫn chọn được đúng từng revision, kể cả R1. Nến luôn là thật, vẽ tới hết ngày bias + 24h.
+
+`auto_outcome` được tính lần đầu khi đọc setup đã kết thúc, từ nến M5 sau `TRIGGERED` đầu tiên qua được confirm: chạm TP trước là `tp_hit`, chạm SL trước hoặc cùng nến là `sl_hit`. Setup `FILLED` chưa chạm mốc nào thì để trống và tính lại lần sau; kho không còn nến từ lúc trigger thì không kết luận. `save_review` ghi đè `outcome`, không đụng `auto_outcome`. Khi lưu, `tp_hit` chuyển kịch bản active gắn với setup sang `played_out`; `sl_hit`, `invalidated` sang `failed`.
+
+Win rate = thắng / lệnh đã đóng (`tp_hit`, `sl_hit`, `be`, `manual_exit`); thắng là `tp_hit`, hoặc `be` / `manual_exit` có R dương. R trung bình chỉ tính setup có `r_multiple`.
+
+### Cấu hình
+
+Khối `dashboard` trong `config.yaml` là giá trị khởi tạo; sửa ở `/admin/dashboard-accounts` thì ghi vào `dashboard/config.json` và có hiệu lực ngay. `enabled: false` thì mọi route trả 404 và tool không trả link. `hide_pnl: true` thì số PnL không xuống trình duyệt, kể cả owner.
+
+Nến đang chạy: kho SQLite không lưu nến chưa đóng nên server ghép từ các nến M5 đã đóng, trễ tối đa một nến M5; khung 5M vì thế không có nến đang chạy. Biểu đồ dùng TradingView Lightweight Charts 4.2.3 (Apache 2.0), tự host trong `static/vendor/`.
 
 ## Lưu nến trong SQLite
 
@@ -740,7 +818,7 @@ Mở `http://127.0.0.1:8848/healthz`.
 .venv\Scripts\python -m pytest tests -q
 ```
 
-Test không gọi mạng và không đụng `data/` thật: chúng dùng thư mục tạm, sàn giả và đồng hồ giả. Bộ test gồm logic ORB (`test_orb_logic.py`), scheduler + watch M5 (`test_orb_runtime.py`), trang admin + backtest (`test_orb_admin_backtest.py`), bộ rule ORB riêng theo các acceptance criteria của BR (`test_orb_rules.py`), và tầng tool của server — trong đó có kiểm tra tool cũ không đổi khi không truyền tham số ORB (`test_server.py`).
+Test không gọi mạng và không đụng `data/` thật: chúng dùng thư mục tạm, sàn giả và đồng hồ giả. Bộ test gồm logic ORB (`test_orb_logic.py`), scheduler + watch M5 (`test_orb_runtime.py`), trang admin + backtest (`test_orb_admin_backtest.py`), bộ rule ORB riêng theo các acceptance criteria của BR (`test_orb_rules.py`), tầng tool của server — trong đó có kiểm tra tool cũ không đổi khi không truyền tham số ORB (`test_server.py`), và setup dashboard theo các tiêu chí nghiệm thu, gồm cả gọi HTTP qua middleware (`test_dashboard.py`).
 
 ## Gắn vào Claude
 

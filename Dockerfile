@@ -44,6 +44,13 @@ COPY sqlite_db.py kline_store.py kline_migrate.py ./
 COPY cron_utc.py fetch_schedules.py admin_schedules.py ./
 # TM - #ENTRY-ALERT - Entry setups & alerts
 COPY entry_logic.py entry_store.py entry_watcher.py notifier.py admin_entry.py ./
+# TM - #DASHBOARD - Setup dashboard
+COPY dashboard_logic.py dashboard_store.py dashboard_auth.py dashboard_ui.py admin_dashboard.py bamcp_cli.py ./
+COPY static ./static
+# Lenh `bamcp dashboard create-owner <username>`. Sinh ngay trong image de khong phu thuoc
+# kieu xuong dong cua file tren may build.
+RUN printf '#!/bin/sh\nexec python /app/bamcp_cli.py "$@"\n' > /usr/local/bin/bamcp \
+    && chmod 755 /usr/local/bin/bamcp
 
 RUN mkdir -p /data/klines /data/bias /data/journal /data/journal/orb_skips \
              /data/orb/state /data/orb/logs /data/orb/history /data/orb/backtests \

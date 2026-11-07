@@ -1,0 +1,132 @@
+/* TM - #DASHBOARD - Setup dashboard */
+:root {
+  color-scheme: light dark;
+  --bg: #f3f4f6; --surface: #ffffff; --surface-2: #f4f5f7; --ink: #111827; --muted: #5f6775;
+  --line: #e2e5ea; --line-strong: #cdd2da; --grid: #eef0f3; --accent: #2563eb;
+  --long: #0a8f6c; --short: #d43a3a; --warn: #a15c07; --warn-soft: #fff7e8; --warn-line: #f2d08a;
+  --neutral: #6b7280; --entry: #2563eb; --invalidate: #c2710c; --tr: #7c5cd6;
+  --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0b0d12; --surface: #141820; --surface-2: #1b2029; --ink: #e7e9ee; --muted: #9aa3b2;
+    --line: #262c38; --line-strong: #363e4d; --grid: #1c212b; --accent: #5b96f8;
+    --long: #2fc99b; --short: #f26d6d; --warn: #f0b64a; --warn-soft: rgba(240,182,74,.1); --warn-line: rgba(240,182,74,.35);
+    --neutral: #9aa3b2; --entry: #6ea3fa; --invalidate: #e39a44; --tr: #a58bf0;
+  }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+h2 { margin: 0 0 10px; font-size: 14px; font-weight: 650; }
+button, select, input, textarea { font: inherit; color: inherit; }
+select, input[type=date], input[type=number], textarea {
+  min-height: 36px; padding: 5px 8px; background: var(--surface); border: 1px solid var(--line-strong); border-radius: 8px;
+}
+textarea { width: 100%; min-height: 60px; resize: vertical; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Thanh tren */
+.bar { position: sticky; top: 0; z-index: 20; background: var(--surface); border-bottom: 1px solid var(--line); }
+.bar-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; max-width: 1560px; margin: 0 auto; padding: 8px 16px; }
+.logo { display: none; white-space: nowrap; }
+#symbol, #date { flex: 1 1 130px; min-width: 0; }
+.updated { flex: 1 1 auto; color: var(--muted); font-size: 12px; }
+.logout { margin: 0; }
+.logout button { min-height: 36px; padding: 5px 10px; background: transparent; border: 1px solid var(--line-strong); border-radius: 8px; cursor: pointer; white-space: nowrap; }
+.banner { padding: 8px 16px; font-size: 13px; color: var(--warn); background: var(--warn-soft); border-top: 1px solid var(--warn-line); }
+.banner[hidden] { display: none; }
+
+.seg { display: inline-flex; padding: 2px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 9px; }
+.seg[hidden] { display: none; }
+.seg button { min-height: 32px; min-width: 40px; padding: 3px 10px; background: transparent; border: 0; border-radius: 7px; color: var(--muted); font-weight: 500; cursor: pointer; }
+.seg button.on { background: var(--surface); color: var(--ink); font-weight: 650; box-shadow: 0 1px 2px rgba(0,0,0,.14); }
+
+/* Khung trang */
+main { max-width: 1560px; margin: 0 auto; padding: 12px 16px 32px; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 12px; margin-bottom: 12px; min-width: 0; }
+.panel[hidden] { display: none; }
+.layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; }
+.layout[hidden] { display: none; }
+.tabs { margin-bottom: 12px; }
+
+/* The tom tat */
+.summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
+.tile { min-width: 0; padding: 9px 11px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+.tile .k { display: block; color: var(--muted); font-size: 12px; }
+.tile .v { display: block; font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.tile .s { display: block; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.tile.clamp .s { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.long { color: var(--long); } .short { color: var(--short); } .neutral { color: var(--neutral); }
+
+/* Bieu do */
+.chart-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
+.check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+.check input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+#revision { min-width: 0; max-width: 100%; }
+.chart { position: relative; width: 100%; height: 62vh; min-height: 340px; max-height: 720px; }
+.chart-note { margin: 6px 0 0; color: var(--muted); font-size: 12px; }
+.chart-note:empty { display: none; }
+
+/* The setup */
+.setup { border: 1px solid var(--line); border-radius: 10px; padding: 10px; margin-bottom: 8px; cursor: pointer; }
+.setup:last-child { margin-bottom: 0; }
+.setup.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.setup.done { opacity: .72; }
+.setup-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.setup-code { font-family: var(--mono); font-weight: 650; font-size: 13px; }
+.pill { display: inline-flex; align-items: center; padding: 0 7px; font-size: 11.5px; font-weight: 550; line-height: 1.65; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+.pill.long { color: var(--long); border-color: currentColor; }
+.pill.short { color: var(--short); border-color: currentColor; }
+.pill.go { color: #fff; background: var(--long); border-color: var(--long); }
+.pill.run { color: var(--accent); border-color: currentColor; }
+.pill.stop { color: var(--short); border-color: currentColor; }
+.pill.warn { color: var(--warn); border-color: currentColor; }
+.facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px 12px; margin: 8px 0 0; }
+.facts div { display: flex; justify-content: space-between; gap: 8px; min-width: 0; }
+.facts dt { color: var(--muted); font-size: 12.5px; }
+.facts dd { margin: 0; font-variant-numeric: tabular-nums; font-size: 13px; text-align: right; }
+.facts .wide { grid-column: 1 / -1; }
+.setup details { margin-top: 8px; font-size: 13px; }
+.setup summary { color: var(--accent); font-size: 12.5px; cursor: pointer; }
+.setup details p { margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* O review */
+.review { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line-strong); cursor: default; }
+.review-auto { color: var(--muted); font-size: 12.5px; margin-bottom: 6px; }
+.review-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.review-row > * { flex: 1 1 120px; min-width: 0; }
+.review-save { display: flex; align-items: center; gap: 8px; }
+.review-save button { min-height: 34px; padding: 4px 14px; color: #fff; background: var(--accent); border: 0; border-radius: 8px; cursor: pointer; font-weight: 600; }
+.review-msg { font-size: 12.5px; color: var(--muted); }
+.review-msg.err { color: var(--short); }
+.empty { color: var(--muted); font-size: 13px; margin: 0; }
+
+/* Timeline */
+.timeline { list-style: none; margin: 0; padding: 0; max-height: 420px; overflow-y: auto; }
+.timeline li { display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+.timeline li:last-child { border-bottom: 0; }
+.timeline time { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12.5px; }
+.timeline .sub { color: var(--muted); font-size: 12px; }
+.timeline .fail { color: var(--short); }
+
+/* Lenh OKX va thong ke */
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; color: var(--muted); font-size: 12px; font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--line-strong); white-space: nowrap; }
+td { padding: 6px 8px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+td.total, tr.total td { font-weight: 650; }
+
+@media (min-width: 720px) {
+  .summary { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  #symbol, #date { flex: 0 1 150px; }
+  .logo { display: inline; }
+  .updated { text-align: right; }
+}
+@media (min-width: 1024px) {
+  .layout { grid-template-columns: minmax(0, 1fr) 390px; gap: 12px; align-items: start; }
+  .chart-panel { position: sticky; top: 64px; }
+  .chart { height: calc(100vh - 230px); min-height: 460px; max-height: none; }
+  .side { min-width: 0; }
+}

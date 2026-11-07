@@ -15,7 +15,7 @@ SETUP_FIELDS = ("id", "code", "symbol", "bias_date", "direction", "status", "zon
                 "zone_high", "trigger_type", "trigger_params", "confirm_type", "confirm_level",
                 "entry", "stop", "target", "max_chase", "invalidate_level", "m15_filter",
                 "expires_at", "tr_high", "tr_low", "tr_since", "state_data", "note",
-                "created_by", "created_at", "updated_at", "htf")
+                "created_by", "created_at", "updated_at", "htf", "invalidate_after_confirm")
 EVENT_FIELDS = ("id", "setup_id", "at", "event", "from_status", "to_status", "tf",
                 "candle_open_time", "price", "details", "notified", "notify_error")
 
@@ -39,6 +39,8 @@ def _setup(row: Any) -> dict[str, Any]:
     out["state"] = _loads(out.pop("state_data")) or {}
     out["htf"] = _loads(out["htf"]) or {}
     out["m15_filter"] = bool(out["m15_filter"])
+    # TM - #DASHBOARD - Setup dashboard
+    out["invalidate_after_confirm"] = bool(out["invalidate_after_confirm"])
     return out
 
 
@@ -76,8 +78,9 @@ class SetupStore:
                 "INSERT INTO setups (id, code, symbol, bias_date, direction, status, zone_low, "
                 "zone_high, trigger_type, trigger_params, confirm_type, confirm_level, entry, stop, "
                 "target, max_chase, invalidate_level, m15_filter, expires_at, tr_high, tr_low, "
-                "tr_since, state_data, note, created_by, created_at, updated_at, htf) VALUES "
-                "(?, ?, ?, ?, ?, 'WAITING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "tr_since, state_data, note, created_by, created_at, updated_at, htf, "
+                "invalidate_after_confirm) VALUES "
+                "(?, ?, ?, ?, ?, 'WAITING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (sid, code, symbol.upper(), clean["bias_date"], clean["direction"],
                  clean["zone_low"], clean["zone_high"], clean["trigger_type"],
                  json.dumps(clean["trigger_params"]) if clean["trigger_params"] else None,
@@ -85,7 +88,8 @@ class SetupStore:
                  clean["target"], clean["max_chase"], clean["invalidate_level"],
                  int(clean["m15_filter"]), clean["expires_at"], clean["tr_high"], clean["tr_low"],
                  clean["tr_since"], json.dumps({}), clean["note"], created_by, now, now,
-                 json.dumps(clean["htf"]) if clean.get("htf") else None))
+                 json.dumps(clean["htf"]) if clean.get("htf") else None,
+                 int(bool(clean.get("invalidate_after_confirm")))))
             conn.execute(
                 "INSERT INTO setup_events (setup_id, at, event, from_status, to_status, details) "
                 "VALUES (?, ?, 'CREATED', NULL, 'WAITING', ?)",
@@ -224,6 +228,25 @@ class SetupStore:
                 f"SELECT * FROM setup_events WHERE id IN (SELECT MAX(id) FROM setup_events "
                 f"WHERE setup_id IN ({marks}) GROUP BY setup_id)", setup_ids).fetchall()
         return {r["setup_id"]: _event(r) for r in rows}
+
+    # TM - #DASHBOARD - Setup dashboard
+    def last_event_id(self) -> int:
+        with self._conn() as conn:
+            row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM setup_events").fetchone()
+        return int(row[0])
+
+    def events_of(self, setup_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+        """Toan bo event cua nhieu setup, moi setup theo thu tu xay ra."""
+        out: dict[str, list[dict[str, Any]]] = {sid: [] for sid in setup_ids}
+        if not setup_ids:
+            return out
+        marks = ", ".join("?" for _ in setup_ids)
+        with self._conn() as conn:
+            rows = conn.execute(f"SELECT * FROM setup_events WHERE setup_id IN ({marks}) ORDER BY id",
+                                setup_ids).fetchall()
+        for row in rows:
+            out[row["setup_id"]].append(_event(row))
+        return out
 
     def events(self, *, setup_id: str | None = None, symbol: str | None = None,
                start_ms: int | None = None, end_ms: int | None = None,

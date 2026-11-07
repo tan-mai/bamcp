@@ -96,6 +96,105 @@ CREATE TABLE IF NOT EXISTS setup_params (
   updated_at INTEGER NOT NULL
 );
 """,
+    # TM - #DASHBOARD - Setup dashboard
+    """
+ALTER TABLE setups ADD COLUMN invalidate_after_confirm INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS scenarios (
+  id          TEXT NOT NULL PRIMARY KEY,
+  symbol      TEXT NOT NULL,
+  bias_date   TEXT NOT NULL,
+  code        TEXT NOT NULL UNIQUE,
+  kind        TEXT NOT NULL,
+  label       TEXT NOT NULL,
+  setup_codes TEXT NOT NULL,
+  points      TEXT NOT NULL,
+  condition   TEXT,
+  status      TEXT NOT NULL,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_scenarios_day ON scenarios(symbol, bias_date);
+CREATE TABLE IF NOT EXISTS trading_ranges (
+  id            TEXT NOT NULL PRIMARY KEY,
+  symbol        TEXT NOT NULL,
+  timeframe     TEXT NOT NULL,
+  tr_high       REAL NOT NULL,
+  tr_low        REAL NOT NULL,
+  since         INTEGER NOT NULL,
+  events        TEXT NOT NULL,
+  redraw_rule   TEXT,
+  superseded_by TEXT,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_tr_symbol ON trading_ranges(symbol, created_at);
+CREATE TABLE IF NOT EXISTS plan_snapshots (
+  id         TEXT NOT NULL PRIMARY KEY,
+  symbol     TEXT NOT NULL,
+  bias_date  TEXT NOT NULL,
+  revision   INTEGER NOT NULL,
+  trigger    TEXT NOT NULL,
+  payload    TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE (symbol, bias_date, revision)
+);
+CREATE TABLE IF NOT EXISTS setup_reviews (
+  id                TEXT NOT NULL PRIMARY KEY,
+  setup_id          TEXT NOT NULL UNIQUE REFERENCES setups(id),
+  outcome           TEXT,
+  auto_outcome      TEXT,
+  r_multiple        REAL,
+  exchange_fill_ids TEXT NOT NULL DEFAULT '[]',
+  note              TEXT,
+  reviewed_by       TEXT,
+  reviewed_at       INTEGER
+);
+CREATE TABLE IF NOT EXISTS dashboard_users (
+  id            TEXT NOT NULL PRIMARY KEY,
+  username      TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  role          TEXT NOT NULL,
+  is_active     INTEGER NOT NULL DEFAULT 1,
+  last_login_at INTEGER,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dashboard_sessions (
+  id           TEXT NOT NULL PRIMARY KEY,
+  user_id      TEXT NOT NULL,
+  expires_at   INTEGER NOT NULL,
+  ip           TEXT,
+  user_agent   TEXT,
+  csrf_token   TEXT NOT NULL,
+  remember     INTEGER NOT NULL DEFAULT 0,
+  created_at   INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_dash_sessions_user ON dashboard_sessions(user_id);
+CREATE TABLE IF NOT EXISTS dashboard_audit (
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  at      INTEGER NOT NULL,
+  actor   TEXT NOT NULL,
+  action  TEXT NOT NULL,
+  target  TEXT NOT NULL,
+  details TEXT,
+  ip      TEXT
+);
+CREATE TABLE IF NOT EXISTS dashboard_login_log (
+  id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  at       INTEGER NOT NULL,
+  username TEXT,
+  ip       TEXT,
+  ok       INTEGER NOT NULL,
+  reason   TEXT
+);
+CREATE TABLE IF NOT EXISTS dashboard_login_guard (
+  ip           TEXT NOT NULL PRIMARY KEY,
+  failures     INTEGER NOT NULL,
+  locked_until INTEGER,
+  updated_at   INTEGER NOT NULL
+);
+""",
 ]
 
 _MIGRATED: set[str] = set()

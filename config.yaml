@@ -41,6 +41,8 @@ paths:
   settings_file: "settings.json" # username/password va credential san, do trang admin ghi
   # TM - #ENTRY-ALERT - Entry setups & alerts
   alerts_config_file: "alerts/config.json"  # notify + watcher do trang /admin/alerts ghi, thang khoi duoi
+  # TM - #DASHBOARD - Setup dashboard
+  dashboard_config_file: "dashboard/config.json"  # khoi dashboard do trang /admin/dashboard-accounts ghi, thang khoi duoi
 
 # TM - #KL-SQL - Kline storage SQLite
 storage:
@@ -312,6 +314,23 @@ setup_params:
     rejection_stopping_min_vol: 2.0  # rejection kieu stopping action: trigger_params.min_vol_mult
   ETHUSDT: *setup_params_base
   XAUUSDT: *setup_params_base
+
+# TM - #DASHBOARD - Setup dashboard
+# Gia tri KHOI TAO. Sua o trang /admin/dashboard-accounts thi ban moi ghi vao
+# paths.dashboard_config_file (tren volume) va thang khoi nay, co hieu luc ngay.
+# Tai khoan khong nam o day ma trong bang dashboard_users.
+dashboard:
+  enabled: true
+  base_url: https://bamcp.online/setup-dashboard   # dung de tao dashboard_url trong tool va tin push
+  session_hours: 12          # han truot cua phien
+  remember_days: 30          # han truot khi tick "Ghi nho"
+  login_max_attempts: 5      # sai lien tiep theo IP
+  login_lockout_minutes: 15
+  poll_seconds: 60           # chu ky lam moi che do Live
+  vol_spike_mult: 2.0        # vol >= boi so nay x SMA20 thi la vol_spike
+  default_tf: 1h
+  default_bars: 96
+  hide_pnl: false            # true: khong tra so PnL xuong trinh duyet, ke ca owner
 
 # Gia tri KHOI TAO. Lan dau update_rules duoc goi, ban sao ghi sang data/rules.json
 # va tu do file do la nguon su that. Sua o day chi anh huong khi rules.json chua co,
@@ -588,6 +607,19 @@ instructions: |
     min_vol_mult (stopping action, vol cao): chon theo dung kich ban, lay so tu
     get_setup_params(symbol) cua dung cap, dung khai cho qua. trigger_params chi nhan
     tham so ma trigger do dung - xem save_setups.
+    invalidate_level da bi pha tai gia hien tai thi setup bi tu choi. Setup breakout co
+    invalidate_level ben kia gia: khai confirm_type, muc nay chi duoc xet sau khi confirm dat.
+  - Ngay sau save_setups, goi save_scenarios(symbol=..., scenarios=[...], tr={...}) cho cap do:
+    kich ban chinh + kich ban phu (points, setup_codes, condition) va TR khoa kem cac moc Wyckoff.
+    Kich ban da dien ra hoac hong: save_scenarios(scenarios=[{code, status}], replace=false).
+  - Can ve bieu do thi dung get_chart_data, KHONG ghep nhieu tool: mot lan goi tra nen, vol_spike,
+    bias, setup, kich ban, TR, muc HTF, vi the. Cung du lieu voi trang dashboard.
+  - Moi bao cao ve setup deu kem dashboard_url ma tool tra ve; tin push da tu kem link.
+  - Tai khoan viewer doc duoc summary, action_zone cua bias va label, condition cua kich ban nhung
+    khong duoc thay vi the, PnL. Khong ghi so vi the hay PnL vao cac cho do; ghi vao notes cua
+    save_bias hoac note cua setup, hai cho nay viewer khong doc duoc.
+  - Review cuoi ngay: get_chart_data(date=..., revision="origin") la ke hoach goc doi voi nen that;
+    save_review gan outcome, r_multiple, note. get_review_stats de xem thong ke.
   - Khi nguoi dung hoi "vao duoc chua": doc get_setups va get_setup_events TRUOC, roi
     moi doc nen M5 va M15 da dong. ENTRY_VALID moi la tin hieu vao lenh; MISSED = gia
     da chay qua max_chase, khong duoi; BLOCKED = check_trade khong qua.
