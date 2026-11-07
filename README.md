@@ -1,849 +1,136 @@
-# BAMCP — BTC Analysis MCP
+# BAMCP
 
-MCP server tự pull dữ liệu kline đa khung, nhiều cặp giao dịch, từ Binance — phục vụ phân tích Wyckoff/VSA/GANN từ bất kỳ thiết bị nào có Claude. Không cần cron job riêng.
+MCP server giúp Claude phân tích thị trường crypto bằng số liệu thật, và giúp bạn giữ kỷ luật khi giao dịch.
 
-Về mặt vận hành nó là một web API server bình thường: Starlette + uvicorn, Basic auth, healthcheck, chạy trong Docker sau reverse proxy. Điểm khác duy nhất là nó nói thêm được giao thức MCP ở đường `/mcp`.
+BAMCP tự kéo nến từ Binance cho nhiều cặp giao dịch. Claude đọc dữ liệu đó để phân tích theo Wyckoff, VSA và GANN, chấm lệnh theo quy định bạn đặt và ghi nhật ký. Server tự canh giá theo kế hoạch và báo qua Discord hoặc Telegram.
 
-Tuỳ chọn đọc tài khoản thật từ Binance, Bybit hoặc OKX bằng API key read-only — để nhật ký và báo cáo dựa trên số liệu sàn thay vì lời khai.
+> **BAMCP không đặt lệnh.** Không có tool nào làm việc đó, và đây là chủ ý. Bạn luôn tự vào lệnh trên sàn.
 
-**Mọi cấu hình nằm trong `config.yaml`, secret nằm trong `.env`.** Không cần sửa `server.py` khi đổi máy.
-
-## Tools
-
-| Tool | Việc |
-|---|---|
-| `list_timeframes` | Các cặp đang theo dõi, khung nào đã có dữ liệu, lần pull gần nhất |
-| `refresh_data` | Ép pull ngay từ Binance, không chờ chu kỳ |
-| `backfill_klines` | Kéo lịch sử cũ về (lùi tới khi hết dữ liệu hoặc `days` ngày) |
-| `get_data_coverage` | Độ phủ dữ liệu từng khung (kể cả 5m), chỗ thiếu nến |
-| `get_klines` | Nến OHLCV thô, mặc định chỉ trả nến đã đóng |
-| `get_context` | Range, vị trí giá trong range, spread/volume cho VSA, swing gần nhất, độ tươi dữ liệu — theo cặp |
-| `get_bias` | Đọc bias đã lưu của một cặp |
-| `save_bias` | Lưu bias cho một cặp sau bước W/D/H4 |
-| `get_rules` | Đọc quy định đang hiệu lực (kèm `symbol` để xem bộ số của một cặp) + lịch sử thay đổi |
-| `update_rules` | Đổi quy định, bắt buộc kèm lý do; rule theo cặp thì bắt buộc kèm `symbol`; `orb=true` đổi bộ rule ORB riêng |
-| `get_today_status` | Quota lệnh + PnL, rule đổi hôm nay, check trước khi vào lệnh |
-| `check_trade` | Chấm thử một lệnh theo rule mà không ghi nhật ký |
-| `log_trade` | Ghi lệnh, cảnh báo nếu phạm rule |
-| `close_trade` | Đóng lệnh, cập nhật PnL thực |
-| `get_positions` | Vị thế đang mở **thật trên sàn**, mọi cặp đang theo dõi |
-| `get_fills` | Lệnh đã khớp trong ngày theo từng vị thế, mọi cặp |
-| `get_account_pnl` | PnL thật, tách lãi/lỗ, phí, funding — và tách theo cặp |
-| `reconcile_journal` | Đối chiếu nhật ký tự ghi với sàn, chỉ ra chỗ lệch |
-| `list_orb_sessions` | Các phiên ORB, giờ mở kế tiếp (UTC + giờ VN), watch M5 có đang chạy |
-| `get_opening_range` | High/Low của OR (nến M15 đầu phiên), ATR H1, cờ lọc `too_narrow`/`too_wide` |
-| `check_orb_signal` | State của phiên, nến M5 kích hoạt, plan entry/SL/TP/qty đã tính phí |
-| `skip_orb_session` | Bỏ một phiên trong ngày (bắt buộc lý do), dừng watch M5 |
-| `backtest_orb` | Backtest ORB trên M5 lịch sử, tách in-sample/out-of-sample |
-| `get_backtest_result` | Lấy kết quả backtest chạy lâu theo `run_id` |
-| `get_orb_config` | Tham số + rule ORB đang áp dụng (kèm nguồn từng lớp), cảnh báo `rule_infeasible` |
-| `save_setups` | Lưu kế hoạch vào lệnh thành setup có cấu trúc; watcher canh trên nến M5 đã đóng |
-| `get_setups` | Setup kèm trạng thái hiện tại và event gần nhất |
-| `get_setup_params` | Tham số setup đang áp dụng cho một cặp, gồm ngưỡng volume gợi ý cho `rejection` |
-| `cancel_setup` | Huỷ đúng một setup (bắt buộc lý do) |
-| `get_setup_events` | Lịch sử chuyển trạng thái và tin đã gửi |
-| `save_scenarios` | Lưu kịch bản giá và TR khoá của một ngày, gọi ngay sau `save_setups` |
-| `get_chart_data` | Một lần gọi đủ dữ liệu vẽ biểu đồ: nến, `vol_spike`, bias, setup, kịch bản, TR, mức HTF, vị thế |
-| `save_review` | Gắn kết quả review cho một setup; `auto_outcome` của hệ thống giữ nguyên |
-| `get_review_stats` | Thống kê setup theo khoảng ngày: tỉ lệ trigger, win rate, R trung bình |
-| `migrate_klines` | `import` nến JSON sang SQLite / `verify` đối chiếu hai bên (xem [Lưu nến trong SQLite](#lưu-nến-trong-sqlite)) |
-
-Không có tool đặt lệnh. Cố ý. Plan của ORB chỉ là con số đề xuất — người dùng tự đặt lệnh trên sàn.
-
-Bốn tool cũ nhận thêm tham số **tuỳ chọn** cho ORB; không truyền thì hành vi và các khoá trả về giữ nguyên như trước:
-
-- `get_today_status(strategy, session_id)` và `get_account_pnl(strategy, session_id)` — thêm khối lọc theo chiến lược/phiên. Quota và `daily_stop_loss` chung chỉ đếm lệnh **không phải ORB**; ORB có quota và daily stop riêng (`orb_trades_remaining`, `orb_daily_stop_hit`, `can_trade_orb` — luôn có trong `get_today_status`).
-- `check_trade(strategy="ORB", session_id, or_date)` — chấm bằng [bộ rule ORB riêng](#bộ-rule-orb-riêng) (`rule_set: "orb"`, lỗi rule nằm ở `orb_rule_violations`), kèm khối `orb_checks`: còn trong cửa sổ không, phiên còn quota không, range có bị lọc không.
-- `log_trade(strategy="ORB", session_id, variant, or_date, or_high, or_low)` — ghi lệnh ORB và dừng watch M5 của phiên đó. Lệnh không phải ORB được gắn `strategy: "OTHER"`.
-
-## Nến đang chạy vs nến đã đóng
-
-`get_context` trả về ba khối tách bạch:
-
-- `last_closed_bar` + `vsa` — tính trên **nến đã đóng** cuối cùng. Đây là thứ dùng để đọc VSA.
-- `current_bar` — nến đang hình thành, kèm `completion_pct`. Chỉ dùng để biết giá hiện tại. Volume và spread của nó **vô nghĩa** với VSA vì nến chưa chạy xong.
-- `freshness` — tuổi của nến đóng gần nhất. `stale: true` nghĩa là trễ hơn 2 nến, pipeline có vấn đề, đừng tin kết quả phân tích.
-
-`get_klines` theo cùng kỷ luật đó: mặc định chỉ trả nến đã đóng, mỗi cây gắn cờ `is_closed`. Muốn thấy nến đang chạy phải gọi `include_forming=true`, và nó về với `is_closed: false`.
-
-## Nhiều cặp giao dịch
-
-Hệ thống theo dõi nhiều cặp, không chỉ BTC. Thêm và quản lý trong trang admin, mục **Cặp giao dịch**.
-
-Khi thêm một cặp, server hỏi Binance xem cặp đó có thật không rồi mới nhận — không có danh sách cứng, nên cặp nào Binance có là dùng được. Thêm xong nó kéo dữ liệu ban đầu ngay, không phải chờ hết chu kỳ 15 phút.
-
-Từ đó cặp mới được pull tự động ở cả 5 khung như BTC, cùng một vòng lặp nền.
-
-### Cấu trúc dữ liệu
+## Cách hoạt động
 
 ```
-data/
-├── klines/
-│   ├── BTCUSDT/   1w.json  1d.json  4h.json  1h.json  15m.json
-│   ├── ETHUSDT/   1w.json  ...
-│   └── SOLUSDT/   ...
-├── bias/
-│   ├── BTCUSDT/   2026-09-15.json
-│   └── ETHUSDT/   2026-09-15.json
-├── journal/       2026-09-15.json     ← dùng chung mọi cặp
-├── rules.json                          ← rule chung + phần đặt riêng của từng cặp
-└── settings.json
+Binance (nến) ───────────┐
+Sàn (tuỳ chọn, chỉ đọc) ─┤
+                         ▼
+                       BAMCP ◀── Claude gọi tool qua /mcp
+                         │
+                         ├── /admin ............ bạn cấu hình
+                         ├── /setup-dashboard .. xem biểu đồ, review
+                         └── Discord/Telegram .. báo khi giá chạm kế hoạch
 ```
 
-Dữ liệu từ bản một-cặp được **tự động chuyển** sang bố cục này lúc khởi động, không mất gì.
+## Có gì trong BAMCP
 
-### Cái gì riêng, cái gì chung
-
-| | Phạm vi |
-|---|---|
-| Nến, bias | **Riêng từng cặp** |
-| Quota lệnh/ngày, dừng ngày, hạn mức margin | **Chung tất cả các cặp** |
-| SL tối đa, TP tối thiểu, ngưỡng swing | **Riêng từng cặp** |
-| Nhật ký lệnh | Chung |
-| Đọc tài khoản sàn | **Mọi cặp đang theo dõi** — vị thế, lệnh khớp, PnL |
-
-Ngân sách rủi ro dùng chung là cố ý: nếu mỗi cặp một bộ quota thì thêm 5 cặp là nhân ngân sách rủi ro lên 5 lần, mà tài khoản thì vẫn chỉ có một.
-
-Ngưỡng đo bằng **điểm giá** thì ngược lại, phải riêng: 300 điểm trên BTC là một nhịp nhỏ, 300 điểm trên ADA là cả một chu kỳ. Ép chung một con số thì hoặc quá chặt cho cặp này, hoặc quá lỏng cho cặp kia.
-
-### Dùng trong chat
-
-Mọi tool phân tích đều nhận `symbol`, bỏ trống là lấy cặp mặc định:
-
-> *"Phân tích ETHUSDT theo Wyckoff từ khung tuần xuống H4"*
-
-> *"So sánh cấu trúc BTC và ETH hiện tại"*
-
-> *"Lưu bias short cho ETHUSDT, pha B"*
-
-Phương pháp không đổi theo cặp — vẫn Wyckoff/VSA/GANN, vẫn từ khung lớn xuống nhỏ, vẫn chỉ đọc VSA trên nến đã đóng.
-
-## Quy định giao dịch
-
-Chia làm hai loại, sửa bằng hai đường khác nhau.
-
-**Rule bằng số** — sống trong `data/rules.json`, đọc mới **mỗi lần gọi tool**, không cache. Đổi là có hiệu lực ngay, không restart.
-
-Rule chia làm hai phạm vi.
-
-**Chung cho cả tài khoản** — một bộ duy nhất, hết quota là hết dù lệnh nằm ở cặp nào:
-
-| Rule | Mặc định |
-|---|---|
-| `max_trades_per_day` | 3 |
-| `max_margin_per_trade` | 20 |
-| `daily_stop_loss` | -20 |
-| `swing_max_margin_per_trade` | 0 *(0 = không giới hạn)* |
-
-**Riêng từng cặp** — mỗi cặp giữ ngưỡng của nó; con số dưới đây là mặc định, cặp nào chưa đặt riêng thì kế thừa đúng những số này:
-
-| Rule | Mặc định |
-|---|---|
-| `max_stop_points` | 300 |
-| `min_take_profit_points` | 500 |
-| `swing_min_take_profit_points` | 2000 |
-| `swing_max_stop_points` | 1500 |
-| `min_rr` | 1.5 *(R:R tối thiểu, không đo bằng điểm)* |
-
-**`min_rr`** — R:R = khoảng cách tới TP ÷ khoảng cách tới SL, tính từ giá vào; lệnh đạt khi R:R ≥ `min_rr` của cặp. Áp cho mọi lệnh không phải ORB, cả scalp lẫn swing. R:R thấp hơn thì `check_trade` trả `would_pass: false` kèm vi phạm `R:R 1.25 < min_rr 1.5`, và `log_trade` chạy đúng kiểm tra đó. `get_rules(symbol=...)` trả khối `min_rr` với `value` và `source` — `symbol` nếu cặp đặt riêng, `default` nếu đang kế thừa. Đổi cho một cặp: `update_rules({"min_rr": 2}, reason="...", symbol="ETHUSDT")`; bỏ trống `symbol` là đổi mặc định cho mọi cặp chưa đặt riêng.
-
-Lệnh `strategy="ORB"` **không** chấm bằng các rule trên (trừ `max_margin_per_trade`) và không ăn quota/daily stop chung — ORB có bộ rule riêng, xem [Bộ rule ORB riêng](#bộ-rule-orb-riêng).
-
-Đổi ngay trong chat, từ bất kỳ thiết bị nào:
-
-> *"Từ hôm nay giảm xuống 2 lệnh một ngày, tôi đang vào lệnh quá tay."*
-
-> *"ADA điểm nhỏ quá, SL tối đa của riêng ADAUSDT để 15 điểm thôi."*
-
-Claude gọi `update_rules({"max_trades_per_day": 2}, reason="...")` cho rule chung, và `update_rules({"max_stop_points": 15}, reason="...", symbol="ADAUSDT")` cho rule riêng. `reason` là tham số bắt buộc ở cả hai — không có lý do thì tool báo lỗi.
-
-**Không nhầm phạm vi được.** Gửi một rule chung kèm `symbol` thì tool từ chối chứ không âm thầm ghi nó vào một cặp — nếu không, bạn tưởng mình siết quota cả tài khoản trong khi thật ra chỉ siết mỗi ADA. Chiều ngược lại, `get_rules(symbol="ETHUSDT")` trả về bộ số đã giải cho ETH, kèm khối `symbol_overrides` cho biết cặp nào đang đặt riêng những rule gì.
-
-Khối `rules:` trong `config.yaml` chỉ là **giá trị khởi tạo**. Lần đầu `update_rules` chạy, bản sao được ghi sang `data/rules.json` và từ đó file đó là nguồn sự thật. Sửa `config.yaml` về sau chỉ có tác dụng khi bạn thêm một rule hoàn toàn mới.
-
-`rules.json` từ bản một-phạm-vi vẫn đọc được nguyên vẹn: nó chỉ có khối `values`, và mọi cặp kế thừa đúng những con số đang có — không cần bước chuyển đổi nào.
-
-Server chỉ chặn giá trị làm vỡ logic tính toán — `daily_stop_loss` phải `<= 0`, `min_rr` phải `> 0`, các rule còn lại phải `>= 0`, tên rule phải có thật (gõ sai tên là báo lỗi chứ không âm thầm tạo rule mới), và cặp phải đang được theo dõi (gõ sai tên cặp thì không tạo ra một bộ rule mồ côi). Ngoài ra nới hay siết bao nhiêu là quyền bạn.
-
-**Mọi thay đổi đều để lại dấu.** `rules.json` giữ `history` đầy đủ: đổi gì, từ bao nhiêu sang bao nhiêu, lúc nào, vì sao, và **cho cặp nào** — "siết cả tài khoản" với "siết mỗi ADA" là hai dòng khác nhau trong lịch sử. Và:
-
-- `get_today_status` trả `rules_changed_today` — rule bị đổi trong chính ngày đang giao dịch thì hiện ra ngay ở bước check trước khi vào lệnh.
-- `log_trade` ghi `rules_at_entry` vào từng lệnh — đọc lại nhật ký cũ vẫn biết lúc đó mình chơi theo luật nào.
-
-Đổi rule giữa lúc đang lỗ thì vẫn đổi được. Nhưng bản ghi sẽ nói ra điều đó, và Claude được dặn phải nhắc lại trước khi bàn tiếp chuyện vào lệnh.
-
-**Quy trình phân tích** — nằm ở key `instructions` trong `config.yaml`, không còn hardcode trong `server.py`. Claude đọc nó một lần lúc bắt tay, nên sửa xong cần `docker compose restart` rồi tắt/bật lại connector trong chat. Không phải build lại image.
-
-## Phân tích ORB
-
-ORB (Opening Range Breakout) chỉ chạy trên một cặp — `orb.symbol`, mặc định `BTCUSDT`. **OR = nến M15 đầu tiên** của mỗi phiên.
-
-### Hai giai đoạn
-
-1. **Chốt OR.** Nến M15 đầu phiên đóng + 20 giây (`candle_close_delay_seconds`), scheduler kéo M15 và H1, tính High/Low của OR và ATR(14) của H1 tính đến trước giờ mở. `OR / ATR` dưới `min_or_atr_ratio` là `too_narrow`, trên `max_or_atr_ratio` là `too_wide` — phiên bị lọc thì **không kéo M5**.
-2. **Watch M5.** OR hợp lệ thì cứ 5 phút (nến M5 đóng + 20 giây) kéo M5 một lần, tìm breakout theo `entry.mode`. Watch dừng khi phiên `TAKEN` (đã `log_trade`), `SKIPPED` (đã `skip_orb_session`), hoặc hết `trade_window_minutes`. Ngoài cửa sổ đó không có request M5 nào.
-
-Mọi giờ tính theo timezone IANA của từng phiên nên tự đổi giờ mùa hè — London 08:00 là 07:00Z vào mùa hè, 08:00Z vào mùa đông. Tool trả cả UTC lẫn giờ VN.
-
-State của một phiên trong một ngày:
-
-```
-WAITING_OPEN → FORMING → RANGE_SET → BREAKOUT_LONG / BREAKOUT_SHORT
-                                    → FAILED_BREAKOUT_LONG / FAILED_BREAKOUT_SHORT
-kết thúc: FILTERED · EXPIRED · SKIPPED · TAKEN
-```
-
-Bộ lọc khác: `use_bias_filter` (so với bias đã `save_bias` trong ngày), `skip_news_days` (ngày có tin lớn), quota `max_trades` mỗi phiên và `orb.max_trades_per_day` (đếm theo `or_date`).
-
-Plan tính sẵn phí taker + trượt giá hai chiều vào 1R. `qty` = `orb.margin_usd × orb.leverage / entry`, làm tròn **xuống** theo `qty_step` — 20 × 100 / 83,500 → 0.023 BTC. Dưới `min_notional_usd` thì plan có cảnh báo, BAMCP không tự tăng size. Mỗi plan còn được chấm bằng rule ORB (`plan.rule_check`, `filters.rules`); trượt rule hoặc đã chạm daily stop ORB thì `blocked_by` chứa `rules` — plan vẫn trả về để xem vì sao, nhưng không phải lệnh để vào.
-
-### Bộ rule ORB riêng
-
-Lệnh ORB có SL/TP nhỏ hơn hẳn scalp/swing, nên được chấm bằng một bộ rule riêng: khối `orb` trong `data/rules.json`. `check_trade`, `log_trade`, `check_orb_signal`, `get_today_status` và `backtest_orb` đều dùng chung một hàm giải rule nên không lệch nhau.
-
-| Rule | BTC | Việc |
+| Tính năng | Làm gì | Chi tiết |
 |---|---|---|
-| `max_stop_points` | 350 | SL tối đa |
-| `min_take_profit_points` | 200 | TP tối thiểu |
-| `min_rr` | 1.5 | R:R tối thiểu (TP / SL) |
-| `max_trades_per_day` | 2 | quota lệnh ORB mỗi `or_date` — riêng, không ăn quota chung |
-| `daily_stop_loss` | -25 | PnL ORB trong `or_date` chạm ngưỡng thì chặn ORB — lệnh khác vẫn vào được |
-| `margin_usd` × `leverage` | 20 × 100 | sizing của plan |
-| `maint_margin_pct`, `liq_safety_pct` | 0.4, 80 | SL phải nằm trong 80% khoảng cách tới giá thanh lý (≈354 điểm ở 83,500) |
-
-Tham số chiến lược cũng nằm ở đây: `min_or_atr_ratio` (0.3), `max_or_atr_ratio` (0.7), `tp_r` (1.5), `buffer_pct` (0.02), `move_sl_to_be_at_r`, `time_exit_minutes`, `use_bias_filter`, `allow_reversal`, `skip_news_days`.
-
-Ba lớp, lớp trên đè lớp dưới: **phiên** (chỉ tham số chiến lược) → **cặp** (`symbol_overrides`) → **`orb.defaults`**. `get_orb_config` ghi rõ mỗi giá trị lấy từ lớp nào (`source`). Cặp chưa đặt SL/TP ORB thì lệnh ORB bị chặn với lỗi `chua dat rule ORB cho <CẶP>.<field>` — server không tự đoán ngưỡng. `orb.enabled = false` là công tắc nghiệp vụ: không phiên nào chốt OR/watch M5, `check_orb_signal` trả `orb_disabled`, `check_trade(strategy="ORB")` báo ORB đang tắt.
-
-Sửa bằng một trong hai đường, cả hai bắt buộc lý do, mỗi trường đổi là một dòng `history` (nguồn `mcp` hoặc `admin`), có hiệu lực ngay:
-
-- chat: `update_rules({"min_rr": 2}, reason="...", symbol="BTCUSDT", orb=true)` — bỏ trống `symbol` là sửa `orb.defaults`, `session_id="ny"` là override của phiên, giá trị `null` là bỏ override;
-- mục **Rule ORB** trên `/admin/orb`: chọn phạm vi, sửa, xem trước bộ rule đã giải kèm cảnh báo trước khi lưu. Mục này hiện luôn số lệnh ORB đã dùng và PnL ORB hôm nay.
-
-**Cảnh báo `rule_infeasible`.** Theo ATR H1 và giá hiện tại, server kiểm xem bộ số có tự mâu thuẫn không — vd `min_take_profit_points` 900 với `tp_r` 1.5 và `max_or_atr_ratio` 1.2 ở ATR 462 thì TP tối đa chỉ ~832, mọi tín hiệu đều trượt; hoặc OR tối đa + buffer đã vượt `max_stop_points`. Cảnh báo hiện trong `get_orb_config.warnings`, trên trang admin và ngay ở bước xem trước. Nó không chặn lưu.
-
-Lần đầu chạy bản này, khối `orb` được tạo **một lần** từ giá trị cũ trong `config.yaml` (nếu còn) + mặc định BTC ở trên, kèm một dòng `history` nguồn `migrate`. Các field cũ trong `config.yaml` (`risk.*`, `exit.tp_r`, `filters.max_or_atr_ratio`, `max_orb_trades_per_day`...) từ đó bị bỏ qua và được liệt kê trong `get_orb_config.warnings` dạng `deprecated: ...` — xoá chúng khỏi `config.yaml` là hết cảnh báo.
-
-### Cấu hình
-
-Tham số **kỹ thuật** nằm ở khối `orb:` trong `config.yaml` (sửa xong phải restart): `entry.mode`, `failed_lookback_bars`, `exit.sl_mode`, khung và chu kỳ ATR, costs, `exchange_limits`, đường dẫn dữ liệu. Rule và tham số chiến lược nằm trong `rules.json` — xem [Bộ rule ORB riêng](#bộ-rule-orb-riêng). Bật/tắt nhanh cả module (scheduler, tool, trang admin) bằng `BAMCP_ORB_ENABLED=true|false`.
-
-Danh sách **phiên** thì quản lý ở trang `/admin/orb`, lưu trong `data/orb/sessions.json`, **không cần restart**. `default_sessions` trong config chỉ là hạt giống cho lần chạy đầu. Trên trang đó:
-
-- thêm/sửa phiên: `session_id`, tên, timezone, giờ mở, ngày giao dịch, cửa sổ, quota, override kỹ thuật (vd `entry_mode`). Override **rule** của phiên (OR/ATR, `tp_r`, `buffer_pct`...) sửa ở mục Rule ORB — form phiên giữ nguyên chúng và từ chối nếu bị sửa ở đây;
-- **Xem trước** giờ mở kế tiếp theo UTC và giờ VN trước khi lưu;
-- bật/tắt, xoá phiên. Tắt hay xoá giữa phiên thì watch đang chạy dừng ngay;
-- lịch sử thay đổi.
-
-`session_id` không đổi được sau khi tạo — state, nhật ký và backtest đều gắn vào nó.
-
-Ngày có tin lớn: thêm/xoá ở mục **News days** trên `/admin/orb`. File là `data/orb/news_days.json` dạng `[{"date": "2026-10-02", "note": "CPI"}]` (dạng cũ `["2026-10-02"]` vẫn đọc được), đọc lại mỗi lần tính, không cần restart. `skip_news_days = true` thì phiên của ngày đó bị lọc (`news_day: true`, `filtered: true`), không ra plan.
-
-### Dùng trong chat
-
-> *"Phiên New York hôm nay OR thế nào, có tín hiệu chưa?"*
-
-Claude gọi `get_opening_range` → `check_orb_signal`, đọc `trigger_candle` (nến M5 **đã đóng**) và `plan`. Plan có `blocked_by` chứa `rules` thì đọc `plan.rule_check.rule_violations` — không vào. Muốn vào lệnh thì `check_trade(strategy="ORB", session_id="ny")`, bạn tự đặt lệnh trên sàn, rồi `log_trade(strategy="ORB", session_id="ny", variant="breakout")`. Giá đã chạy xa, không đuổi: `skip_orb_session("ny", reason="...")`.
-
-### Backtest
-
-> *"Backtest ORB 2 năm, lấy 2026-03-01 làm mốc out-of-sample."*
-
-`backtest_orb(from_date, to_date, session_ids, split_date, overrides, initial_equity, rules_override)` chạy trên M5 lịch sử. Lần đầu nó tải M5 từ `data.binance.vision` (file tháng, tháng đang chạy ghép từ file ngày, có kiểm SHA256) — khoảng nửa phút cho 2 năm; sau đó đọc cache dưới một giây. Chạy quá ~55 giây thì tool trả `status: running` kèm `run_id`, gọi `get_backtest_result(run_id)` sau.
-
-Kết quả gồm: số lệnh, win rate, expectancy theo R, profit factor, drawdown, chuỗi thua dài nhất, tách in-sample/out-of-sample và theo phiên, lý do thoát (tp/sl/breakeven/time), số tín hiệu bị lọc hoặc không vào được vì quy mô tài khoản, và `data_gaps` cho những ngày thiếu dữ liệu. Nến M5 chạm cả SL lẫn TP thì tính là **thua** (`sl_tp_same_bar`). File `trades.csv`, `equity.csv`, `result.json` nằm trong `data/orb/backtests/<run_id>/`.
-
-Mỗi lệnh giả lập được chấm bằng rule ORB hiện hành, kể cả quota và daily stop ORB theo ngày: kết quả có `rules_used` (bộ rule đã dùng), `rejected_by_rule` (số lệnh bị loại theo từng rule) và `stopped_days` (ngày chạm daily stop ORB). `rules_override` — vd `{"min_take_profit_points": 900}` — thử bộ số khác cho riêng lần chạy đó, không sửa `rules.json`.
-
-## Đọc tài khoản thật từ sàn
-
-Mặc định tắt (`account.enabled: false`) — khi đó mọi con số về lệnh và PnL đều là **lời khai của bạn** qua `log_trade` / `close_trade`. Bật lên thì server đọc thẳng từ sàn.
-
-Hỗ trợ ba sàn, mỗi sàn một kiểu ký chữ ký riêng, cùng trả về một dạng dữ liệu chuẩn hoá:
-
-| Sàn | `exchange` | Symbol mặc định | Cần passphrase |
-|---|---|---|---|
-| Binance USDT-M Futures | `binance` | `BTCUSDT` | không |
-| Bybit V5 | `bybit` | `BTCUSDT` | không |
-| OKX V5 | `okx` | `BTC-USDT-SWAP` | **có** |
-
-### Tạo API key
-
-Làm đúng ba việc này, theo thứ tự:
-
-1. **Chỉ bật quyền đọc.** Tắt Enable Futures/Spot Trading, tắt Enable Withdrawals. Key kiểu này đặt lệnh không được, rút tiền không được.
-2. **Bật IP whitelist**, chỉ điền IP của VPS. Key lọt ra ngoài cũng vô dụng ở chỗ khác.
-3. **OKX còn đòi passphrase** — chuỗi bạn tự đặt lúc tạo key, không phải mật khẩu đăng nhập.
-
-`exchanges.py` không có hàm nào đặt lệnh, huỷ lệnh, chuyển tiền hay rút tiền. Nhưng đừng dựa vào đó — dựa vào quyền của key.
-
-### Cấu hình
-
-Key và secret **không bao giờ** nằm trong `config.yaml`. Chúng đi qua `.env` như password:
-
-```bash
-BAMCP_EXCHANGE=binance
-BAMCP_EXCHANGE_KEY=...
-BAMCP_EXCHANGE_SECRET=...
-BAMCP_EXCHANGE_PASSPHRASE=       # chỉ OKX
-```
-
-Rồi bật trong `config.yaml`:
-
-```yaml
-account:
-  enabled: true
-  exchange: "binance"
-```
-
-Server **từ chối khởi động** nếu bật `account.enabled` mà thiếu credential hoặc sai tên sàn — báo lỗi rõ ngay lúc boot thay vì hỏng âm thầm lúc gọi tool.
-
-### Nó đổi gì trong `get_today_status`
-
-Đây là thay đổi quan trọng nhất. Khi bật account, bước check trước khi vào lệnh không còn tin nhật ký nữa:
-
-- `trades_taken` = `max(số lệnh trong nhật ký, số order trên sàn)` — vào lệnh mà quên log thì vẫn bị tính vào quota.
-- `realized_pnl` = **net thật** từ sao kê sàn: lãi/lỗ đã chốt **cộng** phí giao dịch **cộng** funding. Con số này gần như luôn xấu hơn số bạn tự khai, vì log tay hầu như không bao giờ ghi phí và funding.
-- `counted_from` cho biết đang đếm theo `exchange` hay `journal`.
-- `journal_pnl` vẫn được giữ riêng để bạn thấy khoảng lệch.
-
-Nếu mất kết nối tới sàn, `get_today_status` **không lỗi** — nó quay về dùng số trong nhật ký và đặt `exchange.error` để bạn biết con số đang kém tin cậy. Rào chắn kỷ luật không được phép sập vì mạng chập chờn.
-
-### Một vị thế = một lệnh
-
-TP từng phần và SL là những **order riêng** trên sàn, nhưng theo cách hiểu của người giao dịch chúng vẫn thuộc **một lệnh**. Đếm theo `order_id` sẽ thổi phồng số lệnh trong ngày và làm quota hết sớm giả.
-
-Cả ba sàn đều không trả về position id trong lịch sử fill, nên server dựng lại: cộng dồn khối lượng có dấu, về 0 là đóng vị thế. Fill có `realized_pnl` khác 0 là fill đóng bớt, bằng 0 là fill mở hoặc thêm vào.
-
-Ví dụ thật — bốn fill trong một ngày:
-
-```
-00:39  sell 7.27   pnl −11.03  ┐ P1  mở từ hôm trước
-15:13  sell 2.30   pnl  −3.78  ┘     (carried_in)
-15:43  buy  11.25  pnl      0  ┐ P2  mở và đóng trong ngày
-16:24  sell 11.25  pnl −13.62  ┘
-```
-
-Trước đây tính là **4 lệnh**. Giờ là **2 vị thế**, và chỉ **1** tính vào quota hôm nay — vị thế mang từ hôm trước sang đã tính vào quota của hôm đó rồi, tính lại là phạt bạn hai lần.
-
-`get_fills` trả về danh sách vị thế, mỗi vị thế có `position_id`, `carried_in`, `closed`, tổng `realized_pnl` và các fill thành phần. `get_today_status` và `reconcile_journal` đều đếm theo vị thế.
-
-Các trường hợp đã kiểm: TP từng phần (mở 10, chốt 3+3+4 → 1 vị thế), scale in (5+5 rồi đóng 10 → 1), hai vị thế độc lập → 2, vị thế còn mở cuối ngày → 1 với `still_open`.
-
-### Đọc tài khoản theo danh sách cặp
-
-Bốn tool đọc tài khoản — `get_positions`, `get_fills`, `get_account_pnl`, `reconcile_journal` — đều chạy trên **toàn bộ danh sách cặp trong trang admin**. Thêm một cặp ở đó là nó tự động được đọc, không phải khai lại ở đâu.
-
-Mỗi tool nhận `symbol` để lọc về một cặp; bỏ trống là gộp tất cả.
-
-**Mã sàn tự suy.** Cặp phân tích là `ETHUSDT`, nhưng mỗi sàn gọi một kiểu:
-
-| Cặp | Binance | Bybit | OKX |
-|---|---|---|---|
-| `BTCUSDT` | `BTCUSDT` | `BTCUSDT` | `BTC-USDT-SWAP` |
-| `ETHUSDT` | `ETHUSDT` | `ETHUSDT` | `ETH-USDT-SWAP` |
-
-Khai sẵn dạng có dấu gạch (`BTC-USDT-SWAP`) thì giữ nguyên — dùng cho mã không suy ra được theo quy tắc.
-
-**Vị thế gom riêng từng cặp.** Khối lượng cộng dồn của BTC và ETH không thể trộn vào một chuỗi; trộn vào là ranh giới vị thế sai hoàn toàn. `position_id` mang tiền tố cặp: `BTCUSDT-P1`.
-
-**Một cặp lỗi không kéo đổ cả lần gọi.** Cặp sàn không niêm yết được ghi vào `errors` rồi đi tiếp. Cặp lỗi còn được nhớ trong 30 phút để không làm chậm mọi lần gọi sau — ví dụ `XAUUSDT` có trên Binance nhưng có thể không có trên OKX.
-
-`get_today_status` giờ có thêm `by_symbol` để thấy PnL từng cặp, và `errors` để biết cặp nào đọc không được — số liệu thiếu thì phải nhìn thấy, không được im lặng.
-
-### `reconcile_journal`
-
-Chạy cuối ngày, hoặc bất cứ lúc nào nghi mình quên log. Nó chỉ ra ba loại lệch:
-
-- Sàn ghi nhận nhiều order hơn nhật ký → có lệnh chưa log
-- Nhật ký nhiều hơn sàn → có lệnh log nhưng không khớp
-- PnL lệch quá `pnl_tolerance` → thường là phí và funding chưa được tính
-
-Nó **không tự sửa nhật ký**. Chỉ nói ra chỗ lệch, để bạn quyết định.
-
-## Trang admin
-
-`/admin` — đặt username/password cho API, credential sàn, và quy định giao dịch bằng giao diện, thay vì biến môi trường. Lưu xuống `<data_root>/settings.json`, nằm trong volume nên **sống sót qua mọi lần tạo lại container**.
-
-Đây là điểm quan trọng khi deploy bằng panel không có SSH: bạn không phải nhập lại secret mỗi lần recreate container.
-
-### Lần đầu sau khi deploy
-
-Không có tài khoản mặc định nào trong mã nguồn. Mật khẩu đầu tiên vào bằng một trong hai đường:
-
-**Cách khuyên dùng — biến môi trường lúc tạo container.** Điền hai ô này trong panel cùng lúc với các biến khác:
-
-```
-BAMCP_USERNAME=<tên bạn chọn>
-BAMCP_PASSWORD=<chuỗi ngẫu nhiên, tối thiểu 8 ký tự>
-```
-
-Container khởi động là đăng nhập được ngay, không có cửa sổ nào để hở.
-
-**Cách dự phòng — setup token.** Nếu không đặt hai biến trên, server in ra log lúc khởi động:
-
-```
-BAMCP CHUA DUOC CAI DAT - chua co mat khau nao.
-  BAMCP SETUP TOKEN: y-rpoLBrJySnC4rluqovvZXtV1fJmQ8-9MHrzQkOWJk
-```
-
-Lúc này `/admin` mở công khai nhưng **không ghi được gì nếu thiếu token**, và `/mcp` vẫn trả 401. Token đổi mỗi lần khởi động lại và mất tác dụng ngay khi có mật khẩu.
-
-### Sau khi đăng nhập
-
-Thanh trên cùng của mọi trang admin dẫn tới: **Cài đặt** (`/admin`), **Phiên ORB** (`/admin/orb`), **Gann** (`/admin/gann`), **Kéo nến** (`/admin/schedules`), **Vào lệnh** (`/admin/alerts`), **Dashboard accounts** (`/admin/dashboard-accounts`). Phiên ORB và Gann chỉ hiện khi module tương ứng bật (`orb.enabled`, `time_windows.enabled`).
-
-Trang **Cài đặt** chia hai cột — bên trái là kết nối, bên phải là quy định:
-
-1. **Truy cập API** — đổi username/mật khẩu về sau
-2. **Tài khoản sàn** — chọn binance/bybit/okx, dán API key read-only, bấm *Kiểm tra kết nối sàn* để xác nhận ngay tại chỗ
-3. **Cặp giao dịch** — thêm / tắt / bỏ cặp theo dõi; các nút này có hiệu lực ngay khi bấm, không chờ Lưu
-4. **Quy định chung** — 4 rule áp cho cả tài khoản (quota, margin, margin swing, dừng ngày)
-5. **Quy định theo từng cặp** — 5 ngưỡng riêng của từng cặp (SL/TP theo điểm giá, ngưỡng swing, R:R); sửa được nhiều cặp rồi Lưu một lần
-6. **Lý do & lịch sử** — ô lý do (bắt buộc khi đổi rule), kèm lịch sử 5 lần đổi gần nhất
-
-Nút **Lưu thay đổi** nằm trên thanh dính ở đáy màn hình, bấm một lần là mục 1, 2, 4, 5 cùng ghi. Mọi thay đổi có hiệu lực ngay, không cần khởi động lại.
-
-Xong bước này, `.env` và biến môi trường không còn vai trò gì nữa. Từ đó bạn quản lý theo hai đường, cùng đọc ghi một chỗ:
-
-| | Trang admin | Claude |
-|---|---|---|
-| Mật khẩu API | có | không |
-| Credential sàn | có | không |
-| Quy định giao dịch | có | `get_rules` / `update_rules` |
-| Xem lịch sử đổi rule | có | `get_rules` |
-
-Mật khẩu và credential sàn cố ý **không** cho Claude sửa — chúng là thứ bảo vệ chính Claude, không nên nằm trong tầm với của nó.
-
-### Biến môi trường: chỉ cần bốn dòng
-
-Credential sàn **không cần** đi qua biến môi trường. Đặt chúng trong trang admin sau khi container chạy — an toàn hơn, vì key không nằm trong ô config của panel.
-
-Bốn biến bắt buộc:
-
-```
-BAMCP_USERNAME=<tên bạn chọn>
-BAMCP_PASSWORD=<chuỗi ngẫu nhiên, tối thiểu 8 ký tự>
-BAMCP_ALLOWED_HOSTS=btc.domain.com,btc.domain.com:*
-TZ=Asia/Ho_Chi_Minh
-```
-
-Bốn biến `BAMCP_EXCHANGE*` chỉ là đường nạp sẵn cho tiện. Bỏ trống thì container khởi động với phần đọc sàn **tắt** — log không có dòng `BAMCP account`, các tool `get_positions` / `get_fills` báo lỗi rõ ràng cho tới khi bạn cấu hình.
-
-Sau đó vào `/admin`, mục **Tài khoản sàn**: chọn sàn, dán key/secret/passphrase, tích *Đọc dữ liệu tài khoản thật*, bấm **Kiểm tra kết nối sàn**, rồi Lưu. Có hiệu lực ngay, không cần khởi động lại — kể cả khi đổi hẳn sang sàn khác.
-
-### Thứ tự ưu tiên
-
-```
-settings.json  >  biến môi trường  >  config.yaml
-```
-
-Biến môi trường chỉ còn là **giá trị khởi tạo** cho lần chạy đầu. Sau khi bấm Lưu, sửa `.env` không còn tác dụng — nếu không thì bấm Lưu xong mà không thấy gì đổi, kiểu lỗi khó hiểu nhất.
-
-### Cách trang này giữ secret
-
-- **Mật khẩu API lưu dạng hash** PBKDF2-SHA256, 200k vòng, salt riêng. Không có chỗ nào lưu plaintext.
-- **Secret của sàn buộc phải lưu đọc lại được** — cần nó để ký request, mà server phải tự khởi động lại không có người gõ tay. File `chmod 600`. Không có cách nào tránh, và mã hoá tại chỗ chỉ là hình thức vì khoá giải mã cũng phải nằm cạnh.
-- **Server không bao giờ gửi secret về trình duyệt.** Trang chỉ nhận "đã có / chưa có" và 4 ký tự cuối của API key — đủ để đối chiếu với trang sàn, không đủ để dùng lại.
-- **Ô để trống = giữ nguyên.** Muốn xoá thì xoá ở `settings.json`.
-
-Đổi trong trang admin có hiệu lực ngay, không cần khởi động lại — kể cả bật/tắt đọc tài khoản sàn.
-
-### Quy định giao dịch
-
-Trang admin sửa được cả hai phạm vi, và **đi qua đúng một cửa với Claude**: cùng hàm `_apply_rule_changes`, cùng validate, cùng ghi vào `rules.json`.
-
-- Thẻ **Quy định chung** — 4 rule áp cho mọi cặp.
-- Thẻ **Quy định theo từng cặp** — chọn cặp trong ô *Đang sửa cặp* rồi nhập; dòng chú thích ngay dưới cho biết cặp đó đang đặt riêng những rule gì, hay đang kế thừa toàn bộ mặc định. Sửa nhiều cặp rồi bấm Lưu một lần cũng được: những gì bạn nhập cho từng cặp được giữ lại khi đổi lựa chọn.
-- Thẻ **Lý do & lịch sử** — một ô lý do dùng chung cho cả lần lưu, và 5 lần đổi gần nhất kèm phạm vi (`[chung]` hay `[ADAUSDT]`), giá trị cũ → mới, lý do.
-
-Nghĩa là **bắt buộc có lý do** dù bạn đổi ở đâu, phạm vi nào. Trang admin không phải cửa sau vòng qua cơ chế ghi dấu — nếu nó là cửa sau thì toàn bộ `rules_changed_today` và `rules_at_entry` mất giá trị.
-
-Chỉ những ô **thực sự đổi** mới được gửi lên, nên bấm Lưu mà không động vào rule thì không sinh bản ghi lịch sử rỗng.
-
-Bỏ một cặp khỏi danh sách theo dõi **không** xoá phần rule đặt riêng của nó trong `rules.json` — giống như file nến cũ vẫn được giữ lại. Thêm cặp đó trở lại thì ngưỡng riêng cũ có hiệu lực lại luôn.
-
-### Nút "Kiểm tra kết nối sàn"
-
-Gọi thật lên sàn bằng credential đang lưu, chỉ đọc vị thế. Trả về ví dụ:
-
-```
-Ket noi okx thanh cong - 1 vi the dang mo (BTC-USDT-SWAP).
-```
-
-Sai key, sai passphrase hoặc IP chưa whitelist đều hiện ra ở đây thay vì phải mò trong log.
-
-## Authentication
-
-HTTP Basic. Username/password đọc theo thứ tự: biến môi trường `BAMCP_USERNAME` / `BAMCP_PASSWORD` trước, `server.auth` trong `config.yaml` sau.
-
-Server **từ chối khởi động** nếu `auth.enabled: true` mà thiếu credential — không có đường nào vô tình chạy trần. Muốn tắt hẳn khi test local thì đặt `auth.enabled: false`.
-
-So sánh credential dùng `secrets.compare_digest` cho cả hai vế, không short-circuit.
-
-`/healthz` là đường public duy nhất; `/mcp` cần auth. Riêng `/setup-dashboard` không qua Basic auth vì có đăng nhập riêng, xem [Setup dashboard](#setup-dashboard).
-
-## Bề mặt HTTP
-
-Các đường chính:
-
-| Endpoint | Auth | Việc |
-|---|---|---|
-| `POST /mcp` | có | giao thức MCP — Claude nói chuyện ở đây |
-| `GET /healthz` | không | health check cho Docker HEALTHCHECK và reverse proxy |
-| `GET /admin` | có* | trang đặt username/password, credential sàn, quy định |
-| `GET /admin/orb` | có* | quản lý phiên, rule ORB và news days (chỉ có khi `orb.enabled`) |
-| `POST /admin/orb/sessions` | có* | xem trước / lưu / bật / tắt / xoá phiên — trang trên gọi |
-| `POST /admin/orb/rules` | có* | xem trước / lưu rule ORB, thêm / xoá news day — trang trên gọi |
-| `GET /admin/schedules` | có* | lịch kéo nến theo từng khung |
-| `GET /admin/alerts` | có* | thông báo Discord/Telegram, watcher, setups |
-| `POST /admin/alerts/action` | có* | lưu thông báo / gửi thử / lưu watcher / huỷ, tạo setup, timeline — trang trên gọi |
-| `POST /admin/schedules/action` | có* | thêm / sửa / bật tắt / xoá / chạy ngay / xem trước cron — trang trên gọi |
-| `GET /admin/dashboard-accounts` | có* | tài khoản, cấu hình, audit log và lịch sử đăng nhập của dashboard |
-| `POST /admin/dashboard-accounts/action` | có* | tạo / sửa / bật tắt / xoá tài khoản, lưu cấu hình — trang trên gọi |
-| `GET, POST /setup-dashboard/login` | không | form đăng nhập dashboard, khoá theo IP khi sai nhiều lần |
-| `POST /setup-dashboard/logout` | phiên | xoá phiên |
-| `GET /setup-dashboard` | phiên | trang dashboard |
-| `/setup-dashboard/api/*` | phiên | API JSON cho trang, xem [Setup dashboard](#setup-dashboard) |
-
-`*` `/admin` mở công khai khi **chưa** đặt mật khẩu lần nào, nhưng lúc đó phải có setup token mới ghi được. Xem mục [Trang admin](#trang-admin).
-
-Ngoài API của dashboard thì không có REST API nào khác. Muốn pull dữ liệu ngay thì bảo Claude gọi tool `refresh_data`.
-
-## Cấu trúc thư mục dữ liệu
-
-```
-<data_root>/          # Docker: /data, mount ra ./data trên host
-├── klines/    1w.json  1d.json  4h.json  1h.json  15m.json   # storage.kline_store = json
-├── bamcp.db              # SQLite: bảng klines (storage.kline_store = sqlite), fetch_schedules, setups, setup_events, setup_params
-├── alerts/config.json    # khối notify + watcher do /admin/alerts ghi (webhook, bot token)
-├── dashboard/config.json # khối dashboard do /admin/dashboard-accounts ghi
-├── bias/      2026-09-12.json
-├── rules.json            # rule chung + phần đặt riêng từng cặp + khối orb (rule ORB) + lịch sử đổi
-├── settings.json         # username/password (hash) + credential sàn — chmod 600
-├── journal/   2026-09-12.json
-│   └── orb_skips/  2026-09-12.json      # phiên ORB đã skip, kèm lý do
-└── orb/
-    ├── sessions.json     # danh sách phiên + lịch sử đổi (trang /admin/orb)
-    ├── news_days.json    # ngày có tin lớn — sửa ở /admin/orb
-    ├── state/     ny/2026-09-12.json    # state + watch của một phiên trong một ngày
-    ├── logs/      2026-09-12.jsonl      # log sự kiện: chốt OR, tick M5, dừng watch
-    ├── history/   BTCUSDT/5m/*.csv      # M5 lịch sử cho backtest
-    └── backtests/ <run_id>/  result.json  trades.csv  equity.csv
-```
-
-Server kéo nến theo **fetch schedules** (xem [Lịch kéo nến theo khung](#lịch-kéo-nến-theo-khung)): mỗi khung một lịch riêng, kể cả 5m. Merge theo `openTime` nên không trùng nến; bản JSON giữ tối đa `max_history` nến.
-
-Nếu bạn có pipeline khác ghi vào cùng thư mục thì đặt `fetcher.enabled: false` để tắt phần pull tích hợp.
-
-**Quan trọng — `fetcher.market`:** để `futures` nếu bạn trade perpetual swap. Volume spot và volume perp khác nhau, mà VSA thì sống bằng volume.
-
-## Lịch kéo nến theo khung
-
-`fetcher.mode: schedules` (mặc định): mỗi khung một schedule độc lập, cron 6 trường có giây, giờ **UTC**. Quản lý ở `/admin/schedules` — bật/tắt, thêm, sửa, xoá, "Chạy ngay", xem trước 3 lần chạy kế tiếp. Thay đổi có hiệu lực ngay; scheduler tự đọc lại bảng mỗi `reload_seconds`.
-
-Bảng `fetch_schedules` trong `bamcp.db` rỗng thì lúc khởi động tạo 6 schedule mặc định (`seed_defaults`), mỗi lượt chạy 5 giây sau khi nến đóng:
-
-| name | timeframe | cron (UTC) |
-|---|---|---|
-| pull-5m | 5m | `5 */5 * * * *` |
-| pull-15m | 15m | `5 */15 * * * *` |
-| pull-1h | 1h | `5 0 * * * *` |
-| pull-4h | 4h | `5 0 */4 * * *` |
-| pull-1d | 1d | `5 0 0 * * *` |
-| pull-1w | 1w | `5 0 0 * * MON` |
-
-Mỗi lượt, với từng cặp: kéo từ nến mới nhất trong store lùi `overlap_candles` nến (tự vá lỗ gần), tới hiện tại. Nến vừa đóng chưa có trên Binance thì thử lại sau 3 giây, tối đa 3 lần. Khoá theo (cặp, khung): lượt trước chưa xong thì lượt sau ghi `skipped`; `refresh_data`, watch ORB và `backfill_klines` dùng chung khoá đó. Mỗi lượt ghi `last_run_at`, `last_status` (`ok` / `error` / `skipped`), `last_error`, `last_duration_ms`; `list_timeframes` trả các trường đó cho từng khung, còn `last_fetch_error` là lỗi gần nhất của bất kỳ schedule nào.
-
-Sau deploy, backfill 90 ngày 5m cho mỗi cặp: `backfill_klines(timeframe="5m", symbol="...", days=90, max_requests=60)` (nên chạy sau khi đã sang `kline_store: sqlite` — bản JSON cắt 5m theo `max_history`).
-
-Khởi động lại (`run_on_start: true`): schedule nào đã lỡ lịch trong lúc server tắt — lần chạy kế tiếp sau `last_run_at` đã qua — được chạy bù ngay một lần.
-
-Rollback: `fetcher.mode: interval` chạy lại vòng lặp `interval_seconds` cũ; bảng `fetch_schedules` giữ nguyên để bật lại sau.
-
-Task phân tích bias lúc 7h VN nên đặt 00:05 UTC, sau khi đã có nến 4h và 1d.
-
-## Setup vào lệnh và cảnh báo
-
-AI chỉ lập kế hoạch: cuối buổi phân tích bias, Claude gọi `save_setups(symbol, setups, replace=true)` cho từng cặp. Việc canh giá chạy hoàn toàn trên server: watcher chạy ở giây thứ 20 sau mỗi mốc 5 phút. Với cặp có setup đang chạy, watcher tự kéo lại nến 5m vừa đóng từ Binance (kèm nến 15m ở mốc 15 phút nếu setup có `m15_filter`), vì bản do lịch `pull-5m` chụp ở giây thứ 5 có thể chưa chốt giá đóng và volume. Kéo lỗi hoặc chưa có nến thì thử lại sau 10 giây, tối đa 3 lần; hết lượt thì xét trên dữ liệu đang có và ghi vào `errors` của lần quét. Sau đó watcher xét từng setup trên nến **đã đóng** và gửi một tin mỗi lần setup đổi trạng thái.
-
-Mã setup: `<base>-<yyyyMMdd>-<chữ cái>`, vd `BTC-20261101-A`. Tool nhận id hoặc code.
-
-| Trạng thái | Sang | Khi | Tin |
-|---|---|---|---|
-| WAITING | IN_ZONE | high/low của nến giao với vùng | chỉ lần chạm đầu tiên của setup |
-| IN_ZONE | WAITING | đóng ra ngoài vùng về phía cũ, chưa trigger | không |
-| IN_ZONE | TRIGGERED | trigger đạt | có nếu có bước confirm |
-| TRIGGERED | CONFIRMED | đóng vượt `confirm_level` trong `confirm_within` nến; không có confirm thì sang ngay | — |
-| TRIGGERED | WAITING | quá `confirm_within` nến chưa confirm | "trigger hỏng" |
-| CONFIRMED | ENTRY_VALID | \|close − entry\| ≤ max_chase và check_trade pass | **tín hiệu vào lệnh** |
-| CONFIRMED | MISSED | giá đã vượt entry hơn max_chase | "không đuổi" |
-| CONFIRMED | BLOCKED | check_trade fail | kèm lý do (không gửi lại cùng lý do trong ngày) |
-| MISSED | ENTRY_VALID | giá quay lại trong max_chase và check_trade pass | có |
-| ENTRY_VALID | WAITING | hết `entry_valid_candles` nến chưa khớp | "hết cửa sổ entry" |
-| TRIGGERED…MISSED | FILLED | vị thế OKX mới cùng hướng, hoặc `log_trade(setup_id=...)` | có |
-| chưa kết thúc | INVALIDATED / EXPIRED / CANCELLED | đóng quá `invalidate_level` (kèm M15 nếu `m15_filter`) / quá `expires_at` / `cancel_setup` hoặc `replace=true` | có |
-
-Trigger (xét ngay trên nến chạm vùng, rồi trên mỗi nến M5 đã đóng khi còn IN_ZONE; `vol_ok` = volume ≥ `vol_mult` × SMA(`sma_period`) volume M5): `spring`, `utad`, `sos`, `sow`, `rejection`, `retest`, `close_above`, `close_below`. Thiếu `sma_period` nến lịch sử thì không xét, ghi event `INSUFFICIENT_DATA`. Khởi động lại thì xét bù tối đa 12 nến, chỉ gửi tin cần báo mới nhất.
-
-Điều kiện volume M5 theo trigger: `spring`, `utad`, `sos`, `sow` cần ≥ `vol_mult`; `retest` cần ≤ `retest_low_vol_mult`; `rejection` khai riêng từng setup bằng `trigger_params.max_vol_mult` (test, vol thấp) và/hoặc `min_vol_mult` (stopping action, vol cao), bắt buộc có ít nhất một ngưỡng; `close_above`, `close_below` không xét volume. Lúc lưu setup không kiểm tra volume, tin IN_ZONE cũng không; volume chỉ xét lúc trigger, và tin IN_ZONE ghi rõ điều kiện đang áp dụng. `trigger_params` chỉ nhận tham số mà trigger đó đọc, khai thừa thì `save_setups` từ chối (xem docstring). Điều kiện viết trong `note` không có tác dụng.
-
-Tham số theo cặp nằm trong bảng SQLite `setup_params`. Thứ tự ưu tiên: `trigger_params` của setup, rồi `setup_params` của cặp, rồi `watcher.defaults`. Mỗi lần khởi động, cặp nào chưa có dòng trong bảng thì được ghi từ khối `setup_params` của `config.yaml`; tham số từng chỉnh tay trong `alerts/config.json` được giữ. Dòng đã có không bị ghi đè, kể cả khi sửa `config.yaml`, nên muốn đổi thì sửa ở `/admin/alerts` (có hiệu lực ngay). `rejection_test_max_vol` và `rejection_stopping_min_vol` chỉ là số gợi ý: watcher không đọc trực tiếp, Claude lấy từ `get_setup_params` rồi khai vào `trigger_params` của setup.
-
-Chạm lại vùng: giá ra khỏi vùng rồi quay lại thì không gửi tin IN_ZONE nữa (event vẫn ghi, `details.repeat = true`), nhưng trigger vẫn được xét nên TRIGGERED / ENTRY_VALID vẫn báo. Setup đã INVALIDATED thì bỏ qua hoàn toàn, giá quay lại vùng cũng không làm gì.
-
-Hướng khung lớn: lúc lưu setup, server tự ghi `htf` = `{w, d, h4, bias}`. W/D/H4 tính từ swing của nến đã đóng (cùng nguồn `get_context`): `up` khi đỉnh và đáy cao dần, `down` khi đỉnh và đáy thấp dần, còn lại `range`; đóng vượt swing vừa rồi ngược hướng thì về `range`; thiếu dữ liệu thì `null`. `bias` lấy từ `save_bias` của `bias_date`, nên phải `save_bias` trước `save_setups`. `htf_counter` liệt kê các khung ngược hướng setup, không chặn lưu; tin IN_ZONE, TRIGGERED, ENTRY_VALID, MISSED, BLOCKED và trang admin hiện nhãn `NGƯỢC ...` cùng dòng `Khung lớn`. Setup tạo trước bản này không có nhãn.
-
-`max_chase` hiệu lực = min(khai báo, x_max), với x_max giữ R:R tại giá vào thực tế ≥ `min_rr` của cặp — long: `((T−E) − m(E−S)) / (1+m)`. x_max ≤ 0 thì `save_setups` từ chối setup đó. Ví dụ E 67500, S 67050, T 68400, m 1.5 → 90.
-
-Thông báo: `notify.channel` = `discord` (webhook) / `telegram` (bot, `parse_mode=HTML`) / `both`. Gửi lỗi thì thử lại sau 2s, 10s, 30s; Discord 429 thì chờ đúng `retry_after`. Vẫn lỗi thì ghi `notify_error`, không chặn watcher. Cảnh báo hệ thống, mỗi loại tối đa 1 lần/giờ: `PLAN_MISSING` (tới `plan_deadline_utc` mà cặp trong `watch_symbols` chưa có setup hôm nay), `FETCHER_STALE` (quá 15 phút không có nến 5m mới).
-
-Khớp lệnh OKX: mỗi lượt quét, cặp có setup từ TRIGGERED trở đi thì đọc vị thế; vị thế mới mở sau lúc trigger, cùng hướng → FILLED cho setup có entry gần giá mở nhất, không setup nào khớp → tin "lệnh mở ngoài kế hoạch". Mã OKX theo `watcher.okx_symbol_map`.
-
-Trang `/admin/alerts`: kênh + webhook / bot token / chat id (che, chỉ ghi đè khi nhập mới), nút Gửi thử Discord / Gửi thử Telegram (dùng cấu hình đã lưu, thử riêng từng kênh, không retry); watcher bật/tắt, `watch_symbols`, `plan_deadline_utc`, bảng tham số mặc định + override theo cặp; danh sách setup theo ngày/trạng thái, timeline event, huỷ, form tạo setup tay. Tham số theo cặp lưu vào bảng `setup_params`, phần còn lại vào `alerts/config.json`, đều có hiệu lực ngay.
-
-Sau deploy, phía Claude: dời task phân tích bias sang 00:05 UTC và kết thúc bằng `save_setups(..., replace=true)` cho từng cặp; khi hỏi "vào được chưa" thì đọc `get_setups` + `get_setup_events` trước, rồi mới đọc nến M5/M15 đã đóng.
-
-`invalidate_level` đã bị phá tại giá hiện tại (long: giá ≤ mức, short: giá ≥ mức, lấy giá đóng mới nhất) thì `save_setups` từ chối setup đó, vì lưu vào cũng bị huỷ ngay nến đầu. Setup breakout có `invalidate_level` nằm bên kia giá thì khai `confirm_type`: cờ `invalidate_after_confirm` mặc định bật, mức này chỉ được xét sau khi đã có nến đóng đạt `confirm_level` (chốt vào `state.confirm_reached`, không mất đi). Setup lưu trước bản này giữ hành vi cũ.
-
-## Setup dashboard
-
-Trang `https://bamcp.online/setup-dashboard` vẽ bias, setup, kịch bản và TR của từng cặp lên biểu đồ nến, cập nhật theo watcher, kèm chế độ review theo ngày. Trang chỉ đọc: không endpoint nào đặt, sửa, huỷ lệnh hay setup. Ngoại lệ duy nhất là lưu kết quả review.
-
-Deep link, cũng là dạng `dashboard_url` mà tool và tin push trả về: `/setup-dashboard?symbol=ETHUSDT&date=2026-11-07&mode=review&tf=15m`.
-
-### Quy trình cho Claude
-
-1. `save_bias` → `save_setups` → `save_scenarios(symbol, scenarios, tr=...)`. Mỗi lần lưu sinh một snapshot bất biến (`plan_snapshots`).
-2. Cần vẽ biểu đồ inline thì gọi `get_chart_data`, cùng một nguồn với trang.
-3. Cuối ngày: `get_chart_data(date=..., revision="origin")` để so kế hoạch gốc với nến thật, rồi `save_review`.
-
-Kịch bản: `points` có ít nhất 2 điểm, thời gian tăng dần; `t` là epoch ms, `'YYYY-MM-DD HH:MM'` giờ VN, hoặc offset `{bars, tf}` tính từ nến đã đóng cuối lúc lưu. Đổi trạng thái một kịch bản đã có: `save_scenarios(symbol, [{code, status}], replace=false)`.
-
-### Tài khoản và đăng nhập
-
-Tài khoản nằm trong bảng `dashboard_users`, quản lý ở `/admin/dashboard-accounts`. Mật khẩu hash argon2, không dùng chung với admin: phiên admin không vào được dashboard và ngược lại. Mất quyền vào admin thì tạo lại owner bằng lệnh dự phòng:
-
-```bash
-docker exec -it bamcp bamcp dashboard create-owner <username>   # ngoài Docker: python bamcp_cli.py dashboard ...
-```
-
-Username đã có thì lệnh khôi phục thành owner đang hoạt động, đặt lại mật khẩu và đăng xuất mọi phiên của tài khoản đó.
-
-| Quyền | `owner` | `viewer` |
-|---|---|---|
-| Xem Live, Review, tab Thống kê | có | có |
-| Lưu kết quả review | có | không (API 403) |
-| Vị thế mở, PnL, lệnh OKX | có | không (API 403, `/api/chart` không có `positions`, timeline bỏ `UNPLANNED_POSITION` và giá khớp) |
-| Ghi chú: `note` của setup, ghi chú review, `note` của điểm kịch bản | có | không (API không trả) |
-
-Viewer vẫn đọc được `summary`, `action_zone` của bias và `label`, `condition` của kịch bản, nên không ghi số vị thế hay PnL vào các chỗ đó. `notes` của `save_bias` không gửi xuống trình duyệt với mọi tài khoản.
-
-Cookie `HttpOnly; Secure; SameSite=Lax`, hết hạn trượt `session_hours`, tick "Ghi nhớ" thì `remember_days`. DB chỉ lưu SHA-256 của token. Sai liên tiếp `login_max_attempts` lần theo IP thì khoá `login_lockout_minutes` phút; IP lấy từ `X-Forwarded-For` do proxy đặt (`server.behind_proxy`), nên proxy phải ghi đè header này từ client, Traefik và Caddy mặc định đã làm vậy. Cookie `Secure` nghĩa là chạy thử chỉ đăng nhập được qua HTTPS hoặc `http://localhost`, không qua IP LAN.
-
-### API của trang
-
-Tất cả dưới `/setup-dashboard/api`, cần phiên, trả JSON, dùng chung hàm với tool MCP. `POST` cần header `X-CSRF-Token`.
-
-| Method + path | Dùng cho | Quyền |
-|---|---|---|
-| `GET /symbols` | Danh sách cặp | mọi tài khoản |
-| `GET /chart?symbol&tf&bars&date&revision&include_forming` | Toàn bộ dữ liệu biểu đồ, cache tới khi có nến mới hoặc kế hoạch đổi | mọi tài khoản |
-| `GET /setups?symbol&date` | Thẻ setup + review | mọi tài khoản |
-| `GET /events?symbol&date` | Timeline | mọi tài khoản |
-| `GET /snapshots?symbol&date` | Danh sách revision | mọi tài khoản |
-| `GET /review-stats?symbol&from&to&group_by` | Tab Thống kê | mọi tài khoản |
-| `GET /positions?symbol` | Vị thế mở, gọi sàn cache 30 giây | owner |
-| `GET /fills?symbol&date` | Lệnh OKX trong ngày, `setup_code` rỗng là lệnh không gắn setup | owner |
-| `POST /reviews` | Lưu review `{setup_code, outcome, r_multiple, note}` | owner |
-
-### Review
-
-Mặc định Review vẽ **kế hoạch gốc**: mỗi phần (bias, setup, kịch bản, TR) lấy bản đầu tiên có nội dung trong ngày. Lý do: quy trình chuẩn là `save_bias` trước, nên revision 1 thường chỉ có bias. Dropdown vẫn chọn được đúng từng revision, kể cả R1. Nến luôn là thật, vẽ tới hết ngày bias + 24h.
-
-`auto_outcome` được tính lần đầu khi đọc setup đã kết thúc, từ nến M5 sau `TRIGGERED` đầu tiên qua được confirm: chạm TP trước là `tp_hit`, chạm SL trước hoặc cùng nến là `sl_hit`. Setup `FILLED` chưa chạm mốc nào thì để trống và tính lại lần sau; kho không còn nến từ lúc trigger thì không kết luận. `save_review` ghi đè `outcome`, không đụng `auto_outcome`. Khi lưu, `tp_hit` chuyển kịch bản active gắn với setup sang `played_out`; `sl_hit`, `invalidated` sang `failed`.
-
-Win rate = thắng / lệnh đã đóng (`tp_hit`, `sl_hit`, `be`, `manual_exit`); thắng là `tp_hit`, hoặc `be` / `manual_exit` có R dương. R trung bình chỉ tính setup có `r_multiple`.
-
-### Cấu hình
-
-Khối `dashboard` trong `config.yaml` là giá trị khởi tạo; sửa ở `/admin/dashboard-accounts` thì ghi vào `dashboard/config.json` và có hiệu lực ngay. `enabled: false` thì mọi route trả 404 và tool không trả link. `hide_pnl: true` thì số PnL không xuống trình duyệt, kể cả owner.
-
-Nến đang chạy: kho SQLite không lưu nến chưa đóng nên server ghép từ các nến M5 đã đóng, trễ tối đa một nến M5; khung 5M vì thế không có nến đang chạy. Biểu đồ dùng TradingView Lightweight Charts 4.2.3 (Apache 2.0), tự host trong `static/vendor/`.
-
-## Lưu nến trong SQLite
-
-Nến đọc/ghi qua một interface (`kline_store.IKlineStore`) với hai bản: `json` (file như trên, hành vi giữ nguyên) và `sqlite` (`<data_root>/bamcp.db`, bảng `klines`). Bias, journal, rules vẫn là JSON.
-
-```yaml
-storage:
-  kline_store: "json"      # json | sqlite — giá trị mặc định, trang /admin/schedules thắng
-  sqlite_path: "bamcp.db"  # tương đối so với data_root
-```
-
-Đổi store ở mục **Nơi lưu nến** đầu trang `/admin/schedules`. Bảng ở đó cho thấy số nến và nến cuối của từng cặp × khung ở cả hai bên. Bấm chuyển thì server giữ khoá fetch của các cặp, chép nến sang store đích (JSON → SQLite: chép hết; SQLite → JSON: chép theo `retention` của từng khung), đối chiếu, khớp mới đổi. Lựa chọn lưu vào `settings.json`, có hiệu lực ngay, không cần restart, giữ nguyên qua redeploy. Còn lệch thì không đổi và trang liệt kê cặp × khung bị lệch.
-
-Bản `sqlite` chỉ lưu nến **đã đóng** (nến có `close_time > now` bị bỏ ngay ở tầng store), nên `current_bar` của `get_context` luôn rỗng. Không cắt theo `retention`. Bảng tự tạo khi khởi động.
-
-Rollout:
-
-1. Deploy với `kline_store: json`, chạy import: `python kline_migrate.py import` (hoặc bảo Claude gọi `migrate_klines(action="import")`). Chạy lại nhiều lần không sinh trùng.
-2. Kiểm tra song song: `python kline_migrate.py verify` / `migrate_klines(action="verify")` — so số nến, `open_time` đầu/cuối và OHLCV từng nến cho mỗi cặp × khung. Phải ra `mismatches: 0`. Nến JSON mới về sau lần import cũng tính là lệch — chạy lại import rồi verify.
-3. Bấm **Chuyển sang SQLite** ở `/admin/schedules` (bước này tự import + verify lại lần cuối). Giữ thư mục `klines/` 4 tuần để rollback bằng nút **Chuyển về JSON**, sau đó mới xoá.
-
-Backup — cron trên VPS mỗi đêm, giữ 14 bản. Không copy thẳng file khi DB đang mở:
-
-```
-0 3 * * * sqlite3 /data/bamcp.db ".backup /backup/bamcp-$(date +\%F).db" && ls -1t /backup/bamcp-*.db | tail -n +15 | xargs -r rm --
-```
-
-## Deploy: GitHub Actions → ghcr.io → panel + Traefik
-
-Dành cho VPS không có quyền root, chỉ tạo container được qua giao diện (Hostinger). Không cần Docker trên máy cá nhân, không cần SSH vào VPS.
-
-```
-domain.com → DNS → IP VPS → cổng 80/443 → Traefik → đọc Host header → container bamcp
-```
-
-### 1. Đẩy code lên GitHub
-
-```bash
-git init && git add -A && git status --short
-```
-
-Trước khi commit, `git status` **không được** hiện `.env`, `data/`, `.venv/`. Thấy `.env` là dừng lại — nó chứa key OKX thật.
-
-```bash
-git commit -m "BAMCP" && git branch -M main
-git remote add origin https://github.com/<user>/bamcp.git && git push -u origin main
-```
-
-[.github/workflows/publish.yml](.github/workflows/publish.yml) tự chạy, build image và đẩy lên `ghcr.io/<user>/bamcp:latest`. Xem tiến trình ở tab **Actions**.
-
-### 2. Mở quyền đọc cho image
-
-Package trên ghcr mặc định private, mà VPS không có shell để `docker login`. Vào `github.com/users/<user>/packages` → chọn `bamcp` → **Package settings** → **Change visibility** → Public.
-
-Repo vẫn để private được — GHCR tách riêng hai thứ. Image không chứa secret nào (`.env` bị `.dockerignore` loại, `config.yaml` có `password: ""`); thứ lộ ra chỉ là code và bộ rule giao dịch.
-
-### 3. Tạo container trong panel
-
-| Ô | Giá trị |
-|---|---|
-| Container name | `bamcp` |
-| Image | `ghcr.io/<user>/bamcp:latest` |
-| Restart policy | `unless-stopped` |
-| Ports | **để trống** — Traefik gọi thẳng vào container |
-| Volumes | `bamcp_data:/data` |
-| Mạng | chọn mạng của Traefik |
-
-**Volume phải là named volume, không phải host path.** Không có shell thì không `chown` được thư mục trên host, mà container chạy uid 10001. Named volume thì Docker chép quyền sở hữu từ image sang nên ghi được ngay — `Dockerfile` đã `chown -R bamcp:bamcp /data` trước dòng `USER bamcp` đúng vì lý do này.
-
-### 4. Biến môi trường
-
-Chỉ bốn dòng:
-
-| Biến | Giá trị |
-|---|---|
-| `BAMCP_USERNAME` | tên đăng nhập bạn chọn |
-| `BAMCP_PASSWORD` | chuỗi ngẫu nhiên, tối thiểu 8 ký tự |
-| `BAMCP_ALLOWED_HOSTS` | `btc.domain.com,btc.domain.com:*` |
-| `TZ` | `Asia/Ho_Chi_Minh` |
-
-**Credential sàn không đặt ở đây.** Sau khi container chạy, vào `/admin` để dán key — key không nằm trong ô config của panel, và đổi sàn về sau không phải sửa container.
-
-`BAMCP_ALLOWED_HOSTS` là chỗ dễ sập nhất: Traefik chuyển tiếp nguyên Host header, thiếu domain thật trong danh sách là server trả **421** cho mọi request.
-
-### 5. Nhãn Traefik
-
-```
-traefik.enable=true
-traefik.http.routers.bamcp.rule=Host(`btc.domain.com`)
-traefik.http.routers.bamcp.entrypoints=websecure
-traefik.http.routers.bamcp.tls.certresolver=<tên resolver trên VPS>
-traefik.http.services.bamcp.loadbalancer.server.port=8848
-```
-
-Dòng cuối bắt buộc — container mở cổng 8848, Traefik không tự đoán được.
-
-### 6. Kiểm tra
-
-Xem log container, phải thấy:
-
-```
-BAMCP account: okx (read-only)
-BAMCP data_root=/data symbol=BTCUSDT market=futures fetcher=True
-INFO:     Uvicorn running on http://0.0.0.0:8848
-```
-
-Rồi từ máy bất kỳ:
-
-```bash
-curl.exe -s https://btc.domain.com/healthz
-curl.exe -i -s -u "sai:sai" -X POST https://btc.domain.com/mcp
-```
-
-Cái thứ hai phải ra `401`. Ra `421` nghĩa là `BAMCP_ALLOWED_HOSTS` thiếu domain.
-
-`probe.py` nằm sẵn trong image, nên nếu panel cho chạy lệnh trong container:
-
-```bash
-python probe.py get_positions
-```
-
-### 7. Cập nhật về sau
-
-`git push` → Actions build lại image → vào panel bấm recreate container. Dữ liệu trong `bamcp_data` không mất.
-
-
-`bamcp.service` là bản systemd cho trường hợp cài thẳng lên máy. Khi đó nhớ đổi `server.host` về `127.0.0.1` trong `config.yaml`.
-
-## Chạy thử trên Windows
+| Dữ liệu | Tự kéo nến 6 khung (5m đến 1w) cho nhiều cặp, lưu JSON hoặc SQLite | [data.md](docs/data.md) |
+| Quy định | Chấm lệnh theo quota, SL/TP, R:R. Mỗi lần đổi quy định đều phải có lý do | [rules.md](docs/rules.md) |
+| Setup và cảnh báo | Lưu kế hoạch vào lệnh, server canh trên nến M5 đã đóng rồi báo tin | [setups.md](docs/setups.md) |
+| Dashboard | Vẽ bias, setup, kịch bản lên biểu đồ nến và review theo ngày | [dashboard.md](docs/dashboard.md) |
+| ORB | Tín hiệu và backtest Opening Range Breakout theo phiên | [orb.md](docs/orb.md) |
+| GANN | Pivot, cửa sổ thời gian, mốc giá Square of 9 | [gann.md](docs/gann.md) |
+| Tài khoản thật (tuỳ chọn) | Đọc vị thế và PnL từ Binance, Bybit, OKX bằng key chỉ đọc | [account.md](docs/account.md) |
+
+Tra cứu: [danh sách tool](docs/tools.md) · [trang admin và bảo mật](docs/admin.md) · [deploy](docs/deploy.md)
+
+## Chạy thử trên máy
+
+Cần Python 3.12. Lệnh dưới đây dùng PowerShell. Trên macOS/Linux, đổi `.venv\Scripts\` thành `.venv/bin/` và `copy` thành `cp`.
 
 ```powershell
-cd C:\Working\AI\BAMCP
+git clone https://github.com/tan-mai/bamcp.git
+cd bamcp
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
-$env:BAMCP_USERNAME = "bamcp"
-$env:BAMCP_PASSWORD = "test123"
+copy .env.example .env
+```
+
+Mở `.env`, điền `BAMCP_PASSWORD` (**tối thiểu 8 ký tự**), rồi chạy:
+
+```powershell
 .venv\Scripts\python server.py
 ```
 
-Mở `http://127.0.0.1:8848/healthz`.
+Kiểm tra bằng một terminal khác:
 
-## Chạy test
+| Kiểm tra | Kết quả đúng |
+|---|---|
+| Mở `http://127.0.0.1:8848/healthz` | `{"status":"ok",...}` |
+| Mở `http://127.0.0.1:8848/admin` | Trang cài đặt, đăng nhập bằng username và mật khẩu trong `.env` |
+| `.venv\Scripts\python probe.py` | Danh sách tool |
+| `.venv\Scripts\python probe.py list_timeframes` | Các cặp đang theo dõi và khung đã có dữ liệu |
+
+## Gắn vào Claude
+
+Connector của Claude gọi server từ internet nên cần URL HTTPS công khai. Hãy [deploy](docs/deploy.md) trước, rồi:
+
+1. Sinh chuỗi base64 từ username và mật khẩu:
+
+   ```powershell
+   [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("<username>:<mật khẩu>"))
+   ```
+
+2. Trong Claude, vào **Customize → Connectors → Add custom connector**:
+
+   | Ô | Giá trị |
+   |---|---|
+   | URL | `https://<domain>/mcp` |
+   | Authentication | No sign-in |
+   | Request headers | `Authorization` = `Basic <chuỗi base64>` |
+
+3. Bật connector trong chat qua nút **+**, rồi hỏi thử: *"Đang theo dõi những cặp nào?"*
+
+Connector gắn theo tài khoản nên dùng được ngay trên web, desktop và mobile. Không thấy mục **Request headers**? Xem [phương án tạm](docs/deploy.md#không-thấy-mục-request-headers).
+
+## Một ngày dùng BAMCP
+
+| Lúc | Bạn nói với Claude | Chuyện xảy ra |
+|---|---|---|
+| Đầu ngày | *"Phân tích BTCUSDT từ khung tuần xuống H4, lưu bias và lập setup hôm nay."* | Claude đọc `get_context`, rồi gọi `save_bias`, `save_setups`, `save_scenarios` |
+| Trong ngày | Không cần làm gì | Server canh setup và báo tin mỗi lần setup đổi trạng thái |
+| Trước khi vào lệnh | *"Long BTC 67500, SL 67300, TP 68000, margin 20 USD được không?"* | `get_today_status` và `check_trade` chấm thử, không ghi gì. Bạn tự đặt lệnh trên sàn, rồi bảo Claude `log_trade` |
+| Cuối ngày | *"Đối chiếu nhật ký với sàn và review setup hôm nay."* | `reconcile_journal` chỉ ra chỗ lệch, `save_review` lưu kết quả |
+
+Xem thêm: [VSA chỉ đọc trên nến đã đóng](docs/data.md#nến-đang-chạy-và-nến-đã-đóng).
+
+## Cấu hình nằm ở đâu
+
+| Muốn đổi | Đổi ở đâu | Có hiệu lực |
+|---|---|---|
+| Mật khẩu, key sàn, cặp theo dõi | `/admin` | Ngay |
+| Quy định giao dịch | `/admin` hoặc bảo Claude, bắt buộc có lý do | Ngay |
+| Phiên ORB, GANN, lịch kéo nến, cảnh báo, tài khoản dashboard | Các trang con của `/admin` | Ngay |
+| Tham số kỹ thuật, quy trình phân tích của Claude | `config.yaml` | Sau khi restart |
+
+Thứ tự ưu tiên là `settings.json` > biến môi trường > `config.yaml`. Biến môi trường chỉ là giá trị khởi tạo cho lần chạy đầu, nên sau khi đã lưu trên `/admin` thì sửa `.env` không còn tác dụng.
+
+## Lỗi thường gặp
+
+| Triệu chứng | Nguyên nhân | Cách sửa |
+|---|---|---|
+| Đúng mật khẩu vẫn bị 401, log có `CANH BAO: bo qua BAMCP_PASSWORD` | Mật khẩu ngắn hơn 8 ký tự | Đổi mật khẩu dài hơn rồi khởi động lại |
+| `/mcp` trả 421 | `BAMCP_ALLOWED_HOSTS` thiếu domain | [Thêm domain](docs/deploy.md#4-biến-môi-trường) |
+| `list_timeframes` báo `last_fetch_error`, HTTP 451 | Binance chặn IP của VPS | [Kiểm tra IP](docs/deploy.md#ba-chỗ-dễ-sập) |
+| `save_bias` lỗi permission | Volume là bind mount | [Dùng named volume](docs/deploy.md#ba-chỗ-dễ-sập) |
+| Sửa `.env` không thấy đổi | `settings.json` được ưu tiên | Đổi trên `/admin` |
+
+## Phát triển
 
 ```powershell
 .venv\Scripts\pip install pytest
 .venv\Scripts\python -m pytest tests -q
 ```
 
-Test không gọi mạng và không đụng `data/` thật: chúng dùng thư mục tạm, sàn giả và đồng hồ giả. Bộ test gồm logic ORB (`test_orb_logic.py`), scheduler + watch M5 (`test_orb_runtime.py`), trang admin + backtest (`test_orb_admin_backtest.py`), bộ rule ORB riêng theo các acceptance criteria của BR (`test_orb_rules.py`), tầng tool của server — trong đó có kiểm tra tool cũ không đổi khi không truyền tham số ORB (`test_server.py`), và setup dashboard theo các tiêu chí nghiệm thu, gồm cả gọi HTTP qua middleware (`test_dashboard.py`).
+Test không gọi mạng và không đụng `data/` thật. Chúng dùng thư mục tạm, sàn giả và đồng hồ giả.
 
-## Gắn vào Claude
-
-Customize → Connectors → Add custom connector:
-
-- **URL:** `https://btc.yourdomain.com/mcp`
-- **Authentication:** No sign-in
-- **Request headers:** `Authorization` = `Basic <chuỗi base64>`
-
-Sinh chuỗi base64:
-
-```bash
-printf '%s' "$BAMCP_USERNAME:$BAMCP_PASSWORD" | base64
-```
-
-Dán kết quả vào sau chữ `Basic` và một dấu cách. Ví dụ `Basic YmFtY3A6czNjcjN0`.
-
-Connector gắn theo tài khoản nên có ngay trên mobile, desktop cá nhân và máy văn phòng miễn là đăng nhập cùng tài khoản. Bật trong từng chat qua nút "+".
-
-Nếu hộp thoại không có mục **Request headers** thì tài khoản chưa được mở beta đó. Phương án tạm: đặt `auth.enabled: false`, đổi `mcp_path` thành một chuỗi ngẫu nhiên dài (`/mcp-a7f3...`), và coi URL đó như mật khẩu.
-
-## Ba chỗ dễ sập
-
-**Host header.** Traefik chuyển tiếp nguyên Host header của request. `BAMCP_ALLOWED_HOSTS` phải chứa domain thật, nếu không server trả 421 cho mọi request. Dạng `host:*` mới khớp mọi port; riêng `"*"` không phải wildcard.
-
-**IP của VPS.** Binance chặn một số vùng (đáng chú ý: VPS đặt ở Mỹ) và trả `HTTP 451`. Nếu `list_timeframes` báo `last_fetch_error` ngay sau khi khởi động, kiểm tra bằng `curl -I https://fapi.binance.com/fapi/v1/ping` từ chính VPS đó trước khi nghi ngờ code.
-
-**Volume.** Container chạy uid 10001. Dùng **named volume** (`bamcp_data:/data`), đừng bind mount vào thư mục host — không có shell thì không `chown` được, và `save_bias` sẽ lỗi permission ngay lần ghi đầu.
+| File | Vai trò |
+|---|---|
+| `server.py` | Điểm vào: tool MCP, route HTTP, tác vụ nền |
+| `settings.py`, `admin*.py` | `settings.json` và các trang admin |
+| `kline_store.py`, `sqlite_db.py`, `fetch_schedules.py` | Lưu và kéo nến |
+| `exchanges.py` | Đọc tài khoản sàn, không có hàm đặt lệnh |
+| `orb*.py` | ORB |
+| `gann_*.py` | GANN |
+| `entry_*.py`, `notifier.py` | Setup, watcher, thông báo |
+| `dashboard_*.py`, `static/` | Setup dashboard |
+| `probe.py`, `bamcp_cli.py` | Gọi thử tool và lệnh quản trị từ dòng lệnh |
