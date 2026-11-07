@@ -4200,6 +4200,7 @@ ALERTS_FILE = DATA_ROOT / str(PATHS.get("alerts_config_file") or "alerts/config.
 ALERT_PARAM_DEFAULTS: dict[str, Any] = {
     "vol_mult": 2.0, "sma_period": 20, "body_pct": 0.6, "wick_pct": 0.6,
     "retest_low_vol_mult": 0.8, "confirm_within": 3, "entry_valid_candles": 3, "m15_filter": True,
+    "rejection_test_max_vol": 0.8, "rejection_stopping_min_vol": 2.0,
 }
 _ALERTS_CACHE: dict[str, Any] = {"key": None, "cfg": None}
 _ALERTS_LOCK = threading.Lock()
@@ -4226,8 +4227,8 @@ def _alerts_cfg() -> dict[str, Any]:
                 cfg[block] = override[block]
     watcher = cfg["watcher"]
     watcher["defaults"] = {**ALERT_PARAM_DEFAULTS, **(watcher.get("defaults") or {})}
-    watcher["symbol_overrides"] = {str(k).upper(): v or {} for k, v in
-                                   (watcher.get("symbol_overrides") or {}).items()}
+    # TM - #SETUP-PARAMS - Tham so theo cap nam trong SQLite, khong con doc tu file
+    watcher["symbol_overrides"] = SETUPS.all_params()
     watcher["watch_symbols"] = [str(s).upper() for s in (watcher.get("watch_symbols") or [])]
     _ALERTS_CACHE.update(key=key, cfg=cfg)
     return cfg
@@ -4268,11 +4269,48 @@ async def _setup_positions(symbol: str) -> list[dict[str, Any]] | None:
     return (await _open_positions([symbol]))["positions"]
 
 
+# TM - #SETUP-PARAMS - Ghi tham so setup vao SQLite luc khoi dong
+def _seed_setup_params() -> list[str]:
+    """Ghi cap chua co dong nao trong setup_params. Khong ghi de dong da co.
+
+    Gia tri tu config.yaml (setup_params). Neu cap da duoc chinh tay o ban truoc (alerts/config.json)
+    thi cac tham so do duoc giu, vi do la lua chon cua nguoi dung, khong phai mac dinh.
+    """
+    seed = {str(k).upper(): v or {} for k, v in (CFG.get("setup_params") or {}).items()}
+    try:
+        saved = _read_json(ALERTS_FILE, {}) if ALERTS_FILE.exists() else {}
+        legacy = ((saved.get("watcher") or {}).get("symbol_overrides") or {}) if isinstance(saved, dict) else {}
+    except Exception as exc:
+        print(f"CANH BAO: khong doc duoc {ALERTS_FILE.name} ({type(exc).__name__})", file=sys.stderr)
+        legacy = {}
+    legacy = {str(k).upper(): v or {} for k, v in legacy.items()}
+    clean: dict[str, dict[str, Any]] = {}
+    for symbol in sorted({*seed, *legacy}):
+        try:
+            clean[symbol] = _alert_params({**seed.get(symbol, {}), **legacy.get(symbol, {})})
+        except ValueError as exc:
+            print(f"CANH BAO: bo qua setup_params cua {symbol} - {exc}", file=sys.stderr)
+    added = SETUPS.seed_params(clean)
+    if added:
+        _ALERTS_CACHE.update(key=None, cfg=None)
+    return added
+
+
+# TM - #ENTRY-CLOSED - Keo lai nen vua dong truoc khi watcher xet, de dung gia dong da chot
+async def _watcher_refresh(symbol: str, timeframe: str) -> None:
+    async with _fetch_lock(symbol, timeframe):
+        async with httpx.AsyncClient() as client:
+            out = await _pull_since_latest(client, symbol, timeframe, 1, "watcher")
+    if not out["ok"]:
+        raise RuntimeError(out["error"])
+
+
 SETUPS = entry_store.SetupStore(SQLITE_PATH)
 WATCHER = entry_watcher.EntryWatcher(
     SETUPS, klines=lambda: KLINE_STORE, cfg=_alerts_cfg,
     min_rr=lambda symbol: float(_load_rules(symbol)["min_rr"]),
-    check=_setup_check, positions=_setup_positions, tz=TZ, span_ms=_tf_ms)
+    check=_setup_check, positions=_setup_positions, tz=TZ, span_ms=_tf_ms,
+    refresh=_watcher_refresh)
 
 
 def _setup_view(setup: dict[str, Any], last: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -4286,9 +4324,15 @@ def _setup_view(setup: dict[str, Any], last: dict[str, Any] | None = None) -> di
     out["tr_since"] = _stamp(setup["tr_since"]) if setup.get("tr_since") else None
     out["created_at"] = _stamp(setup["created_at"])
     out["terminal"] = setup["status"] in entry_logic.TERMINAL
+    # TM - #ENTRY-HTF - Huong khung lon va nhan setup nguoc
+    out["htf"] = setup.get("htf") or {}
+    out["htf_counter"] = entry_logic.htf_counter(setup["direction"], setup.get("htf"))
+    # TM - #ENTRY-VOL - Dieu kien volume dang co hieu luc cua setup nay
+    out["volume_rule"] = entry_logic.volume_rule(setup["trigger_type"],
+                                                 WATCHER.params_for(setup["symbol"], setup))
     out["state"] = {k: state[k] for k in ("max_chase", "x_max", "min_rr", "last_price",
-                                          "came_from", "confirm_count", "entry_valid_count",
-                                          "trigger", "confirm") if k in state}
+                                          "came_from", "zone_alerted", "confirm_count",
+                                          "entry_valid_count", "trigger", "confirm") if k in state}
     if state.get("last_candle"):
         out["state"]["last_candle"] = _stamp(state["last_candle"])
     if state.get("triggered_at"):
@@ -4319,6 +4363,27 @@ def _setup_finish(setup: dict[str, Any], status: str, event: str,
     return {"id": setup["id"], "code": setup["code"], "status": status, "event_id": ids[-1]}
 
 
+# TM - #ENTRY-HTF - Huong khung lon cua setup
+def _setup_trends(symbol: str) -> dict[str, str | None]:
+    """Huong W/D/H4 tu swing cua nen da dong, cung nguon voi get_context.
+
+    Server tu tinh, khong nhan tu nguoi goi: nhan la he qua cua con so, khong phai y muon.
+    Thieu du lieu hoac loi thi de None, khong duoc chan viec luu setup.
+    """
+    out: dict[str, str | None] = {}
+    for key, timeframe, _ in entry_logic.HTF_FRAMES:
+        try:
+            ctx = _build_context(symbol, timeframe)
+            last = ctx.get("last_closed_bar")
+            out[key] = entry_logic.swing_trend(
+                [s["price"] for s in ctx["swing_highs"]], [s["price"] for s in ctx["swing_lows"]],
+                float(last["close"])) if last else None
+        except Exception as exc:
+            print(f"BAMCP htf {symbol} {timeframe}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            out[key] = None
+    return out
+
+
 def _save_setups(symbol: str, setups: list[dict[str, Any]], replace: bool,
                  created_by: str) -> dict[str, Any]:
     if not isinstance(setups, list):
@@ -4342,7 +4407,9 @@ def _save_setups(symbol: str, setups: list[dict[str, Any]], replace: bool,
                           {"reason": "thay boi save_setups(replace=true)", "by": created_by})
             replaced.append(old["code"])
     saved = []
+    trends = _setup_trends(symbol) if cleaned else {}
     for index, clean in cleaned:
+        clean["htf"] = {**trends, "bias": (_orb_bias(symbol, clean["bias_date"]) or {}).get("direction")}
         row = SETUPS.insert(symbol, clean, created_by)
         verdict = check_trade(side=clean["direction"], entry=clean["entry"], stop=clean["stop"],
                               target=clean["target"], margin_usd=0.0, symbol=symbol)
@@ -4350,6 +4417,8 @@ def _save_setups(symbol: str, setups: list[dict[str, Any]], replace: bool,
                       "bias_date": row["bias_date"], "expires_at": _stamp(row["expires_at"]),
                       "x_max": round(clean["x_max"], 4),
                       "max_chase_effective": round(clean["max_chase_effective"], 4),
+                      "htf": row["htf"],
+                      "htf_counter": entry_logic.htf_counter(row["direction"], row["htf"]),
                       "check_trade": {k: verdict[k] for k in ("would_pass", "rule_violations",
                                                               "rr", "trade_type")}})
     return {"symbol": symbol, "min_rr": min_rr, "saved": saved, "rejected": rejected,
@@ -4368,15 +4437,49 @@ def save_setups(symbol: str, setups: list[dict[str, Any]], replace: bool = False
       tren); target; invalidate_level (long: duoi entry); trigger_type: spring|sos|
       close_above (long), utad|sow|close_below (short), rejection|retest (ca hai).
       Tuy chon: confirm_type close_above|close_below + confirm_level; max_chase (bo trong
-      = tu tinh tu SL/TP/min_rr); trigger_params {vol_mult, sma_period, body_pct, wick_pct,
-      retest_low_vol_mult, confirm_within, entry_valid_candles, m15_filter, ref_low,
-      ref_high, level}; m15_filter; expires_at ('YYYY-MM-DD HH:MM' gio VN hoac epoch ms,
-      bo trong = het ngay bias_date); bias_date (bo trong = hom nay); tr_high, tr_low,
-      tr_since; note.
+      = tu tinh tu SL/TP/min_rr); trigger_params; m15_filter; expires_at ('YYYY-MM-DD HH:MM'
+      gio VN hoac epoch ms, bo trong = het ngay bias_date); bias_date (bo trong = hom nay);
+      tr_high, tr_low, tr_since; note (chi de doc, code khong kiem tra dieu kien ghi trong note).
+    trigger_params chi nhan tham so ma trigger do dung, khai thua bi tu choi:
+      spring: vol_mult, sma_period, ref_low | utad: vol_mult, sma_period, ref_high
+      sos, sow: vol_mult, sma_period, body_pct, level
+      retest: retest_low_vol_mult, sma_period, level | close_above, close_below: level
+      rejection: wick_pct, sma_period, min_vol_mult, max_vol_mult
+      Moi trigger nhan them entry_valid_candles; co confirm_type thi nhan them confirm_within.
+    rejection BAT BUOC khai max_vol_mult (test, vol thap) va/hoac min_vol_mult (stopping
+      action, vol cao), la boi so cua SMA volume M5. Lay so tu get_setup_params cua dung cap.
     Setup co x_max <= 0 (khong dat min_rr ngay tai entry) bi tu choi kem ly do. Moi setup
     hop le duoc cham check_trade dang thu. Tra ve id + code (vd BTC-20261101-A).
+    Server tu luu htf {w, d, h4, bias}: huong W/D/H4 tinh tu swing nen da dong (up/down/range)
+    va bias cua bias_date. htf_counter liet ke cac khung nguoc huong setup - khong chan luu,
+    chi gan nhan trong tin va trong ket qua.
     """
     return _save_setups(_resolve_symbol(symbol), setups, bool(replace), "claude")
+
+
+# TM - #SETUP-PARAMS - Tham so setup theo cap
+@_tool_with_reasons()
+def get_setup_params(symbol: str = "") -> dict[str, Any]:
+    """Tham so setup dang ap dung cho MOT cap. Luu trong SQLite, sua o trang /admin/alerts.
+
+    Goi truoc save_setups de lay dung so cua cap. 'source' cho biet tung tham so lay tu dau:
+    symbol (dat rieng cho cap) hay default. 'rejection_trigger_params' la trigger_params de
+    khai cho setup rejection: 'test' khi can vol thap, 'stopping' khi can vol cao.
+    """
+    sym = _resolve_symbol(symbol)
+    params = WATCHER.params_for(sym)
+    row = SETUPS.param_row(sym)
+    stored = (row or {}).get("params") or {}
+    return {
+        "symbol": sym, "params": params,
+        "source": {k: "symbol" if k in stored else "default" for k in params},
+        "rejection_trigger_params": {
+            "test": {"max_vol_mult": params["rejection_test_max_vol"]},
+            "stopping": {"min_vol_mult": params["rejection_stopping_min_vol"]},
+        },
+        "stored_by": (row or {}).get("source"),
+        "updated_at": _stamp(row["updated_at"]) if row else None,
+    }
 
 
 @_tool_with_reasons()
@@ -5503,8 +5606,11 @@ async def _alerts_action(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
                 enabled=bool(payload.get("enabled")), plan_deadline_utc=f"{hh:02d}:{mm:02d}",
                 watch_symbols=sorted({str(s).strip().upper() for s in payload.get("watch_symbols") or []
                                       if str(s).strip()}),
-                defaults={**ALERT_PARAM_DEFAULTS, **_alert_params(payload.get("defaults") or {})},
-                symbol_overrides={str(k).upper(): _alert_params(v) for k, v in overrides.items()})
+                defaults={**ALERT_PARAM_DEFAULTS, **_alert_params(payload.get("defaults") or {})})
+            # TM - #SETUP-PARAMS - Tham so theo cap ghi vao SQLite. Kiem tra het roi moi ghi
+            pair_params = {str(k).upper(): _alert_params(v) for k, v in overrides.items()}
+            block.pop("symbol_overrides", None)
+            SETUPS.save_params(pair_params, "admin")
             _alerts_save("watcher", block)
             return 200, {"ok": True}
         if action == "setup_cancel":
@@ -5651,6 +5757,10 @@ def build_app():
             seeded = SCHEDULES.seed_defaults()
             if seeded:
                 print(f"BAMCP: da tao {seeded} fetch schedule mac dinh", file=sys.stderr)
+        # TM - #SETUP-PARAMS - Ghi tham so setup truoc khi watcher chay
+        added = _seed_setup_params()
+        if added:
+            print(f"BAMCP: da luu setup_params vao SQLite cho {', '.join(added)}", file=sys.stderr)
         task = (asyncio.create_task(FETCH_SCHEDULER.run_forever() if FETCH_MODE == "schedules"
                                     else _fetcher_loop()) if FETCH.get("enabled") else None)
         # TM - #ORB - ORB Enhancement: scheduler ORB song cung vong doi app nhu fetcher

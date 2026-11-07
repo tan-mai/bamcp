@@ -277,9 +277,9 @@ notify:
 watcher:
   enabled: true
   trigger_tf: "5m"
-  watch_symbols: ["BTCUSDT", "ETHUSDT"]
+  watch_symbols: ["BTCUSDT", "ETHUSDT", "XAUUSDT"]
   plan_deadline_utc: "00:30"         # 7h30 VN: cap trong watch_symbols chua co setup hom nay -> PLAN_MISSING
-  defaults:
+  defaults:                          # uu tien: trigger_params cua setup -> setup_params cua cap -> defaults
     vol_mult: 2.0
     sma_period: 20
     body_pct: 0.6
@@ -288,10 +288,30 @@ watcher:
     confirm_within: 3
     entry_valid_candles: 3
     m15_filter: true
-  symbol_overrides:                  # uu tien: trigger_params cua setup -> override theo cap -> defaults
-    BTCUSDT: {}
-    ETHUSDT: {}
+    rejection_test_max_vol: 0.8
+    rejection_stopping_min_vol: 2.0
   okx_symbol_map: { BTCUSDT: "BTC-USDT-SWAP", ETHUSDT: "ETH-USDT-SWAP" }
+
+# TM - #SETUP-PARAMS - Tham so setup theo cap. Gia tri KHOI TAO: moi lan khoi dong, cap nao chua
+# co trong bang setup_params (SQLite) thi duoc ghi mot lan; cap da co thi khong dong vao, ke ca
+# khi sua o day. Muon doi sau deploy thi sua o /admin/alerts. Doc lai bang get_setup_params.
+# So lieu: ca 3 cap co do hiem volume gan nhu nhau (>= 2x ~ 10% so nen, <= 0.8x ~ 50%) va 120 ngay
+# M5 khong cho thay nguong nao tot hon on dinh, nen dung chung mot bo so. Tach rieng tung cap de
+# sau nay chinh duoc doc lap.
+setup_params:
+  BTCUSDT: &setup_params_base
+    vol_mult: 2.0
+    sma_period: 20
+    body_pct: 0.6
+    wick_pct: 0.6
+    retest_low_vol_mult: 0.8
+    confirm_within: 3
+    entry_valid_candles: 3
+    m15_filter: true
+    rejection_test_max_vol: 0.8      # rejection kieu test: trigger_params.max_vol_mult
+    rejection_stopping_min_vol: 2.0  # rejection kieu stopping action: trigger_params.min_vol_mult
+  ETHUSDT: *setup_params_base
+  XAUUSDT: *setup_params_base
 
 # Gia tri KHOI TAO. Lan dau update_rules duoc goi, ban sao ghi sang data/rules.json
 # va tu do file do la nguon su that. Sua o day chi anh huong khi rules.json chua co,
@@ -560,6 +580,14 @@ instructions: |
   - Ket thuc buoi phan tich bias moi sang bang save_setups(symbol=..., setups=[...],
     replace=true) cho TUNG cap: vung, trigger, entry/SL/TP, invalidate_level. Setup
     khong dat min_rr ngay tai entry bi tu choi - doc 'rejected', dung luu lai y nguyen.
+    Goi save_bias TRUOC save_setups: server tu ghi htf {w, d, h4, bias} vao setup va
+    tra htf_counter = cac khung nguoc huong setup. htf_counter khong rong thi noi ro
+    setup do la setup nguoc khi ban vao lenh. Dieu kien trong 'note' khong duoc code
+    kiem tra - chi trigger_type va trigger_params moi co hieu luc.
+    trigger_type rejection BAT BUOC khai trigger_params.max_vol_mult (test, vol thap) hoac
+    min_vol_mult (stopping action, vol cao): chon theo dung kich ban, lay so tu
+    get_setup_params(symbol) cua dung cap, dung khai cho qua. trigger_params chi nhan
+    tham so ma trigger do dung - xem save_setups.
   - Khi nguoi dung hoi "vao duoc chua": doc get_setups va get_setup_events TRUOC, roi
     moi doc nen M5 va M15 da dong. ENTRY_VALID moi la tin hieu vao lenh; MISSED = gia
     da chay qua max_chase, khong duoi; BLOCKED = check_trade khong qua.

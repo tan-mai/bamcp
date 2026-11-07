@@ -15,7 +15,7 @@ SETUP_FIELDS = ("id", "code", "symbol", "bias_date", "direction", "status", "zon
                 "zone_high", "trigger_type", "trigger_params", "confirm_type", "confirm_level",
                 "entry", "stop", "target", "max_chase", "invalidate_level", "m15_filter",
                 "expires_at", "tr_high", "tr_low", "tr_since", "state_data", "note",
-                "created_by", "created_at", "updated_at")
+                "created_by", "created_at", "updated_at", "htf")
 EVENT_FIELDS = ("id", "setup_id", "at", "event", "from_status", "to_status", "tf",
                 "candle_open_time", "price", "details", "notified", "notify_error")
 
@@ -37,6 +37,7 @@ def _setup(row: Any) -> dict[str, Any]:
     out = {k: row[k] for k in SETUP_FIELDS}
     out["trigger_params"] = _loads(out["trigger_params"]) or {}
     out["state"] = _loads(out.pop("state_data")) or {}
+    out["htf"] = _loads(out["htf"]) or {}
     out["m15_filter"] = bool(out["m15_filter"])
     return out
 
@@ -75,15 +76,16 @@ class SetupStore:
                 "INSERT INTO setups (id, code, symbol, bias_date, direction, status, zone_low, "
                 "zone_high, trigger_type, trigger_params, confirm_type, confirm_level, entry, stop, "
                 "target, max_chase, invalidate_level, m15_filter, expires_at, tr_high, tr_low, "
-                "tr_since, state_data, note, created_by, created_at, updated_at) VALUES "
-                "(?, ?, ?, ?, ?, 'WAITING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "tr_since, state_data, note, created_by, created_at, updated_at, htf) VALUES "
+                "(?, ?, ?, ?, ?, 'WAITING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (sid, code, symbol.upper(), clean["bias_date"], clean["direction"],
                  clean["zone_low"], clean["zone_high"], clean["trigger_type"],
                  json.dumps(clean["trigger_params"]) if clean["trigger_params"] else None,
                  clean["confirm_type"], clean["confirm_level"], clean["entry"], clean["stop"],
                  clean["target"], clean["max_chase"], clean["invalidate_level"],
                  int(clean["m15_filter"]), clean["expires_at"], clean["tr_high"], clean["tr_low"],
-                 clean["tr_since"], json.dumps({}), clean["note"], created_by, now, now))
+                 clean["tr_since"], json.dumps({}), clean["note"], created_by, now, now,
+                 json.dumps(clean["htf"]) if clean.get("htf") else None))
             conn.execute(
                 "INSERT INTO setup_events (setup_id, at, event, from_status, to_status, details) "
                 "VALUES (?, ?, 'CREATED', NULL, 'WAITING', ?)",
@@ -140,6 +142,39 @@ class SetupStore:
                      json.dumps(ev.get("details") or {}, default=str)))
                 ids.append(int(cur.lastrowid))
         return ids
+
+    # TM - #SETUP-PARAMS - Tham so setup theo cap
+    def all_params(self) -> dict[str, dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute("SELECT symbol, params FROM setup_params").fetchall()
+        return {r["symbol"]: _loads(r["params"]) or {} for r in rows}
+
+    def param_row(self, symbol: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM setup_params WHERE symbol = ?", (symbol.upper(),)).fetchone()
+        return {**dict(row), "params": _loads(row["params"]) or {}} if row else None
+
+    def seed_params(self, seed: dict[str, dict[str, Any]]) -> list[str]:
+        """Chi ghi cap chua co dong nao: dong da co (ke ca rong) la lua chon cua nguoi dung."""
+        now, added = self.now_ms(), []
+        with self._conn() as conn, conn:
+            for symbol, params in seed.items():
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO setup_params (symbol, params, source, created_at, updated_at) "
+                    "VALUES (?, ?, 'seed', ?, ?)", (symbol.upper(), json.dumps(params), now, now))
+                if cur.rowcount:
+                    added.append(symbol.upper())
+        return added
+
+    def save_params(self, params: dict[str, dict[str, Any]], source: str) -> None:
+        now = self.now_ms()
+        with self._conn() as conn, conn:
+            for symbol, values in params.items():
+                conn.execute(
+                    "INSERT INTO setup_params (symbol, params, source, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?) ON CONFLICT(symbol) DO UPDATE SET params = excluded.params, "
+                    "source = excluded.source, updated_at = excluded.updated_at",
+                    (symbol.upper(), json.dumps(values), source, now, now))
 
     def system_event(self, event: str, details: dict[str, Any], price: float | None = None,
                      at: int | None = None) -> int:

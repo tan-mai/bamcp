@@ -20,10 +20,31 @@ TRIGGERS: dict[str, tuple[str, ...]] = {
     "close_below": ("short",),
 }
 CONFIRMS = ("close_above", "close_below")
+# rejection_* la nguong goi y theo cap de khai vao trigger_params cua setup rejection; watcher
+# khong doc truc tiep, vi test va stopping action can hai dieu kien nguoc nhau.
 PARAM_KEYS = ("vol_mult", "sma_period", "body_pct", "wick_pct", "retest_low_vol_mult",
-              "confirm_within", "entry_valid_candles", "m15_filter")
+              "confirm_within", "entry_valid_candles", "m15_filter",
+              "rejection_test_max_vol", "rejection_stopping_min_vol")
 LEVEL_KEYS = ("ref_low", "ref_high", "level")
+# TM - #ENTRY-VOL - Nguong volume rieng cua rejection, boi so SMA volume M5, khai theo tung setup.
+# Khong co mac dinh: test can vol thap, stopping action can vol cao.
+REJECTION_VOL_KEYS = ("min_vol_mult", "max_vol_mult")
+# Tham so ma tung trigger thuc su doc. Khai tham so khac thi validate tu choi, de khong co
+# dieu kien nao trong tuong co hieu luc ma code bo qua.
+TRIGGER_PARAMS: dict[str, tuple[str, ...]] = {
+    "spring": ("vol_mult", "sma_period", "ref_low"),
+    "utad": ("vol_mult", "sma_period", "ref_high"),
+    "sos": ("vol_mult", "sma_period", "body_pct", "level"),
+    "sow": ("vol_mult", "sma_period", "body_pct", "level"),
+    "rejection": ("wick_pct", "sma_period", *REJECTION_VOL_KEYS),
+    "retest": ("retest_low_vol_mult", "sma_period", "level"),
+    "close_above": ("level",),
+    "close_below": ("level",),
+}
 RETEST_LOOKBACK = 288
+# TM - #ENTRY-HTF - Huong khung lon luu kem setup: (khoa trong htf, timeframe, nhan hien thi)
+HTF_FRAMES = (("w", "1w", "W"), ("d", "1d", "D"), ("h4", "4h", "H4"))
+HTF_WORDS = {"up": "tăng", "down": "giảm", "range": "đi ngang"}
 
 
 class InsufficientData(Exception):
@@ -75,6 +96,52 @@ def code_base(symbol: str) -> str:
     return sym[:-4] if sym.endswith("USDT") and len(sym) > 4 else sym
 
 
+# TM - #ENTRY-HTF - Huong khung lon cua setup
+def swing_trend(highs: list[float], lows: list[float], close: float) -> str | None:
+    """up = dinh va day cao dan, down = dinh va day thap dan, con lai la range.
+
+    Nen da dong vuot qua swing vua roi nguoc huong thi cau truc da gay: tra range.
+    Chua du 2 dinh + 2 day thi tra None - khong doan.
+    """
+    if len(highs) < 2 or len(lows) < 2:
+        return None
+    if highs[-1] > highs[-2] and lows[-1] > lows[-2] and close >= lows[-1]:
+        return "up"
+    if highs[-1] < highs[-2] and lows[-1] < lows[-2] and close <= highs[-1]:
+        return "down"
+    return "range"
+
+
+def htf_counter(direction: str, htf: dict[str, Any] | None) -> list[str]:
+    """Nhan cac khung (va bias ngay) dang nguoc huong setup, vd ['D', 'H4', 'bias']."""
+    htf = htf or {}
+    trend, bias = ("down", "short") if direction == "long" else ("up", "long")
+    out = [label for key, _, label in HTF_FRAMES if htf.get(key) == trend]
+    return out + ["bias"] if htf.get("bias") == bias else out
+
+
+def htf_text(htf: dict[str, Any] | None) -> str:
+    if not htf:
+        return ""
+    parts = [f"{label} {HTF_WORDS.get(htf.get(key), '?')}" for key, _, label in HTF_FRAMES]
+    return " · ".join(parts + [f"bias {htf.get('bias') or '?'}"])
+
+
+# TM - #ENTRY-VOL - Dieu kien volume cua trigger, dang chu de hien trong tin va trang admin
+def volume_rule(kind: str, params: dict[str, Any]) -> str:
+    sma = f"SMA{params.get('sma_period', '?')}"
+    if kind in ("spring", "utad", "sos", "sow"):
+        return f"vol ≥ {float(params['vol_mult']):g}× {sma}"
+    if kind == "retest":
+        return f"vol ≤ {float(params['retest_low_vol_mult']):g}× {sma}"
+    if kind == "rejection":
+        bounds = [f"{sign} {float(params[key]):g}×"
+                  for sign, key in zip(("≥", "≤"), REJECTION_VOL_KEYS) if params.get(key) is not None]
+        if bounds:
+            return f"vol {' và '.join(bounds)} {sma}"
+    return "không xét vol"
+
+
 def check_trigger(setup: dict[str, Any], bar: dict[str, Any], history: list[dict[str, Any]],
                   params: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
     period = int(params["sma_period"])
@@ -112,6 +179,13 @@ def check_trigger(setup: dict[str, Any], bar: dict[str, Any], history: list[dict
         else:
             ref, extreme = zl, h
             hit = rng > 0 and (h - max(o, c)) >= wick_min and h >= zl and c < zl
+        # TM - #ENTRY-VOL - validate bat buoc khai it nhat mot nguong; setup luu truoc ban nay
+        # khong co nguong thi van chi xet hinh nen.
+        vol_min, vol_max = (params.get(key) for key in REJECTION_VOL_KEYS)
+        if vol_min is not None:
+            hit = hit and sma > 0 and volume >= float(vol_min) * sma
+        if vol_max is not None:
+            hit = hit and sma > 0 and volume <= float(vol_max) * sma
     elif kind == "retest":
         since = setup.get("tr_since")
         prior = [b for b in history if since is None or int(b["open_time"]) >= int(since)]
@@ -186,6 +260,24 @@ def step(setup: dict[str, Any], bar: dict[str, Any], ctx: dict[str, Any]
             state["blocked_sent"] = sent
             emit("BLOCKED", "BLOCKED", notify, rule_violations=reasons, check=verdict)
 
+    def zone_bar(may_exit: bool) -> None:
+        hit, detail = False, None
+        try:
+            hit, detail = check_trigger(setup, bar, ctx["history"], params)
+        except InsufficientData as exc:
+            emit(status, "INSUFFICIENT_DATA", False, have=exc.have, need=exc.need)
+        if hit:
+            state.update(triggered_at=int(bar["close_time"]), trigger=detail, confirm_count=0)
+            state.pop("confirm", None)
+            emit("TRIGGERED", "TRIGGERED", bool(setup.get("confirm_type")), trigger=detail)
+            if not setup.get("confirm_type"):
+                emit("CONFIRMED", "CONFIRMED", False, confirm=None)
+                entry_check()
+        elif may_exit:
+            came = state.get("came_from") or ("above" if long else "below")
+            if (close > zh) if came == "above" else (close < zl):
+                emit("WAITING", "ZONE_EXIT", False, came_from=came)
+
     if status in TERMINAL:
         return status, state, events
 
@@ -209,24 +301,16 @@ def step(setup: dict[str, Any], bar: dict[str, Any], ctx: dict[str, Any]
             came = "above" if opened > zh else "below" if opened < zl else (
                 "above" if long else "below")
             state["came_from"] = came
-            emit("IN_ZONE", "IN_ZONE", True, came_from=came)
+            # TM - #ENTRY-HTF - Moi setup chi bao IN_ZONE lan cham dau tien. Cham lai van
+            # ghi event va van xet trigger, chi khong gui tin.
+            first = not state.get("zone_alerted")
+            state["zone_alerted"] = True
+            emit("IN_ZONE", "IN_ZONE", first, came_from=came, repeat=not first)
+            # Xet trigger ngay tren nen cham vung: voi rejection/spring day thuong chinh la
+            # nen tin hieu. Nen nay chua xet ZONE_EXIT, de nen sau moi quyet dinh.
+            zone_bar(may_exit=False)
     elif status == "IN_ZONE":
-        hit, detail = False, None
-        try:
-            hit, detail = check_trigger(setup, bar, ctx["history"], params)
-        except InsufficientData as exc:
-            emit(status, "INSUFFICIENT_DATA", False, have=exc.have, need=exc.need)
-        if hit:
-            state.update(triggered_at=int(bar["close_time"]), trigger=detail, confirm_count=0)
-            state.pop("confirm", None)
-            emit("TRIGGERED", "TRIGGERED", bool(setup.get("confirm_type")), trigger=detail)
-            if not setup.get("confirm_type"):
-                emit("CONFIRMED", "CONFIRMED", False, confirm=None)
-                entry_check()
-        else:
-            came = state.get("came_from") or ("above" if long else "below")
-            if (close > zh) if came == "above" else (close < zl):
-                emit("WAITING", "ZONE_EXIT", False, came_from=came)
+        zone_bar(may_exit=True)
     elif status == "TRIGGERED":
         count = int(state.get("confirm_count") or 0) + 1
         state["confirm_count"] = count
@@ -247,6 +331,28 @@ def step(setup: dict[str, Any], bar: dict[str, Any], ctx: dict[str, Any]
     elif status == "BLOCKED":
         emit("WAITING", "UNBLOCKED", False)
     return finish()
+
+
+# TM - #ENTRY-VOL - rejection phai noi ro dang can vol cao hay vol thap
+def _rejection_volume(params: dict[str, Any]) -> dict[str, Any]:
+    out = dict(params)
+    for key in REJECTION_VOL_KEYS:
+        if key not in params:
+            continue
+        try:
+            value = float(params[key])
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} phai la so, nhan duoc {params[key]!r}") from None
+        if not 0 < value < float("inf"):
+            raise ValueError(f"{key} phai > 0")
+        out[key] = value
+    vol_min, vol_max = (out.get(key) for key in REJECTION_VOL_KEYS)
+    if vol_min is None and vol_max is None:
+        raise ValueError("rejection phai khai trigger_params.max_vol_mult (test, vol thap) hoac "
+                         "min_vol_mult (stopping action, vol cao), boi so cua SMA volume M5")
+    if vol_min is not None and vol_max is not None and vol_min > vol_max:
+        raise ValueError("min_vol_mult phai <= max_vol_mult")
+    return out
 
 
 def validate(raw: dict[str, Any], *, min_rr: float, now_ms: int,
@@ -307,9 +413,17 @@ def validate(raw: dict[str, Any], *, min_rr: float, now_ms: int,
             raise ValueError("trigger_params khong phai JSON hop le") from None
     if not isinstance(params, dict):
         raise ValueError("trigger_params phai la object")
-    unknown = sorted(set(params) - set(PARAM_KEYS) - set(LEVEL_KEYS))
+    params = {k: v for k, v in params.items() if v is not None}
+    unknown = sorted(set(params) - set(PARAM_KEYS) - set(LEVEL_KEYS) - set(REJECTION_VOL_KEYS))
     if unknown:
         raise ValueError(f"trigger_params co khoa khong ho tro: {unknown}")
+    # TM - #ENTRY-VOL - Tham so trigger khong dung thi tu choi, khong am tham bo qua
+    allowed = {*TRIGGER_PARAMS[kind], "entry_valid_candles", *(["confirm_within"] if confirm else [])}
+    unused = sorted(set(params) - allowed)
+    if unused:
+        raise ValueError(f"trigger {kind} khong dung tham so {unused}; chi nhan {sorted(allowed)}")
+    if kind == "rejection":
+        params = _rejection_volume(params)
     xm = x_max(direction, entry, stop, target, min_rr)
     if xm <= 0:
         rr = abs(target - entry) / abs(entry - stop)

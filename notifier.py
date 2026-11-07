@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo
 
 import httpx2 as httpx
 
+import entry_logic
+
 BACKOFF = (2.0, 10.0, 30.0)
 CHANNELS = ("discord", "telegram", "both")
 DISCORD_LIMIT = 2000
@@ -209,6 +211,18 @@ def _head(icon: str, setup: dict[str, Any], label: str, candle_ms: int | None,
             f"(nến M5 {_hm(candle_ms, tz)} đã đóng)")
 
 
+# TM - #ENTRY-HTF - Tin can ra quyet dinh thi kem huong khung lon va nhan setup nguoc
+HTF_EVENTS = ("IN_ZONE", "TRIGGERED", "ENTRY_VALID", "MISSED", "BLOCKED")
+
+
+def _htf_lines(setup: dict[str, Any]) -> list[str]:
+    text = entry_logic.htf_text(setup.get("htf"))
+    if not text:
+        return []
+    counter = entry_logic.htf_counter(setup["direction"], setup.get("htf"))
+    return ([f"⚠️ NGƯỢC {', '.join(counter)}"] if counter else []) + [f"Khung lớn: {text}"]
+
+
 def setup_alert(setup: dict[str, Any], event: dict[str, Any], tz: ZoneInfo,
                 params: dict[str, Any] | None = None) -> Alert:
     state = setup.get("state") or {}
@@ -223,8 +237,10 @@ def setup_alert(setup: dict[str, Any], event: dict[str, Any], tz: ZoneInfo,
         f" · R:R {rr:.1f}" if rr else "")
     zone = f"{_num(setup['zone_low'])}–{_num(setup['zone_high'])}"
     if name == "IN_ZONE":
+        # TM - #ENTRY-VOL - Noi ro trigger nay co xet volume khong
+        rule = f" ({entry_logic.volume_rule(setup['trigger_type'], params)})" if params else ""
         lines = [_head("🟡", setup, "IN_ZONE", candle, tz),
-                 f"Vào vùng {zone}, chuẩn bị. Chờ trigger {setup['trigger_type']}.",
+                 f"Vào vùng {zone}, chuẩn bị. Chờ trigger {setup['trigger_type']}{rule}.",
                  f"Giá {_num(price)} · {plan}"]
     elif name == "TRIGGERED":
         lines = [_head("🔵", setup, "TRIGGERED", candle, tz), _trigger_line(details.get("trigger")),
@@ -282,6 +298,10 @@ def setup_alert(setup: dict[str, Any], event: dict[str, Any], tz: ZoneInfo,
                  f"Lý do: {details.get('reason') or '—'}"]
     else:
         lines = [f"{setup['code']} · {name}"]
+    if name in HTF_EVENTS:
+        # Tin MISSED co dong ma setup o dong 2; cac tin khac o dong 1
+        at = 2 if name == "MISSED" else 1
+        lines[at:at] = _htf_lines(setup)
     return Alert("\n".join(lines), title=f"{setup['code']} {name}",
                  meta={"setup_id": setup["id"], "event": name})
 

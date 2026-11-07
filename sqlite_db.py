@@ -82,6 +82,20 @@ CREATE TABLE IF NOT EXISTS setup_events (
 CREATE INDEX IF NOT EXISTS ix_setups_active ON setups(symbol, status);
 CREATE INDEX IF NOT EXISTS ix_events_setup ON setup_events(setup_id, at);
 """,
+    # TM - #ENTRY-HTF - Huong khung lon luu kem setup (JSON: w, d, h4, bias)
+    """
+ALTER TABLE setups ADD COLUMN htf TEXT;
+""",
+    # TM - #SETUP-PARAMS - Tham so setup theo cap (JSON), thay symbol_overrides trong alerts/config.json
+    """
+CREATE TABLE IF NOT EXISTS setup_params (
+  symbol     TEXT NOT NULL PRIMARY KEY,
+  params     TEXT NOT NULL,
+  source     TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+""",
 ]
 
 _MIGRATED: set[str] = set()

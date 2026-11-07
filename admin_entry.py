@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 import admin_ui
+import entry_logic
 
 CSS = """
   table.params td { vertical-align:middle; }
@@ -63,7 +64,7 @@ __CFG_WARNING__
         <input type="text" id="s_expires" placeholder="YYYY-MM-DD HH:MM"></div>
       <div class="end pad"><label class="check"><input type="checkbox" id="s_m15" checked> m15_filter</label></div>
     </div>
-    <label for="s_params">trigger_params (JSON, tuỳ chọn)</label>
+    <label for="s_params">trigger_params (JSON) <span class="small">· rejection bắt buộc có max_vol_mult hoặc min_vol_mult</span></label>
     <textarea id="s_params" rows="3" placeholder='{"vol_mult": 1.8, "ref_low": 67100}'></textarea>
     <label for="s_note">Ghi chú</label><input type="text" id="s_note">
     <div class="actions"><button type="button" class="primary" id="b_create">Tạo setup</button></div>
@@ -286,15 +287,20 @@ def _setup_rows(rows: list[dict[str, Any]]) -> str:
         cancel = ("" if s["terminal"] else
                   f'<button class="danger" data-act="cancel" data-id="{_e(s["id"])}" '
                   f'data-code="{_e(s["code"])}">Huỷ</button>')
+        # TM - #ENTRY-HTF - Huong khung lon va nhan setup nguoc
+        counter = s.get("htf_counter") or []
+        htf = (f'<div class="small">{_e(entry_logic.htf_text(s.get("htf")))}</div>'
+               + (f'<span class="pill no">NGƯỢC {_e(", ".join(counter))}</span>' if counter else ""))
         out.append(
             "<tr>"
             f'<td><b>{_e(s["code"])}</b><div class="small">{_e(s["created_by"])} · {_e(s["created_at"])}</div></td>'
-            f'<td>{_e(s["direction"])}</td><td><span class="pill {css}">{_e(s["status"])}</span></td>'
+            f'<td>{_e(s["direction"])}{htf}</td><td><span class="pill {css}">{_e(s["status"])}</span></td>'
             f'<td class="num">{_num(s["zone_low"])}–{_num(s["zone_high"])}</td>'
             f'<td class="num">{_num(s["entry"])} / {_num(s["stop"])} / {_num(s["target"])}'
             f'<div class="small">max_chase {_num(chase if chase is not None else s.get("max_chase"))}'
             f' · inv {_num(s["invalidate_level"])}</div></td>'
-            f'<td>{_e(trigger)}</td><td class="small">{_e(s["expires_at"])}</td>'
+            f'<td>{_e(trigger)}<div class="small">{_e(s.get("volume_rule"))}</div></td>'
+            f'<td class="small">{_e(s["expires_at"])}</td>'
             f'<td class="small">{_e(last.get("event"))} {_e(last.get("at"))}'
             f'{" · lỗi tin" if last.get("notify_error") else ""}</td>'
             f'<td class="act"><button data-act="timeline" data-id="{_e(s["id"])}">Timeline</button>{cancel}</td>'

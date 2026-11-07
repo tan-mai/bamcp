@@ -39,6 +39,7 @@ Tuỳ chọn đọc tài khoản thật từ Binance, Bybit hoặc OKX bằng AP
 | `get_orb_config` | Tham số + rule ORB đang áp dụng (kèm nguồn từng lớp), cảnh báo `rule_infeasible` |
 | `save_setups` | Lưu kế hoạch vào lệnh thành setup có cấu trúc; watcher canh trên nến M5 đã đóng |
 | `get_setups` | Setup kèm trạng thái hiện tại và event gần nhất |
+| `get_setup_params` | Tham số setup đang áp dụng cho một cặp, gồm ngưỡng volume gợi ý cho `rejection` |
 | `cancel_setup` | Huỷ đúng một setup (bắt buộc lý do) |
 | `get_setup_events` | Lịch sử chuyển trạng thái và tin đã gửi |
 | `migrate_klines` | `import` nến JSON sang SQLite / `verify` đối chiếu hai bên (xem [Lưu nến trong SQLite](#lưu-nến-trong-sqlite)) |
@@ -504,7 +505,7 @@ Không có REST API nào khác. Muốn pull dữ liệu ngay thì bảo Claude g
 ```
 <data_root>/          # Docker: /data, mount ra ./data trên host
 ├── klines/    1w.json  1d.json  4h.json  1h.json  15m.json   # storage.kline_store = json
-├── bamcp.db              # SQLite: bảng klines (storage.kline_store = sqlite), fetch_schedules, setups, setup_events
+├── bamcp.db              # SQLite: bảng klines (storage.kline_store = sqlite), fetch_schedules, setups, setup_events, setup_params
 ├── alerts/config.json    # khối notify + watcher do /admin/alerts ghi (webhook, bot token)
 ├── bias/      2026-09-12.json
 ├── rules.json            # rule chung + phần đặt riêng từng cặp + khối orb (rule ORB) + lịch sử đổi
@@ -553,13 +554,13 @@ Task phân tích bias lúc 7h VN nên đặt 00:05 UTC, sau khi đã có nến 4
 
 ## Setup vào lệnh và cảnh báo
 
-AI chỉ lập kế hoạch: cuối buổi phân tích bias, Claude gọi `save_setups(symbol, setups, replace=true)` cho từng cặp. Việc canh giá chạy hoàn toàn trên server: watcher chạy ở giây thứ 20 sau mỗi mốc 5 phút, đọc nến 5m mới nhất trong DB (chưa có thì thử lại sau 10 giây, tối đa 3 lần), xét từng setup trên nến **đã đóng** và gửi một tin mỗi lần setup đổi trạng thái.
+AI chỉ lập kế hoạch: cuối buổi phân tích bias, Claude gọi `save_setups(symbol, setups, replace=true)` cho từng cặp. Việc canh giá chạy hoàn toàn trên server: watcher chạy ở giây thứ 20 sau mỗi mốc 5 phút. Với cặp có setup đang chạy, watcher tự kéo lại nến 5m vừa đóng từ Binance (kèm nến 15m ở mốc 15 phút nếu setup có `m15_filter`), vì bản do lịch `pull-5m` chụp ở giây thứ 5 có thể chưa chốt giá đóng và volume. Kéo lỗi hoặc chưa có nến thì thử lại sau 10 giây, tối đa 3 lần; hết lượt thì xét trên dữ liệu đang có và ghi vào `errors` của lần quét. Sau đó watcher xét từng setup trên nến **đã đóng** và gửi một tin mỗi lần setup đổi trạng thái.
 
 Mã setup: `<base>-<yyyyMMdd>-<chữ cái>`, vd `BTC-20261101-A`. Tool nhận id hoặc code.
 
 | Trạng thái | Sang | Khi | Tin |
 |---|---|---|---|
-| WAITING | IN_ZONE | high/low của nến giao với vùng | có |
+| WAITING | IN_ZONE | high/low của nến giao với vùng | chỉ lần chạm đầu tiên của setup |
 | IN_ZONE | WAITING | đóng ra ngoài vùng về phía cũ, chưa trigger | không |
 | IN_ZONE | TRIGGERED | trigger đạt | có nếu có bước confirm |
 | TRIGGERED | CONFIRMED | đóng vượt `confirm_level` trong `confirm_within` nến; không có confirm thì sang ngay | — |
@@ -572,7 +573,15 @@ Mã setup: `<base>-<yyyyMMdd>-<chữ cái>`, vd `BTC-20261101-A`. Tool nhận id
 | TRIGGERED…MISSED | FILLED | vị thế OKX mới cùng hướng, hoặc `log_trade(setup_id=...)` | có |
 | chưa kết thúc | INVALIDATED / EXPIRED / CANCELLED | đóng quá `invalidate_level` (kèm M15 nếu `m15_filter`) / quá `expires_at` / `cancel_setup` hoặc `replace=true` | có |
 
-Trigger (xét khi IN_ZONE; `vol_ok` = volume ≥ `vol_mult` × SMA(`sma_period`) volume M5): `spring`, `utad`, `sos`, `sow`, `rejection`, `retest`, `close_above`, `close_below`. Thiếu `sma_period` nến lịch sử thì không xét, ghi event `INSUFFICIENT_DATA`. Khởi động lại thì xét bù tối đa 12 nến, chỉ gửi tin cho trạng thái cuối.
+Trigger (xét ngay trên nến chạm vùng, rồi trên mỗi nến M5 đã đóng khi còn IN_ZONE; `vol_ok` = volume ≥ `vol_mult` × SMA(`sma_period`) volume M5): `spring`, `utad`, `sos`, `sow`, `rejection`, `retest`, `close_above`, `close_below`. Thiếu `sma_period` nến lịch sử thì không xét, ghi event `INSUFFICIENT_DATA`. Khởi động lại thì xét bù tối đa 12 nến, chỉ gửi tin cần báo mới nhất.
+
+Điều kiện volume M5 theo trigger: `spring`, `utad`, `sos`, `sow` cần ≥ `vol_mult`; `retest` cần ≤ `retest_low_vol_mult`; `rejection` khai riêng từng setup bằng `trigger_params.max_vol_mult` (test, vol thấp) và/hoặc `min_vol_mult` (stopping action, vol cao), bắt buộc có ít nhất một ngưỡng; `close_above`, `close_below` không xét volume. Lúc lưu setup không kiểm tra volume, tin IN_ZONE cũng không; volume chỉ xét lúc trigger, và tin IN_ZONE ghi rõ điều kiện đang áp dụng. `trigger_params` chỉ nhận tham số mà trigger đó đọc, khai thừa thì `save_setups` từ chối (xem docstring). Điều kiện viết trong `note` không có tác dụng.
+
+Tham số theo cặp nằm trong bảng SQLite `setup_params`. Thứ tự ưu tiên: `trigger_params` của setup, rồi `setup_params` của cặp, rồi `watcher.defaults`. Mỗi lần khởi động, cặp nào chưa có dòng trong bảng thì được ghi từ khối `setup_params` của `config.yaml`; tham số từng chỉnh tay trong `alerts/config.json` được giữ. Dòng đã có không bị ghi đè, kể cả khi sửa `config.yaml`, nên muốn đổi thì sửa ở `/admin/alerts` (có hiệu lực ngay). `rejection_test_max_vol` và `rejection_stopping_min_vol` chỉ là số gợi ý: watcher không đọc trực tiếp, Claude lấy từ `get_setup_params` rồi khai vào `trigger_params` của setup.
+
+Chạm lại vùng: giá ra khỏi vùng rồi quay lại thì không gửi tin IN_ZONE nữa (event vẫn ghi, `details.repeat = true`), nhưng trigger vẫn được xét nên TRIGGERED / ENTRY_VALID vẫn báo. Setup đã INVALIDATED thì bỏ qua hoàn toàn, giá quay lại vùng cũng không làm gì.
+
+Hướng khung lớn: lúc lưu setup, server tự ghi `htf` = `{w, d, h4, bias}`. W/D/H4 tính từ swing của nến đã đóng (cùng nguồn `get_context`): `up` khi đỉnh và đáy cao dần, `down` khi đỉnh và đáy thấp dần, còn lại `range`; đóng vượt swing vừa rồi ngược hướng thì về `range`; thiếu dữ liệu thì `null`. `bias` lấy từ `save_bias` của `bias_date`, nên phải `save_bias` trước `save_setups`. `htf_counter` liệt kê các khung ngược hướng setup, không chặn lưu; tin IN_ZONE, TRIGGERED, ENTRY_VALID, MISSED, BLOCKED và trang admin hiện nhãn `NGƯỢC ...` cùng dòng `Khung lớn`. Setup tạo trước bản này không có nhãn.
 
 `max_chase` hiệu lực = min(khai báo, x_max), với x_max giữ R:R tại giá vào thực tế ≥ `min_rr` của cặp — long: `((T−E) − m(E−S)) / (1+m)`. x_max ≤ 0 thì `save_setups` từ chối setup đó. Ví dụ E 67500, S 67050, T 68400, m 1.5 → 90.
 
@@ -580,7 +589,7 @@ Thông báo: `notify.channel` = `discord` (webhook) / `telegram` (bot, `parse_mo
 
 Khớp lệnh OKX: mỗi lượt quét, cặp có setup từ TRIGGERED trở đi thì đọc vị thế; vị thế mới mở sau lúc trigger, cùng hướng → FILLED cho setup có entry gần giá mở nhất, không setup nào khớp → tin "lệnh mở ngoài kế hoạch". Mã OKX theo `watcher.okx_symbol_map`.
 
-Trang `/admin/alerts`: kênh + webhook / bot token / chat id (che, chỉ ghi đè khi nhập mới), nút Gửi thử Discord / Gửi thử Telegram (dùng cấu hình đã lưu, thử riêng từng kênh, không retry); watcher bật/tắt, `watch_symbols`, `plan_deadline_utc`, bảng tham số mặc định + override theo cặp; danh sách setup theo ngày/trạng thái, timeline event, huỷ, form tạo setup tay. Lưu vào `alerts/config.json`, có hiệu lực ngay.
+Trang `/admin/alerts`: kênh + webhook / bot token / chat id (che, chỉ ghi đè khi nhập mới), nút Gửi thử Discord / Gửi thử Telegram (dùng cấu hình đã lưu, thử riêng từng kênh, không retry); watcher bật/tắt, `watch_symbols`, `plan_deadline_utc`, bảng tham số mặc định + override theo cặp; danh sách setup theo ngày/trạng thái, timeline event, huỷ, form tạo setup tay. Tham số theo cặp lưu vào bảng `setup_params`, phần còn lại vào `alerts/config.json`, đều có hiệu lực ngay.
 
 Sau deploy, phía Claude: dời task phân tích bias sang 00:05 UTC và kết thúc bằng `save_setups(..., replace=true)` cho từng cặp; khi hỏi "vào được chưa" thì đọc `get_setups` + `get_setup_events` trước, rồi mới đọc nến M5/M15 đã đóng.
 

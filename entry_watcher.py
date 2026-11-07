@@ -16,6 +16,7 @@ SCAN_OFFSET_MS = 20_000
 CANDLE_RETRIES = 3
 CANDLE_RETRY_DELAY = 10.0
 CATCH_UP = 12
+REFRESH_TIMEOUT = 15.0
 STALE_MS = 15 * 60_000
 SYSTEM_EVERY_MS = 3_600_000
 LOAD_BARS = 500
@@ -33,8 +34,10 @@ class EntryWatcher:
                  tz: ZoneInfo, span_ms: Callable[[str], int],
                  now_ms: Callable[[], int] | None = None,
                  sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-                 deliver: Callable[..., Awaitable[str | None]] = notifier.deliver) -> None:
+                 deliver: Callable[..., Awaitable[str | None]] = notifier.deliver,
+                 refresh: Callable[[str, str], Awaitable[None]] | None = None) -> None:
         self.store = store
+        self.refresh = refresh
         self.klines = klines
         self.cfg = cfg
         self.min_rr = min_rr
@@ -154,8 +157,12 @@ class EntryWatcher:
             if status == setup["status"] and state == setup["state"] and not events:
                 continue
             ids = self.store.apply(setup, status, state, events, tf)
-            if events and events[-1]["notify"]:
-                out.append((ids[-1], {**setup, "status": status, "state": state}))
+            # TM - #ENTRY-HTF - Gui event can bao cuoi cung trong lo, khong chi event cuoi: nen
+            # cham vung dau tien co the ket thuc bang event im lang (CONFIRMED, INSUFFICIENT_DATA)
+            for event_id, event in zip(reversed(ids), reversed(events)):
+                if event["notify"]:
+                    out.append((event_id, {**setup, "status": status, "state": state}))
+                    break
         return out
 
     async def match_positions(self, symbol: str) -> list[tuple[int, dict[str, Any] | None]]:
@@ -237,23 +244,56 @@ class EntryWatcher:
                 out.append(eid)
         return out
 
+    # TM - #ENTRY-CLOSED - Lich keo nen chay ngay sat luc nen dong, Binance co the chua chot
+    # gia dong/volume. Keo lai ngay truoc khi xet de khong bao tin hieu tu ban chup do.
+    def _refresh_frames(self, setups: list[dict[str, Any]], tf: str,
+                        closed_at: int) -> dict[str, set[str]]:
+        frames: dict[str, set[str]] = {}
+        if self.refresh is None:
+            return frames
+        m15_closed = closed_at % self.span_ms("15m") == 0
+        for setup in setups:
+            frames.setdefault(setup["symbol"], {tf})
+            if setup["m15_filter"] and m15_closed:
+                frames[setup["symbol"]].add("15m")
+        return frames
+
+    async def _refresh_symbol(self, symbol: str, frames: set[str]) -> bool:
+        try:
+            await asyncio.wait_for(asyncio.gather(*[self.refresh(symbol, f) for f in sorted(frames)]),
+                                   REFRESH_TIMEOUT)
+            return True
+        except Exception as exc:
+            print(f"BAMCP watcher: khong keo lai duoc nen {symbol} - {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+            return False
+
     async def scan(self, now: int | None = None) -> dict[str, Any]:
         now = int(now if now is not None else self.now_ms())
         tf = self.trigger_tf()
         span = self.span_ms(tf)
         expected = now // span * span - span
         w = self.watcher_cfg()
-        symbols = sorted({s["symbol"] for s in self.store.active()}
+        active = self.store.active()
+        symbols = sorted({s["symbol"] for s in active}
                          | {str(s).upper() for s in (w.get("watch_symbols") or [])})
         pending = list(symbols)
         processed: list[str] = []
         errors: dict[str, str] = {}
         sent: list[int] = []
+        # Cap khong co setup dang chay thi khong can keo lai: khong co gi de xet tren nen do
+        frames = self._refresh_frames(active, tf, expected + span)
+        unrefreshed = set(frames)
         for attempt in range(CANDLE_RETRIES + 1):
-            ready = [s for s in pending
-                     if (self.klines().get_latest_open_time(s, tf) or -1) >= expected]
+            todo = [s for s in pending if s in unrefreshed]
+            results = await asyncio.gather(*[self._refresh_symbol(s, frames[s]) for s in todo])
+            unrefreshed -= {s for s, ok in zip(todo, results) if ok}
+            ready = [s for s in pending if s not in unrefreshed
+                     and (self.klines().get_latest_open_time(s, tf) or -1) >= expected]
             if attempt == CANDLE_RETRIES:
                 ready = list(pending)
+                # Het luot thu thi van xet tren du lieu dang co, nhung ghi lai de con biet
+                errors.update({s: "xet tren nen chua keo lai duoc" for s in pending if s in unrefreshed})
             for sym in ready:
                 try:
                     for eid, setup in self.process_symbol(sym, self.now_ms() if attempt else now):
