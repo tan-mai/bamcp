@@ -14,11 +14,16 @@ server:
   log_level: "info"
   behind_proxy: true         # tin X-Forwarded-* khi chay sau Caddy/nginx
 
-  auth:                      # HTTP Basic authentication
+  auth:                      # HTTP Basic cho /mcp, form dang nhap cho /admin (chung mot mat khau)
     enabled: true
     username: "bamcp"        # co the de o day, KHONG nen de password o day
     password: ""             # de RONG -> doc tu bien moi truong BAMCP_PASSWORD
     realm: "BAMCP"
+    # TM - #ADMIN-LOGIN - Form dang nhap admin
+    session_hours: 12        # han phien /admin, tinh tu luc dang nhap
+    remember_days: 30        # han phien khi tick "Ghi nho"
+    login_max_attempts: 5    # sai lien tiep theo IP
+    login_lockout_minutes: 15
 
   allowed_hosts:             # Host header hop le. BAT BUOC them domain that khi chay sau proxy.
                              # Dang "host:*" cho phep moi port. De rong = tat kiem tra (khong khuyen khich).

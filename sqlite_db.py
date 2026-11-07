@@ -195,6 +195,15 @@ CREATE TABLE IF NOT EXISTS dashboard_login_guard (
   updated_at   INTEGER NOT NULL
 );
 """,
+    # TM - #ADMIN-LOGIN - Form dang nhap admin
+    """
+CREATE TABLE IF NOT EXISTS admin_sessions (
+  id         TEXT NOT NULL PRIMARY KEY,
+  auth_fp    TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+""",
 ]
 
 _MIGRATED: set[str] = set()

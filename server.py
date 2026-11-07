@@ -35,6 +35,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import JSONResponse
 
 import admin       # module cuc bo: trang cai dat
+import admin_auth  # TM - #ADMIN-LOGIN - Form dang nhap admin
 import admin_gann  # TM - #GANN-TW - Gann Time Windows: trang admin Gann
 import admin_dashboard  # TM - #DASHBOARD - Setup dashboard
 import admin_entry  # TM - #ENTRY-ALERT - Entry setups & alerts
@@ -5176,6 +5177,9 @@ ADMIN_PATH = SRV.get("admin_path", "/admin")
 ADMIN_SAVE_PATH = ADMIN_PATH.rstrip("/") + "/save"
 ADMIN_TEST_PATH = ADMIN_PATH.rstrip("/") + "/test"
 ADMIN_SYMBOL_PATH = ADMIN_PATH.rstrip("/") + "/symbols"
+# TM - #ADMIN-LOGIN - Form dang nhap admin
+ADMIN_LOGIN_PATH = ADMIN_PATH.rstrip("/") + "/login"
+ADMIN_LOGOUT_PATH = ADMIN_PATH.rstrip("/") + "/logout"
 
 
 def _admin_nav() -> list[tuple[str, str, str]]:
@@ -5189,13 +5193,16 @@ def _admin_nav() -> list[tuple[str, str, str]]:
     items.append(("alerts", "Vào lệnh", ADMIN_ALERTS_PATH))
     # TM - #DASHBOARD - Setup dashboard
     items.append(("dashboard", "Dashboard accounts", ADMIN_DASH_PATH))
+    # TM - #ADMIN-LOGIN - Form dang nhap admin
+    if AUTH_ENABLED and STORE.has_auth():
+        items.append(("logout", "Đăng xuất", ADMIN_LOGOUT_PATH))
     return items
 
 
 def _setup_ok(payload: dict[str, Any]) -> bool:
     """Truoc khi co mat khau, moi thao tac ghi phai kem setup token."""
     if STORE.has_auth():
-        return True        # da qua Basic auth o middleware
+        return True        # da qua dang nhap o middleware
     # strip(): copy tu khung log rat de dinh khoang trang hoac xuong dong o cuoi,
     # ma compare_digest so khop tung byte nen lech ngay.
     token = str(payload.get("setup_token") or "").strip()
@@ -5350,7 +5357,7 @@ async def http_admin_save(request):
     return JSONResponse({
         "saved": True,
         "message": "Da luu: " + ", ".join(changed) + ". Co hieu luc ngay.",
-        # Vua dat mat khau lan dau thi tai lai de trinh duyet hoi dang nhap.
+        # Vua dat hoac doi mat khau thi tai lai: phien cu het hieu luc, trang chuyen ve form dang nhap.
         # Doi rule cung tai lai: trang giu ban sao rule theo cap trong JS, khong
         # nap lai thi lan luu ke tiep so sanh voi gia tri cu va gui thua.
         "reload": bool(password) or rules_touched,
@@ -6372,10 +6379,6 @@ async def http_admin_dashboard(request):
 
 @mcp.custom_route(ADMIN_DASH_ACTION_PATH, methods=["POST"])
 async def http_admin_dashboard_action(request):
-    # Trinh duyet tu gui kem Basic auth da luu. Bat buoc JSON de trang la khong gui ngam duoc
-    # (form cross-site khong dat duoc Content-Type nay ma khong qua preflight), tao owner gia.
-    if "application/json" not in (request.headers.get("content-type") or "").lower():
-        return JSONResponse({"error": "can Content-Type application/json"}, status_code=415)
     try:
         payload = await request.json()
     except Exception:
@@ -6702,10 +6705,110 @@ async def http_dash_logout(request):
     return _dash_secure(response)
 
 
+# ---------------------------------------------------------------- admin: dang nhap bang form
+# TM - #ADMIN-LOGIN - Form dang nhap admin
+# Chi /admin dung phien cookie; /mcp van la Basic auth. Hai ben chung mot mat khau trong settings.json.
+
+ADMIN_COOKIE = "bamcp_admin"
+ADMIN_COOKIE_PATH = ADMIN_PATH.rstrip("/")
+ADMIN_SESSIONS = admin_auth.AdminSessions(SQLITE_PATH)
+
+
+def _admin_gate(scope):
+    """Cua vao cac trang admin. None la cho qua, con lai la response tra ngay cho trinh duyet."""
+    from starlette.requests import Request
+    from starlette.responses import RedirectResponse
+    request = Request(scope)
+    read_only = request.method in ("GET", "HEAD")
+    if not ADMIN_SESSIONS.valid(request.cookies.get(ADMIN_COOKIE) or "", STORE.auth_fingerprint()):
+        if read_only:
+            target = request.url.path + (f"?{request.url.query}" if request.url.query else "")
+            return _dash_secure(RedirectResponse(f"{ADMIN_LOGIN_PATH}?next={quote(target, safe='')}", status_code=302))
+        # Khong kem WWW-Authenticate de trinh duyet khong bat popup. Cac trang admin hien thang truong error.
+        return JSONResponse({"error": "Phiên đăng nhập đã hết hạn. Tải lại trang để đăng nhập lại."}, status_code=401)
+    # Cookie tu gui kem theo request nen phai chan trang la gui ngam. Form cross-site khong dat duoc
+    # Content-Type nay ma khong qua preflight. So ca gia tri, vi "text/plain; x=application/json" van la form thuong.
+    content_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if not read_only and content_type != "application/json":
+        return JSONResponse({"error": "can Content-Type application/json"}, status_code=415)
+    return None
+
+
+@mcp.custom_route(ADMIN_LOGIN_PATH, methods=["GET", "POST"])
+async def http_admin_login(request):
+    from starlette.responses import HTMLResponse, RedirectResponse
+    # Chua co mat khau hoac da tat auth thi khong co gi de dang nhap
+    if not (AUTH_ENABLED and STORE.has_auth()):
+        return RedirectResponse(ADMIN_PATH, status_code=302)
+    max_attempts = int(AUTH.get("login_max_attempts", 5))
+    lockout_minutes = float(AUTH.get("login_lockout_minutes", 15))
+    remember_days = int(AUTH.get("remember_days", 30))
+
+    def form_page(status: int = 200, error: str = "", next_url: str = "", username: str = ""):
+        page = dashboard_ui.login_page(action=ADMIN_LOGIN_PATH, next_url=next_url, error=error, username=username,
+                                       remember_days=remember_days, heading="Admin",
+                                       note="Đăng nhập bằng tài khoản quản trị BAMCP.")
+        return _dash_secure(HTMLResponse(page, status_code=status, headers={"Cache-Control": "no-store"}))
+
+    token = request.cookies.get(ADMIN_COOKIE) or ""
+    fingerprint = STORE.auth_fingerprint()
+    if request.method != "POST":
+        target = dashboard_logic.safe_next(request.query_params.get("next"), ADMIN_PATH)
+        if ADMIN_SESSIONS.valid(token, fingerprint):
+            return _dash_secure(RedirectResponse(target, status_code=302))
+        return form_page(next_url=target)
+
+    body = await request.body()
+    if len(body) > DASH_LOGIN_BODY_MAX:
+        return JSONResponse({"error": "body qua lon"}, status_code=413)
+    form = parse_qs(body.decode("utf-8", "replace"), keep_blank_values=True)
+
+    def field(name: str) -> str:
+        return (form.get(name) or [""])[0]
+
+    target = dashboard_logic.safe_next(field("next"), ADMIN_PATH)
+    username = field("username").strip()
+    # Tien to rieng: sai ben nay khong khoa ben dashboard, dang nhap dung ben kia cung khong xoa so lan sai ben nay.
+    guard_key = f"admin:{_dash_ip(request)}"
+    locked_message = f"Sai quá nhiều lần, tạm khoá đăng nhập từ địa chỉ này tối đa {lockout_minutes:g} phút."
+    if DASH_AUTH.locked_until(guard_key):
+        return form_page(429, locked_message, target, username)
+    # PBKDF2 ton CPU, khong chay tren event loop
+    if not await asyncio.to_thread(STORE.check_credentials, username.encode("utf-8"), field("password").encode("utf-8")):
+        if DASH_AUTH.record_failure(guard_key, max_attempts, lockout_minutes):
+            return form_page(429, locked_message, target, username)
+        return form_page(401, "Sai tên đăng nhập hoặc mật khẩu.", target, username)
+    DASH_AUTH.clear_failures(guard_key)
+    if token:
+        ADMIN_SESSIONS.destroy(token)
+    life_ms = (remember_days * 86_400_000 if field("remember")
+               else int(AUTH.get("session_hours", 12)) * 3_600_000)
+    response = RedirectResponse(target, status_code=303)
+    # Secure theo scheme thuc te (sau proxy thi lay tu X-Forwarded-Proto): chay http://127.0.0.1 ma ep Secure
+    # thi co trinh duyet bo cookie, dang nhap dung van bi day ve form.
+    response.set_cookie(ADMIN_COOKIE, ADMIN_SESSIONS.create(fingerprint, life_ms), max_age=life_ms // 1000,
+                        path=ADMIN_COOKIE_PATH, secure=request.url.scheme == "https", httponly=True, samesite="lax")
+    return _dash_secure(response)
+
+
+@mcp.custom_route(ADMIN_LOGOUT_PATH, methods=["POST"])
+async def http_admin_logout(request):
+    from starlette.responses import RedirectResponse
+    response = RedirectResponse(ADMIN_LOGIN_PATH, status_code=303)
+    # Khong co cookie thi khong lam gi: form cross-site khong gui kem cookie SameSite=Lax,
+    # nen trang la khong dang xuat ho duoc.
+    token = request.cookies.get(ADMIN_COOKIE)
+    if token:
+        ADMIN_SESSIONS.destroy(token)
+        response.delete_cookie(ADMIN_COOKIE, path=ADMIN_COOKIE_PATH, secure=request.url.scheme == "https",
+                               httponly=True, samesite="lax")
+    return _dash_secure(response)
+
+
 # ---------------------------------------------------------------- auth
 
 class BasicAuthMiddleware:
-    """HTTP Basic auth, viet duoi dang pure ASGI middleware.
+    """HTTP Basic auth, viet duoi dang pure ASGI middleware. Rieng /admin di qua session_gate.
 
     Khong dung BaseHTTPMiddleware vi transport streamable-http cua MCP dua tren SSE;
     BaseHTTPMiddleware boc response vao mot anyio task group va lam hong stream dai.
@@ -6714,7 +6817,9 @@ class BasicAuthMiddleware:
     def __init__(self, app, store, realm: str,
                  public_paths: tuple[str, ...] = (),
                  setup_paths: tuple[str, ...] = (),
-                 public_prefixes: tuple[str, ...] = ()):
+                 public_prefixes: tuple[str, ...] = (),
+                 session_prefix: str = "",
+                 session_gate=None):
         self.app = app
         self.store = store
         self.realm = realm
@@ -6724,6 +6829,10 @@ class BasicAuthMiddleware:
         # Duong chi mo khi CHUA co mat khau nao - de con vao dat mat khau lan dau.
         # Ban than chung van doi setup token moi ghi duoc gi.
         self.setup_paths = setup_paths
+        # TM - #ADMIN-LOGIN - Form dang nhap admin: nhanh nay khong nhan Basic. Neu nhan thi trinh
+        # duyet da luu credential tu popup cu se vao thang, khong thay form va khong dang xuat duoc.
+        self.session_prefix = session_prefix
+        self.session_gate = session_gate
 
     def _authorized(self, headers: list[tuple[bytes, bytes]]) -> bool:
         raw = b""
@@ -6745,6 +6854,11 @@ class BasicAuthMiddleware:
     def _own_login(self, path: str) -> bool:
         return ".." not in path and any(path == p or path.startswith(p + "/") for p in self.public_prefixes)
 
+    # TM - #ADMIN-LOGIN - Form dang nhap admin
+    def _uses_session(self, path: str) -> bool:
+        prefix = self.session_prefix
+        return bool(prefix) and ".." not in path and (path == prefix or path.startswith(prefix + "/"))
+
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or scope["path"] in self.public_paths or self._own_login(scope["path"]):
             await self.app(scope, receive, send)
@@ -6752,6 +6866,15 @@ class BasicAuthMiddleware:
         # Chua cai dat gi: cho vao trang admin, moi duong khac van dong
         if not self.store.has_auth() and scope["path"] in self.setup_paths:
             await self.app(scope, receive, send)
+            return
+
+        # TM - #ADMIN-LOGIN - Form dang nhap admin
+        if self._uses_session(scope["path"]):
+            response = self.session_gate(scope)
+            if response is None:
+                await self.app(scope, receive, send)
+            else:
+                await response(scope, receive, send)
             return
 
         if not self._authorized(scope.get("headers") or []):
@@ -6781,7 +6904,10 @@ def build_app():
             BasicAuthMiddleware,
             store=STORE,
             realm=AUTH_REALM,
-            public_paths=(SRV["health_path"],),
+            # TM - #ADMIN-LOGIN - Form dang nhap admin
+            public_paths=(SRV["health_path"], ADMIN_LOGIN_PATH, ADMIN_LOGOUT_PATH),
+            session_prefix=ADMIN_COOKIE_PATH,
+            session_gate=_admin_gate,
             setup_paths=(ADMIN_PATH, ADMIN_SAVE_PATH, ADMIN_TEST_PATH, ADMIN_SYMBOL_PATH,
                          # TM - #ORB - ORB Enhancement
                          ADMIN_ORB_PATH, ADMIN_ORB_ACTION_PATH,

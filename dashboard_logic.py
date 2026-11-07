@@ -361,7 +361,7 @@ def link_positions(groups: list[dict[str, Any]], setups: list[dict[str, Any]],
 
 
 def safe_next(value: Any, base: str) -> str:
-    """Chi nhan duong dan tuong doi nam trong dashboard. Sai thi ve trang chinh (chong open redirect)."""
+    """Chi nhan duong dan tuong doi nam trong base. Sai thi ve trang chinh (chong open redirect)."""
     text = str(value or "")
     if not text.startswith(base):
         return base

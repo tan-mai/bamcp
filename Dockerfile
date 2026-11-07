@@ -46,6 +46,8 @@ COPY cron_utc.py fetch_schedules.py admin_schedules.py ./
 COPY entry_logic.py entry_store.py entry_watcher.py notifier.py admin_entry.py ./
 # TM - #DASHBOARD - Setup dashboard
 COPY dashboard_logic.py dashboard_store.py dashboard_auth.py dashboard_ui.py admin_dashboard.py bamcp_cli.py ./
+# TM - #ADMIN-LOGIN - Form dang nhap admin
+COPY admin_auth.py ./
 COPY static ./static
 # Lenh `bamcp dashboard create-owner <username>`. Sinh ngay trong image de khong phu thuoc
 # kieu xuong dong cua file tren may build.

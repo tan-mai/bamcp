@@ -34,7 +34,9 @@ os.environ.setdefault("BAMCP_ACCOUNT_ENABLED", "false")
 
 import httpx2  # noqa: E402
 from argon2 import PasswordHasher  # noqa: E402
+from starlette.responses import JSONResponse  # noqa: E402
 
+import admin_ui  # noqa: E402
 import bamcp_cli  # noqa: E402
 import dashboard_auth  # noqa: E402
 import dashboard_logic as logic  # noqa: E402
@@ -180,7 +182,7 @@ def wipe() -> None:
     with sqlite_db.connect(server.SQLITE_PATH) as conn:
         for table in ("scenarios", "trading_ranges", "plan_snapshots", "setup_reviews", "setups", "setup_events",
                       "dashboard_users", "dashboard_sessions", "dashboard_audit", "dashboard_login_log",
-                      "dashboard_login_guard"):
+                      "dashboard_login_guard", "admin_sessions"):
             conn.execute(f"DELETE FROM {table}")
     server._DASH_CHART_CACHE.clear()
     server._DASH_EXCHANGE_CACHE.clear()
@@ -739,11 +741,11 @@ class HttpBase(Base):
         data.pop("auth", None)
         server.STORE._write(data)
 
-    def session(self, coro_fn, ip="10.0.0.1"):
+    def session(self, coro_fn, ip="10.0.0.1", base_url="https://bamcp.online"):
         """Chay kich ban voi mot client giu cookie, nhu mot trinh duyet."""
         async def main():
             transport = httpx2.ASGITransport(app=self.app, client=(ip, 1234))
-            async with httpx2.AsyncClient(transport=transport, base_url="https://bamcp.online") as client:
+            async with httpx2.AsyncClient(transport=transport, base_url=base_url) as client:
                 return await coro_fn(client)
         return run(main())
 
@@ -752,6 +754,10 @@ class HttpBase(Base):
 
     def csrf(self, token):
         return server.DASH_AUTH.session(token)["csrf_token"]
+
+    # TM - #ADMIN-LOGIN - Form dang nhap admin
+    async def admin_login(self, client, username="admin", password="admin-password-1", **form):
+        return await client.post(server.ADMIN_LOGIN_PATH, data={"username": username, "password": password, **form})
 
 
 class LoginTest(HttpBase):
@@ -821,16 +827,20 @@ class LoginTest(HttpBase):
             token = c.cookies.get("bamcp_dash")
             for path in (ADMIN, server.ADMIN_DASH_PATH):
                 res = await c.get(path, headers={"cookie": f"bamcp_dash={token}"})
-                self.assertEqual(res.status_code, 401, path)
-            self.assertEqual((await c.get(ADMIN, auth=("tan", OWNER_PASS))).status_code, 401)
+                self.assertEqual(res.status_code, 302, path)
+                self.assertTrue(res.headers["location"].startswith(server.ADMIN_LOGIN_PATH), path)
+            self.assertEqual((await c.get(ADMIN, auth=("tan", OWNER_PASS))).status_code, 302)
+            self.assertEqual((await self.admin_login(c, "tan", OWNER_PASS)).status_code, 401)
             self.assertEqual((await c.post("/mcp", headers={"cookie": f"bamcp_dash={token}"}, json={})).status_code, 401)
         self.session(main)
 
     def test_prefix_bypass_is_exact(self):
         async def main(c):
             self.assertEqual((await c.get(f"{BASE}x")).status_code, 401)
-            self.assertEqual((await c.get(f"{BASE}/../admin")).status_code, 401)
-            self.assertEqual((await c.get(f"{BASE}/../admin/dashboard-accounts")).status_code, 401)
+            for path in (f"{BASE}/../admin", f"{BASE}/../admin/dashboard-accounts"):
+                res = await c.get(path)
+                self.assertEqual(res.status_code, 302, path)
+                self.assertTrue(res.headers["location"].startswith(server.ADMIN_LOGIN_PATH), path)
         self.session(main)
 
     def test_lockout_after_5_failures(self):
@@ -1186,20 +1196,28 @@ class RoleTest(HttpBase):
 
 
 class AdminAccountsTest(HttpBase):
-    AUTH = ("admin", "admin-password-1")
+    def session(self, coro_fn, ip="10.0.0.1", **kwargs):
+        """Moi kich ban o day deu chay sau khi da dang nhap trang admin."""
+        async def logged_in(c):
+            self.assertEqual((await self.admin_login(c)).status_code, 303)
+            return await coro_fn(c)
+        return super().session(logged_in, ip, **kwargs)
 
     async def action(self, client, **payload):
-        return await client.post(server.ADMIN_DASH_ACTION_PATH, json=payload, auth=self.AUTH)
+        return await client.post(server.ADMIN_DASH_ACTION_PATH, json=payload)
 
     def test_page_needs_admin_and_lists_users(self):
+        async def anonymous(c):
+            self.assertEqual((await c.get(server.ADMIN_DASH_PATH)).status_code, 302)
+        HttpBase.session(self, anonymous)
+
         async def main(c):
-            self.assertEqual((await c.get(server.ADMIN_DASH_PATH)).status_code, 401)
-            page = await c.get(server.ADMIN_DASH_PATH, auth=self.AUTH)
+            page = await c.get(server.ADMIN_DASH_PATH)
             self.assertEqual(page.status_code, 200)
             for text in ("Dashboard accounts", "guest", "tan", "Audit log", "Lịch sử đăng nhập"):
                 self.assertIn(text, page.text)
             self.assertNotIn("$argon2", page.text)
-            self.assertIn("Dashboard accounts", (await c.get(ADMIN, auth=self.AUTH)).text, "co muc tren menu")
+            self.assertIn("Dashboard accounts", (await c.get(ADMIN)).text, "co muc tren menu")
         self.session(main)
 
     def test_created_viewer_logs_in_immediately(self):
@@ -1232,7 +1250,7 @@ class AdminAccountsTest(HttpBase):
             password = res.json()["generated_password"]
             self.assertGreaterEqual(len(password), 10)
             self.assertEqual((await self.login(c, "randomuser", password)).status_code, 303)
-            page = await c.get(server.ADMIN_DASH_PATH, auth=self.AUTH)
+            page = await c.get(server.ADMIN_DASH_PATH)
             self.assertNotIn(password, page.text)
             self.assertNotIn(password, json.dumps(server.DASH_AUTH.audit_log()))
         self.session(main)
@@ -1282,7 +1300,7 @@ class AdminAccountsTest(HttpBase):
             await self.action(c, action="set_active", id=uid, active=False)
             await self.action(c, action="set_active", id=uid, active=True)
             await self.action(c, action="delete", id=uid)
-            page = await c.get(server.ADMIN_DASH_PATH, auth=self.AUTH)
+            page = await c.get(server.ADMIN_DASH_PATH)
             self.assertIn("reset_password", page.text)
         self.session(main)
         rows = [r for r in server.DASH_AUTH.audit_log() if r["target"] == "audited"]
@@ -1310,9 +1328,11 @@ class AdminAccountsTest(HttpBase):
     def test_action_requires_json_content_type(self):
         async def main(c):
             body = json.dumps({"action": "create", "username": "evil", "password": "new-password-1", "role": "owner"})
-            res = await c.post(server.ADMIN_DASH_ACTION_PATH, content=body, auth=self.AUTH,
-                               headers={"content-type": "text/plain"})
-            self.assertEqual(res.status_code, 415)
+            for content_type in ("text/plain", "text/plain; x=application/json",
+                                 "application/x-www-form-urlencoded"):
+                res = await c.post(server.ADMIN_DASH_ACTION_PATH, content=body,
+                                   headers={"content-type": content_type})
+                self.assertEqual(res.status_code, 415, content_type)
         self.session(main)
         with self.assertRaises(ValueError):
             server.DASH_AUTH.user("evil")
@@ -1323,7 +1343,264 @@ class AdminAccountsTest(HttpBase):
         async def main(c):
             res = await c.post(server.ADMIN_DASH_ACTION_PATH, json={"action": "create", "username": "xyz", "password": "new-password-1"})
             self.assertEqual(res.status_code, 403)
+        HttpBase.session(self, main)
+
+
+# TM - #ADMIN-LOGIN - Form dang nhap admin
+class AdminLoginTest(HttpBase):
+    AUTH = ("admin", "admin-password-1")
+
+    def test_page_redirects_to_form_without_popup(self):
+        async def main(c):
+            res = await c.get(ADMIN)
+            self.assertEqual(res.status_code, 302)
+            self.assertEqual(res.headers["location"], f"{server.ADMIN_LOGIN_PATH}?next=%2Fadmin")
+            self.assertNotIn("www-authenticate", res.headers)
+            res = await c.get(f"{server.ADMIN_SCHEDULES_PATH}?tab=x")
+            self.assertEqual(res.headers["location"], f"{server.ADMIN_LOGIN_PATH}?next=%2Fadmin%2Fschedules%3Ftab%3Dx")
+            form = await c.get(res.headers["location"])
+            self.assertEqual(form.status_code, 200)
+            self.assertNotIn("www-authenticate", form.headers)
+            self.assertEqual(form.headers["cache-control"], "no-store")
+            self.assertEqual(form.headers["x-frame-options"], "DENY")
+            self.assertIn("form-action 'self'", form.headers["content-security-policy"])
+            for text in (f'action="{server.ADMIN_LOGIN_PATH}"', 'type="password"', 'autocomplete="current-password"',
+                         'name="next" value="/admin/schedules?tab=x"'):
+                self.assertIn(text, form.text)
+            self.assertNotIn("<script", form.text)
         self.session(main)
+
+    def test_action_without_session_gets_json_401_without_popup(self):
+        async def main(c):
+            res = await c.post(server.ADMIN_SAVE_PATH, json={})
+            self.assertEqual(res.status_code, 401)
+            self.assertNotIn("www-authenticate", res.headers)
+            self.assertIn("đăng nhập", res.json()["error"])
+        self.session(main)
+
+    def test_login_flow_and_cookie_flags(self):
+        async def main(c):
+            res = await self.admin_login(c, next=f"{server.ADMIN_SCHEDULES_PATH}?tab=x")
+            self.assertEqual(res.status_code, 303)
+            self.assertEqual(res.headers["location"], f"{server.ADMIN_SCHEDULES_PATH}?tab=x")
+            cookie = res.headers["set-cookie"].lower()
+            for flag in ("bamcp_admin=", "httponly", "secure", "samesite=lax", "path=/admin", "max-age=43200"):
+                self.assertIn(flag, cookie)
+            page = await c.get(ADMIN)
+            self.assertEqual(page.status_code, 200)
+            self.assertIn(f'action="{server.ADMIN_LOGOUT_PATH}"', page.text)
+            again = await c.get(f"{server.ADMIN_LOGIN_PATH}?next={server.ADMIN_ORB_PATH}")
+            self.assertEqual(again.status_code, 302, "da dang nhap thi khong hien form nua")
+            self.assertEqual(again.headers["location"], server.ADMIN_ORB_PATH)
+        self.session(main)
+
+    def test_remember_uses_30_days(self):
+        async def main(c):
+            res = await self.admin_login(c, remember="1")
+            self.assertIn(f"max-age={30 * 86400}", res.headers["set-cookie"].lower())
+        self.session(main)
+
+    def test_plain_http_cookie_is_not_secure_and_still_works(self):
+        async def main(c):
+            res = await self.admin_login(c)
+            self.assertEqual(res.status_code, 303)
+            self.assertNotIn("secure", res.headers["set-cookie"].lower())
+            self.assertEqual((await c.get(ADMIN)).status_code, 200)
+        self.session(main, base_url="http://127.0.0.1:8848")
+
+    def test_wrong_credentials_show_form_again(self):
+        async def main(c):
+            for username, password in (("admin", "sai-mat-khau-1"), ("khong-co", "admin-password-1"), ("", "")):
+                res = await self.admin_login(c, username, password)
+                self.assertEqual(res.status_code, 401, username)
+                self.assertNotIn("set-cookie", res.headers)
+                self.assertIn("Sai tên đăng nhập hoặc mật khẩu", res.text)
+                self.assertNotIn("sai-mat-khau-1", res.text)
+            self.assertIn('value="khong-co"', (await self.admin_login(c, "khong-co", "x")).text)
+            self.assertEqual((await c.get(ADMIN)).status_code, 302)
+        self.session(main)
+
+    def test_lockout_after_5_failures(self):
+        async def main(c):
+            for attempt in range(4):
+                self.assertEqual((await self.admin_login(c, password="sai")).status_code, 401, attempt)
+            self.assertEqual((await self.admin_login(c, password="sai")).status_code, 429)
+            res = await self.admin_login(c)
+            self.assertEqual(res.status_code, 429, "dang khoa thi mat khau dung cung bi chan")
+            self.assertNotIn("set-cookie", res.headers)
+        self.session(main)
+
+        async def allowed(c):
+            self.assertEqual((await self.admin_login(c)).status_code, 303)
+        self.session(allowed, ip="10.0.0.2")
+
+        future = int(time.time() * 1000) + 16 * 60_000
+        with mock.patch.object(server.DASH_AUTH, "now_ms", lambda: future):
+            self.session(allowed)
+
+    def test_lockout_is_separate_from_dashboard(self):
+        async def main(c):
+            for _ in range(5):
+                await self.admin_login(c, password="sai")
+            self.assertEqual((await self.admin_login(c)).status_code, 429)
+            self.assertEqual((await self.login(c)).status_code, 303, "sai ben admin khong khoa dashboard")
+            self.assertEqual((await self.admin_login(c)).status_code, 429, "dung ben dashboard khong mo khoa admin")
+        self.session(main)
+
+        async def dashboard_failures(c):
+            for _ in range(5):
+                await self.login(c, password="sai")
+            self.assertEqual((await self.login(c)).status_code, 429)
+            self.assertEqual((await self.admin_login(c)).status_code, 303, "sai ben dashboard khong khoa admin")
+        self.session(dashboard_failures, ip="10.0.0.3")
+
+    def test_success_clears_failures(self):
+        async def main(c):
+            for _ in range(4):
+                await self.admin_login(c, password="sai")
+            self.assertEqual((await self.admin_login(c)).status_code, 303)
+            for attempt in range(4):
+                self.assertEqual((await self.admin_login(c, password="sai")).status_code, 401, attempt)
+        self.session(main)
+
+    def test_open_redirect_blocked(self):
+        async def main(c):
+            for bad in ("https://evil.com", "//evil.com", f"{ADMIN}evil", "/mcp", server.ADMIN_LOGIN_PATH,
+                        server.ADMIN_LOGOUT_PATH, f"{ADMIN}/../mcp", BASE):
+                self.assertEqual((await self.admin_login(c, next=bad)).headers["location"], ADMIN, bad)
+                c.cookies.clear()
+                form = await c.get(server.ADMIN_LOGIN_PATH, params={"next": bad})
+                self.assertIn(f'name="next" value="{ADMIN}"', form.text, bad)
+        self.session(main)
+
+    def test_basic_auth_does_not_open_admin(self):
+        async def main(c):
+            self.assertEqual((await c.get(ADMIN, auth=self.AUTH)).status_code, 302)
+            self.assertEqual((await c.post(server.ADMIN_SAVE_PATH, json={}, auth=self.AUTH)).status_code, 401)
+        self.session(main)
+
+    def test_admin_session_opens_only_admin(self):
+        async def main(c):
+            await self.admin_login(c)
+            cookie = {"cookie": f"bamcp_admin={c.cookies.get('bamcp_admin')}"}
+            res = await c.post("/mcp", headers=cookie, json={})
+            self.assertEqual(res.status_code, 401)
+            self.assertIn("www-authenticate", res.headers)
+            self.assertEqual((await c.get(BASE, headers=cookie)).status_code, 302)
+            self.assertEqual((await c.get(f"{BASE}/api/chart", headers=cookie)).status_code, 401)
+            self.assertEqual((await c.get(f"{ADMIN}x", headers=cookie)).status_code, 401)
+        self.session(main)
+
+    def test_mcp_keeps_basic_auth(self):
+        async def stub(scope, receive, send):
+            await JSONResponse({"ok": True})(scope, receive, send)
+        app = server.BasicAuthMiddleware(stub, store=server.STORE, realm="BAMCP",
+                                         session_prefix=ADMIN, session_gate=server._admin_gate)
+
+        async def main():
+            transport = httpx2.ASGITransport(app=app)
+            async with httpx2.AsyncClient(transport=transport, base_url="https://bamcp.online") as c:
+                res = await c.post("/mcp")
+                self.assertEqual(res.status_code, 401)
+                self.assertIn('Basic realm="BAMCP"', res.headers["www-authenticate"])
+                self.assertEqual((await c.post("/mcp", auth=("admin", "sai"))).status_code, 401)
+                self.assertEqual((await c.post("/mcp", auth=self.AUTH)).status_code, 200)
+        run(main())
+
+    def test_token_stored_hashed(self):
+        async def main(c):
+            await self.admin_login(c)
+            return c.cookies.get("bamcp_admin")
+        token = self.session(main)
+        with sqlite_db.connect(server.SQLITE_PATH) as conn:
+            ids = [r[0] for r in conn.execute("SELECT id FROM admin_sessions")]
+        self.assertEqual(len(ids), 1)
+        self.assertNotIn(token, ids)
+
+    def test_logout(self):
+        async def main(c):
+            await self.admin_login(c)
+            token = c.cookies.get("bamcp_admin")
+            self.assertEqual((await c.get(server.ADMIN_LOGOUT_PATH)).status_code, 405, "chi POST")
+            self.assertEqual((await c.get(ADMIN)).status_code, 200)
+            res = await c.post(server.ADMIN_LOGOUT_PATH)
+            self.assertEqual(res.status_code, 303)
+            self.assertEqual(res.headers["location"], server.ADMIN_LOGIN_PATH)
+            self.assertIsNone(c.cookies.get("bamcp_admin"))
+            self.assertEqual((await c.get(ADMIN)).status_code, 302)
+            replay = await c.get(ADMIN, headers={"cookie": f"bamcp_admin={token}"})
+            self.assertEqual(replay.status_code, 302, "token cu khong dung lai duoc")
+        self.session(main)
+
+    def test_logout_without_cookie_changes_nothing(self):
+        """Form cross-site khong gui kem cookie SameSite=Lax, nen khong dang xuat ho duoc."""
+        async def main(c):
+            res = await c.post(server.ADMIN_LOGOUT_PATH)
+            self.assertEqual(res.status_code, 303)
+            self.assertNotIn("set-cookie", res.headers)
+        self.session(main)
+
+    def test_password_change_ends_sessions(self):
+        async def main(c):
+            await self.admin_login(c)
+            res = await c.post(server.ADMIN_SAVE_PATH, json={"username": "admin", "password": "new-password-1",
+                                                             "password2": "new-password-1"})
+            self.assertEqual(res.status_code, 200, res.text)
+            self.assertTrue(res.json()["reload"])
+            self.assertEqual((await c.get(ADMIN)).status_code, 302, "phien cu het hieu luc ngay")
+            self.assertEqual((await self.admin_login(c)).status_code, 401, "mat khau cu")
+            self.assertEqual((await self.admin_login(c, password="new-password-1")).status_code, 303)
+            self.assertEqual((await c.get(ADMIN)).status_code, 200)
+        self.session(main)
+
+    def test_session_expires(self):
+        async def main(c):
+            await self.admin_login(c)
+            now = int(time.time() * 1000)
+            with mock.patch.object(server.ADMIN_SESSIONS, "now_ms", lambda: now + 11 * 3_600_000):
+                self.assertEqual((await c.get(ADMIN)).status_code, 200)
+            with mock.patch.object(server.ADMIN_SESSIONS, "now_ms", lambda: now + 13 * 3_600_000):
+                self.assertEqual((await c.get(ADMIN)).status_code, 302)
+        self.session(main)
+
+    def test_setup_mode_stays_open_until_password_is_set(self):
+        self.drop_admin()
+
+        async def main(c):
+            page = await c.get(ADMIN)
+            self.assertEqual(page.status_code, 200)
+            self.assertIn('id="setup_token"', page.text)
+            self.assertNotIn(server.ADMIN_LOGOUT_PATH, page.text, "chua co mat khau thi khong co gi de dang xuat")
+            res = await c.get(server.ADMIN_LOGIN_PATH)
+            self.assertEqual(res.status_code, 302)
+            self.assertEqual(res.headers["location"], ADMIN)
+            payload = {"username": "admin", "password": "first-password-1", "password2": "first-password-1"}
+            self.assertEqual((await c.post(server.ADMIN_SAVE_PATH, json=payload)).status_code, 403)
+            payload["setup_token"] = server.STORE.setup_token()
+            res = await c.post(server.ADMIN_SAVE_PATH, json=payload)
+            self.assertEqual(res.status_code, 200, res.text)
+            self.assertTrue(res.json()["reload"])
+            res = await c.get(ADMIN)
+            self.assertEqual(res.status_code, 302, "vua dat mat khau xong thi phai dang nhap")
+            self.assertTrue(res.headers["location"].startswith(server.ADMIN_LOGIN_PATH))
+            self.assertEqual((await self.admin_login(c, password="first-password-1")).status_code, 303)
+        self.session(main)
+
+    def test_auth_disabled_has_no_login(self):
+        async def main(c):
+            res = await c.get(server.ADMIN_LOGIN_PATH)
+            self.assertEqual(res.status_code, 302)
+            self.assertEqual(res.headers["location"], ADMIN)
+        with mock.patch.object(server, "AUTH_ENABLED", False):
+            self.session(main)
+            self.assertNotIn("logout", [key for key, _label, _path in server._admin_nav()])
+
+    def test_logout_is_a_post_button_not_a_link(self):
+        nav = [("admin", "Cài đặt", "/admin"), ("logout", "Đăng xuất", "/admin/logout")]
+        page = admin_ui.page(title="x", active="admin", nav=nav, body="")
+        self.assertIn('<form class="logout" method="post" action="/admin/logout">', page)
+        self.assertNotIn('href="/admin/logout"', page)
+        self.assertNotIn('class="logout"', admin_ui.page(title="x", active="admin", nav=nav[:1], body=""))
 
 
 class CliTest(HttpBase):

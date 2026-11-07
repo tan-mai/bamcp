@@ -61,6 +61,8 @@ CSS = """
     white-space:nowrap; }
   .nav a:hover { color:var(--ink); background:var(--surface-2); text-decoration:none; }
   .nav a.on { color:var(--accent); background:var(--accent-soft); }
+  .logout { margin:0 0 0 auto; flex:none; }
+  .logout button { min-height:30px; padding:3px 12px; font-size:13px; }
 
   /* bo cuc */
   .wrap { max-width:1160px; margin:0 auto; padding:28px 20px 96px; }
@@ -220,7 +222,15 @@ def _nav(nav: list[NavItem], active: str) -> str:
     on = ' class="on" aria-current="page"'
     return "".join(
         f'<a href="{html.escape(path)}"{on if key == active else ""}>{html.escape(label)}</a>'
-        for key, label, path in nav)
+        for key, label, path in nav if key != "logout")
+
+
+# TM - #ADMIN-LOGIN - Form dang nhap admin: dang xuat la POST nen la nut trong form, khong phai link
+def _logout(nav: list[NavItem]) -> str:
+    return "".join(
+        f'<form class="logout" method="post" action="{html.escape(path)}">'
+        f'<button type="submit">{html.escape(label)}</button></form>'
+        for key, label, path in nav if key == "logout")
 
 
 def page(*, title: str, active: str, nav: list[NavItem], body: str, css: str = "") -> str:
@@ -237,7 +247,7 @@ def page(*, title: str, active: str, nav: list[NavItem], body: str, css: str = "
 <style>{CSS}{css}</style>
 </head>
 <body>
-<header class="topbar"><div class="topbar-in">{brand}<nav class="nav">{_nav(nav, active)}</nav></div></header>
+<header class="topbar"><div class="topbar-in">{brand}<nav class="nav">{_nav(nav, active)}</nav>{_logout(nav)}</div></header>
 <main class="wrap">
 {body}
 </main>

@@ -2,7 +2,7 @@
 
 # TM - #ORB - ORB Enhancement
 
-Dung chung co che dang nhap cua trang admin hien co (Basic auth o middleware,
+Dung chung co che dang nhap cua trang admin hien co (form dang nhap o middleware,
 setup token khi chua co mat khau). Moi thao tac ghi di qua SessionStore - ghi
 file atomic, ghi lich su, bao scheduler dung lai job ngay, khong can restart.
 

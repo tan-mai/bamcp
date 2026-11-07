@@ -1,5 +1,5 @@
 # TM - #DASHBOARD - Setup dashboard
-"""Tai khoan rieng cua dashboard, tach han khoi Basic auth cua admin.
+"""Tai khoan rieng cua dashboard, tach han khoi dang nhap cua admin.
 
 Cookie chua token ngau nhien; DB chi luu SHA-256 cua token, nen doc duoc DB cung khong
 dung lai duoc phien. Moi request deu doc lai vai tro va trang thai tai khoan, nen tat

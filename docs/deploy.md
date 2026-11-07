@@ -122,7 +122,7 @@ Với tag `:latest`, recreate có thể vẫn chạy image cũ nếu Docker khô
 
 Tài khoản Claude chưa được mở beta đó. Phương án tạm: đặt `auth.enabled: false`, đổi `mcp_path` thành một chuỗi ngẫu nhiên dài (`/mcp-a7f3...`), và coi URL đó như mật khẩu.
 
-> **Rủi ro:** `auth.enabled: false` tắt Basic auth cho cả `/admin`. Bất kỳ ai cũng mở được các trang admin và gọi được action của chúng mà không cần đăng nhập. Nếu buộc phải dùng, hãy chặn đường `/admin` ở Traefik và bật lại auth sớm nhất có thể.
+> **Rủi ro:** `auth.enabled: false` tắt luôn form đăng nhập của `/admin`. Bất kỳ ai cũng mở được các trang admin và gọi được action của chúng mà không cần đăng nhập. Nếu buộc phải dùng, hãy chặn đường `/admin` ở Traefik và bật lại auth sớm nhất có thể.
 
 ## Ba chỗ dễ sập
 

@@ -129,6 +129,20 @@ class SettingsStore:
         """
         if self._verified_header and secrets.compare_digest(header_value, self._verified_header):
             return True
+        if self.check_credentials(username, password):
+            self._verified_header = bytes(header_value)
+            return True
+        return False
+
+    # TM - #ADMIN-LOGIN - Form dang nhap admin
+    def auth_fingerprint(self) -> str:
+        """Doi moi khi username hoac mat khau doi. Phien dang nhap admin gan voi gia tri nay."""
+        auth = self.load().get("auth") or {}
+        raw = "\0".join(str(auth.get(key) or "") for key in ("username", "salt", "hash"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def check_credentials(self, username: bytes, password: bytes) -> bool:
+        """Luon chay PBKDF2 va so ca hai ve, de thoi gian phan hoi khong lo username co dung khong."""
         auth = self.load().get("auth") or {}
         stored_user = str(auth.get("username") or "")
         stored_hash = str(auth.get("hash") or "")
@@ -143,10 +157,7 @@ class SettingsStore:
         digest = hashlib.pbkdf2_hmac("sha256", password, bytes.fromhex(stored_salt), rounds)
         ok_user = secrets.compare_digest(username, stored_user.encode("utf-8"))
         ok_pass = secrets.compare_digest(digest.hex(), stored_hash)
-        if ok_user and ok_pass:
-            self._verified_header = bytes(header_value)
-            return True
-        return False
+        return ok_user and ok_pass
 
     # ------------------------------------------------------------ exchange
 

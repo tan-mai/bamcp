@@ -90,20 +90,34 @@ Biến môi trường chỉ là **giá trị khởi tạo** cho lần chạy đ�
 
 ## Xác thực
 
-`/mcp` và `/admin` dùng HTTP Basic, so khớp với hash trong `settings.json`. `BAMCP_USERNAME` / `BAMCP_PASSWORD`, rồi tới `server.auth` trong `config.yaml`, chỉ được nạp khi `settings.json` chưa có mật khẩu. So sánh credential dùng `secrets.compare_digest` cho cả hai vế, không short-circuit.
+`/mcp` dùng HTTP Basic, còn `/admin` dùng form đăng nhập tại `/admin/login`. Hai bên chung một username và mật khẩu, so khớp với hash trong `settings.json`. `BAMCP_USERNAME` / `BAMCP_PASSWORD`, rồi tới `server.auth` trong `config.yaml`, chỉ được nạp khi `settings.json` chưa có mật khẩu. So sánh credential dùng `secrets.compare_digest` cho cả hai vế, không short-circuit.
 
-`/healthz` không cần auth. `/setup-dashboard` không qua Basic auth vì có [đăng nhập riêng](dashboard.md#tài-khoản-và-quyền).
+`/admin` **không nhận Basic auth**, và cookie phiên của `/admin` cũng không mở được `/mcp`.
+
+Cách phiên đăng nhập `/admin` hoạt động:
+
+- **Hạn phiên** tính từ lúc đăng nhập, không tự gia hạn: `server.auth.session_hours` (mặc định 12 giờ), hoặc `remember_days` (30 ngày) nếu tick *Ghi nhớ*.
+- **Đổi mật khẩu** làm mọi phiên cũ hết hiệu lực ngay. **Đăng xuất** xoá phiên ở phía server.
+- **Khoá theo IP** sau `login_max_attempts` lần sai liên tiếp (mặc định 5), trong `login_lockout_minutes` phút (mặc định 15). Bộ đếm tách riêng với dashboard. Basic auth của `/mcp` không có khoá này.
+- **Cookie** `bamcp_admin` có `HttpOnly`, `SameSite=Lax`, chỉ gửi trong `/admin`, và có `Secure` khi truy cập qua HTTPS. Reverse proxy phải chuyển tiếp `X-Forwarded-Proto` (Traefik và Caddy làm sẵn), nếu không cookie sẽ thiếu `Secure`. Token trong DB chỉ lưu dạng SHA-256.
+- **Chống CSRF:** mọi `POST` trong `/admin` phải có `Content-Type: application/json`, trừ đăng nhập và đăng xuất.
+
+Hết phiên giữa chừng thì nút bấm báo lỗi và dữ liệu đang nhập vẫn còn trên trang. Đăng nhập lại ở tab khác rồi bấm lại là được.
+
+`/healthz` không cần auth. `/setup-dashboard` không dùng cơ chế này vì có [đăng nhập riêng](dashboard.md#tài-khoản-và-quyền).
 
 Thiếu credential thì server không dừng mà vào chế độ [setup token](#đặt-mật-khẩu-lần-đầu).
 
-> **Chỉ đặt `auth.enabled: false` khi test local.** Khi đó server bỏ hẳn Basic auth: `/mcp`, mọi trang `/admin` và các action của chúng đều không còn yêu cầu đăng nhập.
+> **Chỉ đặt `auth.enabled: false` khi test local.** Khi đó server bỏ hẳn xác thực: `/mcp`, mọi trang `/admin` và các action của chúng đều không còn yêu cầu đăng nhập.
 
 ## Bề mặt HTTP
 
 | Endpoint | Auth | Việc |
 |---|---|---|
-| `POST /mcp` | có | Giao thức MCP, Claude nói chuyện ở đây |
+| `POST /mcp` | Basic | Giao thức MCP, Claude nói chuyện ở đây |
 | `GET /healthz` | không | Health check cho Docker HEALTHCHECK và reverse proxy |
+| `GET, POST /admin/login` | không | Form đăng nhập admin, khoá theo IP khi sai nhiều lần |
+| `POST /admin/logout` | phiên | Xoá phiên admin |
 | `GET /admin` | có* | Trang Cài đặt |
 | `POST /admin/save`, `/admin/test`, `/admin/symbols` | có* | Lưu cài đặt, kiểm tra kết nối sàn, thêm/tắt/bỏ cặp |
 | `GET /admin/orb` | có* | Quản lý phiên, rule ORB và news days (chỉ có khi `orb.enabled`) |
@@ -122,6 +136,6 @@ Thiếu credential thì server không dừng mà vào chế độ [setup token](
 | `/setup-dashboard/static/*` | phiên | CSS và JS của trang |
 | `/setup-dashboard/api/*` | phiên | [API JSON](dashboard.md#api-của-trang) cho trang |
 
-`*` Các trang `/admin` mở công khai khi **chưa** đặt mật khẩu lần nào, nhưng lúc đó phải có setup token mới ghi được.
+`*` Cần phiên đăng nhập admin: chưa đăng nhập thì `GET` chuyển về `/admin/login`, `POST` trả 401. Các trang `/admin` mở công khai khi **chưa** đặt mật khẩu lần nào, nhưng lúc đó phải có setup token mới ghi được.
 
 Ngoài API của dashboard thì không có REST API nào khác. Muốn pull dữ liệu ngay thì bảo Claude gọi tool `refresh_data`.

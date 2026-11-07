@@ -24,7 +24,7 @@ __SETUP_BANNER__
 <div>
   <section class="card">
     <h2>Truy cập API</h2>
-    <p class="desc">Basic auth cho <code>/mcp</code> và chính các trang admin này.</p>
+    <p class="desc">Dùng để đăng nhập các trang admin này và làm Basic auth cho <code>/mcp</code>. Đổi mật khẩu thì phải đăng nhập lại.</p>
     <label for="username">Tên đăng nhập</label>
     <input type="text" id="username" name="username" value="__USERNAME__" autocomplete="username">
     <div class="row">

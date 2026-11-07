@@ -35,22 +35,24 @@ LOGIN_CSS = """
 """
 
 
+# TM - #ADMIN-LOGIN - Form dang nhap admin: trang admin dung lai form nay voi heading/note rieng
 def login_page(*, action: str, next_url: str, error: str = "", username: str = "",
-               remember_days: int = 30) -> str:
+               remember_days: int = 30, heading: str = "Setup Dashboard",
+               note: str = "Đăng nhập bằng tài khoản dashboard.") -> str:
     message = f'<p class="error" role="alert">{html.escape(error)}</p>' if error else ""
     return f"""<!doctype html>
 <html lang="vi">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BAMCP Setup Dashboard - Đăng nhập</title>
+<title>BAMCP {html.escape(heading)} - Đăng nhập</title>
 <link rel="icon" href="data:,">
 <style>{LOGIN_CSS}</style>
 </head>
 <body>
 <form method="post" action="{html.escape(action)}">
-  <h1>Setup Dashboard</h1>
-  <p>Đăng nhập bằng tài khoản dashboard.</p>
+  <h1>{html.escape(heading)}</h1>
+  <p>{html.escape(note)}</p>
   {message}
   <input type="hidden" name="next" value="{html.escape(next_url)}">
   <label for="username">Tên đăng nhập</label>
