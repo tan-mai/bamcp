@@ -204,6 +204,61 @@ CREATE TABLE IF NOT EXISTS admin_sessions (
   created_at INTEGER NOT NULL
 );
 """,
+    # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+    # Cot json events cu giu lai toi khi nghiem thu xong, bo trong mot migration rieng.
+    # events_migrated = 0: event cu con nam trong json, server chuyen sang tr_events luc khoi dong
+    # (can nen de tinh so VSA nen khong lam bang SQL).
+    """
+ALTER TABLE trading_ranges ADD COLUMN schematic TEXT NOT NULL DEFAULT 'undetermined';
+ALTER TABLE trading_ranges ADD COLUMN status TEXT NOT NULL DEFAULT 'hypothesis';
+ALTER TABLE trading_ranges ADD COLUMN levels TEXT;
+ALTER TABLE trading_ranges ADD COLUMN note TEXT;
+ALTER TABLE trading_ranges ADD COLUMN events_migrated INTEGER NOT NULL DEFAULT 0;
+UPDATE trading_ranges SET status = 'completed' WHERE superseded_by IS NOT NULL;
+CREATE TABLE IF NOT EXISTS tr_phases (
+  id         TEXT NOT NULL PRIMARY KEY,
+  tr_id      TEXT NOT NULL REFERENCES trading_ranges(id),
+  phase      TEXT NOT NULL,
+  start_t    INTEGER NOT NULL,
+  end_t      INTEGER,
+  note       TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE (tr_id, phase)
+);
+CREATE TABLE IF NOT EXISTS tr_events (
+  id           TEXT NOT NULL PRIMARY KEY,
+  tr_id        TEXT NOT NULL REFERENCES trading_ranges(id),
+  seq          INTEGER NOT NULL,
+  type         TEXT NOT NULL,
+  t            INTEGER NOT NULL,
+  tf           TEXT NOT NULL,
+  price        REAL NOT NULL,
+  side         TEXT NOT NULL,
+  vol_ratio    REAL,
+  spread_ratio REAL,
+  close_pct    REAL,
+  status       TEXT NOT NULL DEFAULT 'tentative',
+  confirmed_by TEXT,
+  note         TEXT,
+  created_by   TEXT NOT NULL,
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL,
+  UNIQUE (tr_id, type, t)
+);
+CREATE INDEX IF NOT EXISTS ix_tr_events_tr ON tr_events(tr_id, t);
+CREATE TABLE IF NOT EXISTS tr_event_deletions (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  tr_id      TEXT NOT NULL,
+  event      TEXT NOT NULL,
+  reason     TEXT NOT NULL,
+  deleted_at INTEGER NOT NULL
+);
+ALTER TABLE setups ADD COLUMN tr_id TEXT;
+ALTER TABLE setups ADD COLUMN event_ref TEXT;
+ALTER TABLE setups ADD COLUMN expects TEXT;
+ALTER TABLE setups ADD COLUMN phase TEXT;
+""",
 ]
 
 _MIGRATED: set[str] = set()

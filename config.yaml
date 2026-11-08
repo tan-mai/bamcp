@@ -444,6 +444,7 @@ orb:
 
 # Quy trinh phan tich ma Claude doc luc bat tay. Sua o day, `docker compose restart`,
 # roi tat/bat lai connector trong chat de Claude doc ban moi. Khong can build lai image.
+# TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: them muc "TR KHOA & WYCKOFF".
 instructions: |
   Du lieu BTC da khung tu Binance. Moi con so phai lay tu cac tool nay,
   khong duoc uoc luong hay nho lai.
@@ -614,15 +615,33 @@ instructions: |
     tham so ma trigger do dung - xem save_setups.
     invalidate_level da bi pha tai gia hien tai thi setup bi tu choi. Setup breakout co
     invalidate_level ben kia gia: khai confirm_type, muc nay chi duoc xet sau khi confirm dat.
-  - Ngay sau save_setups, goi save_scenarios(symbol=..., scenarios=[...], tr={...}) cho cap do:
-    kich ban chinh + kich ban phu (points, setup_codes, condition) va TR khoa kem cac moc Wyckoff.
+  - Ngay sau save_setups, goi save_scenarios(symbol=..., scenarios=[...]) cho cap do: kich ban
+    chinh + kich ban phu (points, setup_codes, condition). Chi truyen tr={...} khi tao TR lan dau
+    hoac ve lai TR (neo tr_high/tr_low/since doi).
     Kich ban da dien ra hoac hong: save_scenarios(scenarios=[{code, status}], replace=false).
+
+  TR KHOA & WYCKOFF: pha va su kien luu tren TR, khong luu tren setup.
+  - Doc TR bang get_chart_data truoc khi phan tich. Chi gan event tren nen DA DONG.
+  - Event moi mac dinh tentative. Chi confirmed khi co event xac nhan; bi phu dinh thi failed, khong xoa.
+  - Dung update_tr de them/sua event va pha. Doi neo TR (tr_high/tr_low/since) = ve lai TR, qua save_scenarios.
+  - Goi update_tr TRUOC save_bias. save_setups kem event_ref va expects.
+  - schematic undetermined cho toi khi co bang chung (vd SPRING/SOS -> accumulation; UTAD/SOW -> distribution).
+  - Moi lan phan tich: get_chart_data(symbol, "15m", 96+) -> xet redraw_rule (bi pha thi ve TR moi qua
+    save_scenarios, TR cu completed hoac failed qua old_tr_status) -> duyet nen moi da dong, gan event
+    moi neu co bang chung VSA -> danh gia lai event tentative cu (confirmed khi co event xac nhan, vd
+    SPRING -> TEST giu day vol thap, SOS -> LPS; failed khi bi phu dinh, vd dong duoi day SPRING) ->
+    mo/dong pha (ST ket thuc A, SPRING/UTAD mo C, SOS/SOW mo D, roi TR mo E) -> MOT lan update_tr
+    -> save_bias -> save_setups (event_ref, expects) -> save_scenarios.
+  - Bao cao ghi ro event moi / doi trang thai trong lan nay (added, updated cua update_tr) va gan dashboard_url.
+  - get_review_stats(group_by="phase" | "event_ref_type" | "expects" | "schematic", hoac nhom cheo
+    "direction,event_ref_type,phase") de xem setup nao an trong pha nao.
   - Can ve bieu do thi dung get_chart_data, KHONG ghep nhieu tool: mot lan goi tra nen, vol_spike,
     bias, setup, kich ban, TR, muc HTF, vi the. Cung du lieu voi trang dashboard.
   - Moi bao cao ve setup deu kem dashboard_url ma tool tra ve; tin push da tu kem link.
-  - Tai khoan viewer doc duoc summary, action_zone cua bias va label, condition cua kich ban nhung
-    khong duoc thay vi the, PnL. Khong ghi so vi the hay PnL vao cac cho do; ghi vao notes cua
-    save_bias hoac note cua setup, hai cho nay viewer khong doc duoc.
+  - Tai khoan viewer doc duoc summary, action_zone cua bias, label, condition cua kich ban va TOAN BO
+    TR (note, redraw_rule, note cua pha va event) nhung khong duoc thay vi the, PnL. Khong ghi so vi
+    the hay PnL vao cac cho do; ghi vao notes cua save_bias hoac note cua setup, hai cho nay viewer
+    khong doc duoc.
   - Review cuoi ngay: get_chart_data(date=..., revision="origin") la ke hoach goc doi voi nen that;
     save_review gan outcome, r_multiple, note. get_review_stats de xem thong ke.
   - Khi nguoi dung hoi "vao duoc chua": doc get_setups va get_setup_events TRUOC, roi

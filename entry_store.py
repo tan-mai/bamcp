@@ -15,7 +15,9 @@ SETUP_FIELDS = ("id", "code", "symbol", "bias_date", "direction", "status", "zon
                 "zone_high", "trigger_type", "trigger_params", "confirm_type", "confirm_level",
                 "entry", "stop", "target", "max_chase", "invalidate_level", "m15_filter",
                 "expires_at", "tr_high", "tr_low", "tr_since", "state_data", "note",
-                "created_by", "created_at", "updated_at", "htf", "invalidate_after_confirm")
+                "created_by", "created_at", "updated_at", "htf", "invalidate_after_confirm",
+                # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+                "tr_id", "event_ref", "expects", "phase")
 EVENT_FIELDS = ("id", "setup_id", "at", "event", "from_status", "to_status", "tf",
                 "candle_open_time", "price", "details", "notified", "notify_error")
 
@@ -79,8 +81,9 @@ class SetupStore:
                 "zone_high, trigger_type, trigger_params, confirm_type, confirm_level, entry, stop, "
                 "target, max_chase, invalidate_level, m15_filter, expires_at, tr_high, tr_low, "
                 "tr_since, state_data, note, created_by, created_at, updated_at, htf, "
-                "invalidate_after_confirm) VALUES "
-                "(?, ?, ?, ?, ?, 'WAITING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "invalidate_after_confirm, tr_id, event_ref, expects, phase) VALUES "
+                "(?, ?, ?, ?, ?, 'WAITING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, ?, ?)",
                 (sid, code, symbol.upper(), clean["bias_date"], clean["direction"],
                  clean["zone_low"], clean["zone_high"], clean["trigger_type"],
                  json.dumps(clean["trigger_params"]) if clean["trigger_params"] else None,
@@ -89,7 +92,9 @@ class SetupStore:
                  int(clean["m15_filter"]), clean["expires_at"], clean["tr_high"], clean["tr_low"],
                  clean["tr_since"], json.dumps({}), clean["note"], created_by, now, now,
                  json.dumps(clean["htf"]) if clean.get("htf") else None,
-                 int(bool(clean.get("invalidate_after_confirm")))))
+                 int(bool(clean.get("invalidate_after_confirm"))),
+                 # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+                 clean.get("tr_id"), clean.get("event_ref"), clean.get("expects"), clean.get("phase")))
             conn.execute(
                 "INSERT INTO setup_events (setup_id, at, event, from_status, to_status, details) "
                 "VALUES (?, ?, 'CREATED', NULL, 'WAITING', ?)",

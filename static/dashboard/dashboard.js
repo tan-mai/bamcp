@@ -18,7 +18,17 @@
   const TERMINAL = ["FILLED", "INVALIDATED", "EXPIRED", "CANCELLED"];
   const TRIGGER_LABEL = {
     save_bias: "Lưu bias", save_setups: "Lưu setup", save_scenarios: "Lưu kịch bản", cancel_setup: "Huỷ setup",
+    // TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+    update_tr: "Cập nhật TR", delete_tr_event: "Xoá event TR",
   };
+  // TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+  const SCHEMATIC_LABEL = {
+    accumulation: "Tích luỹ", reaccumulation: "Tái tích luỹ", distribution: "Phân phối",
+    redistribution: "Tái phân phối", undetermined: "Chưa xác định",
+  };
+  const FAMILY = { accumulation: "acc", reaccumulation: "acc", distribution: "dist", redistribution: "dist" };
+  const TR_STATUS_LABEL = { hypothesis: "giả thuyết", confirmed: "đã xác nhận", failed: "thất bại", completed: "đã hoàn tất" };
+  const EVENT_STATUS_LABEL = { tentative: "chưa chắc", confirmed: "đã xác nhận", failed: "hỏng" };
 
   const $ = (id) => document.getElementById(id);
   const params = new URLSearchParams(location.search);
@@ -49,6 +59,14 @@
     showLevels: loadPref("levels", true),
     chart: null,
     openNotes: new Set(),
+    // TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: lop nho theo trinh duyet, event hong an mac dinh
+    layers: { phases: loadPref("phases", true), events: loadPref("events", true), levels: loadPref("creek", true) },
+    showFailed: false,
+    markerIndex: {},
+    popover: null,
+    trFilter: false,
+    trChanges: null,
+    trLoading: null,
   };
   let chartTicket = 0;
   let listTicket = 0;
@@ -213,9 +231,32 @@
     return a + ((snapped - d.axisFirst) / d.span) * (b - a);
   }
 
+  // TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+  // Dai pha: tu mep trai nen mo pha toi mep trai nen mo pha sau; pha dang chay keo toi het nen cuoi.
+  function phaseSpans(size) {
+    const d = overlay.data;
+    if (!d || !S.layers.phases || !d.tr || !(d.tr.phases || []).length || d.lastTime === null) return [];
+    const half = (chart.timeScale().options().barSpacing || 6) / 2;
+    const lastX = xOf(d.lastTime);
+    return d.tr.phases.map((phase, index) => {
+      const start = xOf(phase.start_t);
+      const open = phase.end_t === null || phase.end_t === undefined;
+      const end = open ? (lastX === null ? null : lastX + half) : xOf(phase.end_t) - half;
+      if (start === null || end === null) return null;
+      const x1 = Math.max(0, start - half);
+      const x2 = Math.min(size.width, end);
+      return x2 > x1 ? { phase: phase.phase, x1, x2, shade: index % 2 } : null;
+    }).filter(Boolean);
+  }
+
   function drawBands(ctx, size) {
     const d = overlay.data;
     if (!d) return;
+    // Hai pha lien ke xen ke hai muc xam, khong dung mau rieng cho tung pha
+    phaseSpans(size).forEach((span) => {
+      ctx.fillStyle = alpha(C.neutral, span.shade ? 0.12 : 0.05);
+      ctx.fillRect(span.x1, 0, span.x2 - span.x1, size.height);
+    });
     if (d.tr) {
       const top = yOf(d.tr.tr_high);
       const bottom = yOf(d.tr.tr_low);
@@ -280,8 +321,29 @@
       });
       ctx.setLineDash([]);
       const y = yOf(d.tr.tr_high);
-      if (y !== null) textBox(ctx, "TR khoá", start + 4, y + 10, C.tr, size);
+      // TM - #WYCKOFF-TR: dinh TR ngoai khung nhin thi khong ghim nhan len mep tren (de len nhan pha)
+      if (y !== null && y >= 0 && y <= size.height) textBox(ctx, "TR khoá", start + 4, y + 10, C.tr, size);
+      // TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: creek / ice net dut co nhan, tu since
+      if (S.layers.levels) {
+        [["creek", "Creek"], ["ice", "Ice"]].forEach(([key, name]) => {
+          const price = (d.tr.levels || {})[key];
+          const ly = price === null || price === undefined ? null : yOf(Number(price));
+          if (ly === null) return;
+          ctx.strokeStyle = alpha(C.tr, 0.95);
+          ctx.lineWidth = 1.25;
+          ctx.setLineDash([2, 3]);
+          ctx.beginPath();
+          ctx.moveTo(start, ly);
+          ctx.lineTo(size.width, ly);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          textBox(ctx, `${name} ${num(price)}`, size.width, ly - 9, C.tr, size);
+        });
+      }
     }
+    phaseSpans(size).forEach((span) => {
+      if (span.x2 - span.x1 >= 14) textBox(ctx, span.phase, span.x1 + 3, 11, C.muted, size);
+    });
     d.zones.forEach((zone) => {
       const y = yOf(zone.high);
       if (y === null || (S.selected && S.selected !== zone.code) || zone.dim) return;
@@ -326,6 +388,10 @@
     if (!d) return [];
     const out = [];
     if (d.tr) out.push({ price: d.tr.tr_high }, { price: d.tr.tr_low });
+    // TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+    if (d.tr && S.layers.levels) {
+      ["creek", "ice"].forEach((key) => { if ((d.tr.levels || {})[key]) out.push({ price: Number(d.tr.levels[key]) }); });
+    }
     d.zones.forEach((zone) => {
       const force = zone.code === S.selected;
       if (zone.dim && !force) return;
@@ -378,6 +444,7 @@
     const out = [];
     const snap = (ms) => Math.floor(ms / span) * span / 1000;
     (d.markers || []).forEach((m) => {
+      if (m.kind === "wyckoff") return;
       const time = snap(m.t);
       if (!times.has(time)) return;
       const up = m.direction === "long";
@@ -386,15 +453,101 @@
       else if (m.event === "TRIGGERED") out.push({ ...base, position: up ? "belowBar" : "aboveBar", shape: up ? "arrowUp" : "arrowDown", color: up ? C.long : C.short });
       else out.push({ ...base, position: "aboveBar", shape: "square", color: m.event === "EXPIRED" ? C.neutral : C.short });
     });
-    ((d.tr || {}).events || []).forEach((event) => {
-      const time = snap(event.t);
-      if (!times.has(time)) return;
-      const low = ["SC", "ST", "SPRING", "TEST", "LPS"].includes(event.type);
-      out.push({ time, text: event.type, position: low ? "belowBar" : "aboveBar", shape: "circle", size: 0.6, color: C.tr });
-    });
+    out.push(...wyckoffMarkers(d, times));
     if (formingTime) out.push({ time: formingTime, text: "đang chạy", position: "aboveBar", shape: "circle", size: 0, color: C.muted });
     return out.sort((a, b) => a.time - b.time);
   }
+
+  // TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+  // Event day duoi nen (mui ten len), event dinh tren nen (mui ten xuong). Cung mot nen thi
+  // Lightweight Charts tu xep chong theo chieu doc. Mau theo so do; confirmed dam, tentative nhat
+  // kem "?", failed xam gach ngang va an mac dinh.
+  const strike = (text) => Array.from(String(text)).map((ch) => ch + "̶").join("");
+
+  function wyckoffColor(tr, status) {
+    const family = FAMILY[(tr || {}).schematic];
+    const base = family === "acc" ? C.long : family === "dist" ? C.short : C.neutral;
+    if (status === "failed") return alpha(C.neutral, 0.6);
+    return status === "confirmed" ? base : alpha(base, 0.5);
+  }
+
+  function wyckoffMarkers(d, times) {
+    S.markerIndex = {};
+    if (!S.layers.events) return [];
+    const events = new Map(((d.tr || {}).events || []).map((e) => [e.id, e]));
+    const out = [];
+    (d.markers || []).forEach((m) => {
+      if (m.kind !== "wyckoff" || (m.status === "failed" && !S.showFailed)) return;
+      const time = m.t_bar / 1000;
+      if (!times.has(time)) return;
+      const id = "w:" + m.event_id;
+      S.markerIndex[id] = { marker: m, event: events.get(m.event_id) || m };
+      const low = m.side === "low";
+      out.push({
+        id, time, color: wyckoffColor(d.tr, m.status),
+        text: m.status === "failed" ? strike(m.label) : m.label + (m.status === "tentative" ? "?" : ""),
+        position: low ? "belowBar" : "aboveBar", shape: low ? "arrowUp" : "arrowDown",
+      });
+    });
+    return out;
+  }
+
+  // ---------------------------------------------------------------- popover event
+  const pop = $("popover");
+  const ratio = (value) => (value === null || value === undefined ? "—" : `${num(value, 2)}×`);
+
+  function hidePopover() {
+    S.popover = null;
+    pop.hidden = true;
+  }
+
+  // Neo vao nen va gia cua marker, nen keo / zoom thi popover di theo
+  function placePopover() {
+    const item = S.popover && S.markerIndex[S.popover];
+    if (!item) { hidePopover(); return; }
+    const x = chart.timeScale().timeToCoordinate(item.marker.t_bar / 1000);
+    const y = candleSeries.priceToCoordinate(Number(item.marker.price));
+    const width = chartBox.clientWidth;
+    const height = chartBox.clientHeight;
+    if (x === null || y === null || x < 0 || x > width) { pop.hidden = true; return; }
+    pop.hidden = false;
+    const w = pop.offsetWidth;
+    const h = pop.offsetHeight;
+    pop.style.left = `${Math.max(4, Math.min(x + 12, width - w - 4))}px`;
+    pop.style.top = `${y + 14 + h > height ? Math.max(4, y - h - 14) : y + 14}px`;
+  }
+
+  function openPopover(id) {
+    const item = S.markerIndex[id];
+    if (!item) { hidePopover(); return; }
+    const e = item.event;
+    const confirmed = e.confirmed_by_label || null;
+    const rows = [
+      ["Thời gian", full(e.t) + (e.tf ? ` · ${TF_LABEL[e.tf] || e.tf}` : "")],
+      ["Giá", num(e.price)],
+      ["Vol / SMA20", ratio(e.vol_ratio)],
+      ["Spread / TB20", ratio(e.spread_ratio)],
+      ["Đóng cửa", e.close_pct === null || e.close_pct === undefined ? "—" : `${num(e.close_pct, 1)}%`],
+      ["Trạng thái", EVENT_STATUS_LABEL[e.status] || e.status || "—"],
+      e.phase ? ["Pha", e.phase] : null,
+      confirmed ? ["Xác nhận bởi", confirmed] : null,
+    ].filter(Boolean);
+    pop.replaceChildren(
+      el("div", { class: "pop-head" }, el("strong", {}, e.label || e.type),
+        el("button", { type: "button", class: "pop-close", "aria-label": "Đóng", on: { click: hidePopover } }, "×")),
+      el("dl", { class: "pop-facts" }, rows.map(([k, v]) => el("div", {}, el("dt", {}, k), el("dd", {}, v)))),
+      e.note ? el("p", { class: "pop-note" }, e.note) : null);
+    S.popover = id;
+    placePopover();
+  }
+
+  chart.subscribeClick((param) => {
+    const id = param.hoveredObjectId;
+    if (id && S.markerIndex[id]) openPopover(id);
+    else hidePopover();
+  });
+  chart.timeScale().subscribeVisibleLogicalRangeChange(() => { if (S.popover) placePopover(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") hidePopover(); });
 
   function scenarioColor(scenario, setups) {
     const linked = setups.find((s) => scenario.setup_codes.includes(s.code));
@@ -417,6 +570,8 @@
     overlay.data = {
       span,
       axisFirst: candles.length ? candles[0][0] : null,
+      // TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: pha dang chay keo toi nen cuoi
+      lastTime: candles.length ? candles[candles.length - 1][0] : null,
       tr: d.tr,
       zones: d.setups.filter((s) => s.status !== "CANCELLED").map((s) => ({
         code: s.code, low: s.zone_low, high: s.zone_high, start: s.created_ms,
@@ -500,6 +655,11 @@
       scale.setVisibleLogicalRange({ from: before.from + shift, to: before.to + shift });
     }
     overlay.refresh();
+    // TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: du lieu moi thi lam moi popover dang mo
+    if (S.popover) {
+      const open = S.popover;
+      requestAnimationFrame(() => (S.markerIndex[open] ? openPopover(open) : hidePopover()));
+    }
 
     const notes = [];
     if (!candles.length) notes.push(`Chưa có nến ${TF_LABEL[d.timeframe]} của ${d.symbol} trong kho.`);
@@ -567,6 +727,147 @@
     return tile("PnL chưa chốt", signed(pnl), summary, { tone: pnl > 0 ? "long" : pnl < 0 ? "short" : "neutral" });
   }
 
+  // ---------------------------------------------------------------- the TR
+  // TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+
+  function duration(ms) {
+    const minutes = Math.max(0, Math.round(ms / 60000));
+    const days = Math.floor(minutes / 1440);
+    const hours = Math.floor((minutes % 1440) / 60);
+    if (days) return `${days} ngày${hours ? ` ${hours} giờ` : ""}`;
+    if (hours) return `${hours} giờ${minutes % 60 ? ` ${minutes % 60} phút` : ""}`;
+    return `${minutes % 60} phút`;
+  }
+
+  // Cuon bieu do toi nen cua event va mo popover neu marker dang hien
+  function focusEvent(event) {
+    if (!S.chart) return;
+    const d = S.chart.data;
+    const span = SPAN[d.timeframe];
+    const marker = (d.markers || []).find((m) => m.kind === "wyckoff" && m.event_id === event.id);
+    const target = marker ? marker.t_bar : Math.floor(event.t / span) * span;
+    const index = d.candles.findIndex((c) => c[0] === target);
+    if (index < 0) {
+      $("chartNote").textContent = `Nến của ${event.label} (${full(event.t)}) nằm ngoài cửa sổ đang tải — đổi sang khung lớn hơn.`;
+      return;
+    }
+    const scale = chart.timeScale();
+    const range = scale.getVisibleLogicalRange();
+    const width = range ? range.to - range.from : 80;
+    scale.setVisibleLogicalRange({ from: index - width / 2, to: index + width / 2 });
+    if (window.innerWidth < 1024) $("chartPanel").scrollIntoView({ behavior: "smooth", block: "start" });
+    requestAnimationFrame(() => { if (S.markerIndex["w:" + event.id]) openPopover("w:" + event.id); });
+  }
+
+  function eventRow(event) {
+    const tentative = event.status === "tentative";
+    return el("li", {
+      class: `tr-ev ${event.status || ""}`, tabIndex: 0, role: "button",
+      "aria-label": `${event.label} ${full(event.t)}`,
+      on: {
+        click: () => focusEvent(event),
+        keydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); focusEvent(event); } },
+      },
+    },
+    el("time", {}, full(event.t)),
+    el("div", {}, el("span", { class: "name" }, event.label + (tentative ? "?" : "")),
+      el("span", { class: "sub" }, `${num(event.price)} · vol ${ratio(event.vol_ratio)}`)),
+    el("span", { class: "pill " + (event.status === "confirmed" ? "go" : event.status === "failed" ? "stop" : "") },
+      EVENT_STATUS_LABEL[event.status] || event.status || "—"));
+  }
+
+  function eventList(tr) {
+    const shown = (tr.events || []).filter((e) => S.showFailed || e.status !== "failed");
+    const hidden = (tr.events || []).length - shown.length;
+    const items = [];
+    let group;
+    shown.forEach((event) => {
+      const key = event.phase || "";
+      if (key !== group) {
+        group = key;
+        items.push(el("li", { class: "tr-group" }, key ? `Pha ${key}` : "Ngoài pha"));
+      }
+      items.push(eventRow(event));
+    });
+    if (!items.length) items.push(el("li", { class: "empty" }, "Chưa có event."));
+    if (hidden) items.push(el("li", { class: "empty" }, `Ẩn ${hidden} event hỏng — bật "Hiện event hỏng" để xem.`));
+    return el("ol", { class: "tr-events" }, items);
+  }
+
+  function changeList(changes) {
+    if (!changes) return el("p", { class: "empty" }, "Đang tải thay đổi…");
+    const rows = [];
+    if (changes.redrawn) rows.push(el("li", { class: "tr-group" }, "TR đã vẽ lại trong ngày"));
+    if (changes.added.length) rows.push(el("li", { class: "tr-group" }, "Event thêm"), ...changes.added.map(eventRow));
+    if (changes.status_changed.length) {
+      rows.push(el("li", { class: "tr-group" }, "Đổi trạng thái"),
+        ...changes.status_changed.map((e) => eventRow({ ...e, label: `${e.label}: ${EVENT_STATUS_LABEL[e.from] || e.from} → ${EVENT_STATUS_LABEL[e.to] || e.to}` })));
+    }
+    if (changes.removed.length) rows.push(el("li", { class: "tr-group" }, "Không còn"), ...changes.removed.map(eventRow));
+    if (!rows.length) rows.push(el("li", { class: "empty" }, "Không có event thêm hay đổi trạng thái trong ngày."));
+    const span = changes.from_revision ? `R${changes.from_revision} → R${changes.to_revision}` : "chưa có snapshot";
+    return el("div", {}, el("p", { class: "empty" }, `So sánh ${span}.`), el("ol", { class: "tr-events" }, rows));
+  }
+
+  async function loadTrChanges(key) {
+    S.trLoading = key;
+    let data;
+    try {
+      data = await api("/tr-changes", { symbol: S.symbol, date: S.date });
+    } catch (err) {
+      data = { error: err.message };
+    }
+    if (S.trLoading === key) S.trLoading = null;
+    if (`${S.symbol}|${S.date}` !== key) return;
+    S.trChanges = { key, data };
+    if (S.chart) renderTr(S.chart.data);
+  }
+
+  function renderTr(d) {
+    const box = $("trCard");
+    const tr = d.tr;
+    if (!tr) {
+      box.replaceChildren(el("p", { class: "empty" }, `Chưa có TR khoá cho ${S.symbol}.`));
+      return;
+    }
+    const family = FAMILY[tr.schematic];
+    const current = (tr.phases || []).find((p) => p.phase === tr.current_phase && (p.end_t === null || p.end_t === undefined));
+    const until = S.mode === "live" ? Date.now() : Math.min(Date.now(), d.day_start_ms + 86400000);
+    const filter = S.mode === "review" ? el("button", {
+      type: "button", class: "tr-filter" + (S.trFilter ? " on" : ""), "aria-pressed": S.trFilter ? "true" : "false",
+      on: {
+        click: () => {
+          S.trFilter = !S.trFilter;
+          if (S.trFilter) S.trChanges = null;  // bat lai la lay so moi
+          renderTr(d);
+        },
+      },
+    }, "Thay đổi TR trong ngày") : null;
+    const key = `${S.symbol}|${S.date}`;
+    if (S.mode === "review" && S.trFilter && (!S.trChanges || S.trChanges.key !== key) && S.trLoading !== key) {
+      loadTrChanges(key);
+    }
+    const head = el("div", { class: "tr-head" },
+      el("span", { class: "pill " + (family === "acc" ? "long" : family === "dist" ? "short" : "") },
+        `${SCHEMATIC_LABEL[tr.schematic] || tr.schematic} · ${TR_STATUS_LABEL[tr.status] || tr.status}`),
+      tr.current_phase ? el("span", { class: "pill run" },
+        `Pha ${tr.current_phase}${current ? ` · ${duration(until - current.start_t)}` : ""}`) : null,
+      tr.source === "setup" ? el("span", { class: "pill warn" }, "Khai trong setup") : null,
+      filter);
+    const levels = tr.levels || {};
+    const facts = el("dl", { class: "facts" },
+      fact("TR high", num(tr.tr_high)), fact("TR low", num(tr.tr_low)),
+      levels.creek ? fact("Creek", num(levels.creek)) : null, levels.ice ? fact("Ice", num(levels.ice)) : null,
+      fact("Từ", tr.since ? full(tr.since) : "—", true));
+    const changes = S.trChanges && S.trChanges.key === key ? S.trChanges.data : null;
+    const body = S.mode === "review" && S.trFilter
+      ? (changes && changes.error ? el("p", { class: "empty" }, changes.error) : changeList(changes))
+      : eventList(tr);
+    box.replaceChildren(head, facts, body,
+      tr.redraw_rule ? el("p", { class: "tr-text" }, el("b", {}, "Vẽ lại khi: "), tr.redraw_rule) : null,
+      tr.note ? el("p", { class: "tr-text" }, el("b", {}, "Nhận định: "), tr.note) : null);
+  }
+
   // ---------------------------------------------------------------- the setup
 
   function distanceText(setup, price) {
@@ -603,6 +904,10 @@
         toggle: (e) => { if (e.target.open) S.openNotes.add(setup.code); else S.openNotes.delete(setup.code); },
       },
     }, el("summary", {}, "Ghi chú"), el("p", {}, setup.note)) : null;
+    // TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: "Pha C · giao dich TEST 3 · ky vong LPS"
+    const wyckoff = [setup.phase ? `Pha ${setup.phase}` : null,
+      setup.event_ref ? `giao dịch ${String(setup.event_ref).replace("#", " ")}` : null,
+      setup.expects ? `kỳ vọng ${setup.expects}` : null].filter(Boolean).join(" · ");
     return el("article", {
       class: `setup${S.selected === setup.code ? " on" : ""}${TERMINAL.includes(setup.status) ? " done" : ""}`,
       "data-code": setup.code,
@@ -614,6 +919,7 @@
       el("span", { class: "pill " + (STATUS_CLASS[setup.status] || "") }, setup.status),
       counter),
     el("dl", { class: "facts" },
+      wyckoff ? fact("Wyckoff", wyckoff, true) : null,
       fact("Trigger", trigger, true),
       fact("Vùng", `${num(setup.zone_low)} – ${num(setup.zone_high)}`, true),
       fact("Entry", num(setup.entry)),
@@ -778,6 +1084,7 @@
       if (ticket !== chartTicket) return;
       renderChart(data, fit);
       renderSummary(data);
+      renderTr(data);  // TM - #WYCKOFF-TR - the TR theo dung revision dang xem
       renderRevisions(data.plan);
       $("updated").textContent = `Cập nhật lúc ${hm(Date.now())}`;
       const fresh = data.freshness || {};
@@ -835,6 +1142,7 @@
     S.mode = mode;
     S.tab = "plan";
     S.revision = "origin";
+    S.trFilter = false;  // TM - #WYCKOFF-TR - bo loc thay doi TR chi co o review
     markButtons(document, "data-mode", S.mode);
     applyTab();
     syncUrl();
@@ -853,7 +1161,7 @@
     markButtons($("tfs"), "data-tf", S.tf);
     markButtons($("ranges"), "data-range", S.range);
 
-    $("symbol").addEventListener("change", (e) => { S.symbol = e.target.value; S.selected = null; S.revision = "origin"; syncUrl(); load(true); });
+    $("symbol").addEventListener("change", (e) => { S.symbol = e.target.value; S.selected = null; S.revision = "origin"; hidePopover(); syncUrl(); load(true); });
     $("date").addEventListener("change", (e) => {
       if (!e.target.value) { e.target.value = S.date; return; }
       S.date = e.target.value;
@@ -879,6 +1187,23 @@
       buildOverlay(S.chart.data);
       drawPriceLines(S.chart.data);
       overlay.refresh();
+    });
+    // TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: bat / tat lop, nho theo trinh duyet
+    [["layerPhases", "phases", "phases"], ["layerEvents", "events", "events"], ["layerLevels", "levels", "creek"]]
+      .forEach(([id, key, pref]) => {
+        $(id).checked = S.layers[key];
+        $(id).addEventListener("change", (e) => {
+          S.layers[key] = e.target.checked;
+          savePref(pref, S.layers[key]);
+          if (S.chart) renderChart(S.chart.data, false);
+        });
+      });
+    $("showFailed").checked = S.showFailed;
+    $("showFailed").addEventListener("change", (e) => {
+      S.showFailed = e.target.checked;
+      if (!S.chart) return;
+      renderChart(S.chart.data, false);
+      renderTr(S.chart.data);
     });
     $("tabs").addEventListener("click", (e) => {
       const b = e.target.closest("button[data-tab]");

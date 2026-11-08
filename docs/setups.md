@@ -75,6 +75,19 @@ Lúc lưu setup, server tự ghi `htf` = `{w, d, h4, bias}`.
 - `bias` lấy từ `save_bias` của `bias_date`, nên phải `save_bias` trước `save_setups`.
 - `htf_counter` liệt kê các khung ngược hướng setup, không chặn lưu. Tin IN_ZONE, TRIGGERED, ENTRY_VALID, MISSED, BLOCKED và trang admin hiện nhãn `NGƯỢC ...` cùng dòng `Khung lớn`.
 
+## Liên kết TR khoá
+
+Setup chỉ trỏ tới TR, không chép lại cấu trúc Wyckoff. Pha và sự kiện nằm trên TR ([dashboard.md](dashboard.md#tr-khoá-và-wyckoff)).
+
+- `tr_id`: bỏ trống là TR đang hiệu lực của cặp. TR không tồn tại hoặc của cặp khác thì setup bị từ chối.
+- `event_ref`: event setup đang giao dịch, dạng `TYPE#n` (`TEST#3`) hoặc `TYPE`. Được phép trỏ tới event chưa xảy ra.
+- `expects`: event kỳ vọng nếu setup đúng, ví dụ `LPS`.
+- `phase`: server tự ghi `current_phase` của TR lúc tạo setup.
+- `tr_high`, `tr_low`, `tr_since` lấy từ TR liên kết. Khai khác TR thì bị thay bằng số của TR và trả `warnings`. Không có TR thì giữ số khai như trước.
+- `event_ref` hoặc `expects` không khớp `schematic` của TR (ví dụ `UTAD` trên TR tích luỹ) chỉ cảnh báo.
+
+Thẻ setup trên dashboard hiện thêm một dòng, ví dụ "Pha C · giao dịch TEST 3 · kỳ vọng LPS".
+
 ## Lúc nào `save_setups` từ chối
 
 **`max_chase` không còn khả thi.** `max_chase` hiệu lực = min(khai báo, x_max), với x_max giữ R:R tại giá vào thực tế ≥ `min_rr` của cặp. Với lệnh long: `((T−E) − m(E−S)) / (1+m)`. x_max ≤ 0 thì `save_setups` từ chối setup đó. Ví dụ E 67500, S 67050, T 68400, m 1.5 → 90.

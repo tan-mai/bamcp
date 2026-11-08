@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 import entry_logic
 import sqlite_db
+import tr_logic  # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
 
 
 def _now_ms() -> int:
@@ -36,7 +37,15 @@ def _scenario(row: Any) -> dict[str, Any]:
 def _tr(row: Any) -> dict[str, Any]:
     out = dict(row)
     out["events"] = _loads(out["events"], [])
+    # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+    out["levels"] = _loads(out.get("levels"), {})
     return out
+
+
+# TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+EVENT_COLUMNS = ("id", "tr_id", "seq", "type", "t", "tf", "price", "side", "vol_ratio", "spread_ratio",
+                 "close_pct", "status", "confirmed_by", "note", "created_by", "created_at", "updated_at")
+EVENT_UPDATABLE = ("status", "note", "confirmed_by", "price")
 
 
 def _review(row: Any) -> dict[str, Any]:
@@ -116,33 +125,148 @@ class PlanStore:
 
     # ------------------------------------------------------------ TR khoa
 
+    # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+    # TR la noi duy nhat luu cau truc Wyckoff: so do, pha, event. Setup chi lien ket toi TR.
+
+    def _full(self, conn, row: Any) -> dict[str, Any]:
+        out = _tr(row)
+        if out.get("events_migrated"):
+            out["events"] = [dict(r) for r in conn.execute(
+                "SELECT * FROM tr_events WHERE tr_id = ? ORDER BY t, created_at", (out["id"],))]
+        out["phases"] = [dict(r) for r in conn.execute(
+            "SELECT * FROM tr_phases WHERE tr_id = ?", (out["id"],))]
+        out.pop("events_migrated", None)
+        return tr_logic.decorate_tr(out)  # type: ignore[return-value]
+
+    def _one(self, sql: str, params: tuple) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(sql, params).fetchone()
+            return self._full(conn, row) if row else None
+
+    def tr(self, tr_id: str) -> dict[str, Any]:
+        out = self._one("SELECT * FROM trading_ranges WHERE id = ?", (str(tr_id).strip(),))
+        if out is None:
+            raise ValueError(f"khong tim thay TR {tr_id!r}")
+        return out
+
     def tr_at(self, symbol: str, at_ms: int) -> dict[str, Any] | None:
         """TR dang hieu luc tai mot thoi diem. TR cu giu lai de review nen van doc duoc."""
-        with self._conn() as conn:
-            row = conn.execute("SELECT * FROM trading_ranges WHERE symbol = ? AND created_at <= ? "
-                               "ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                               (symbol.upper(), int(at_ms))).fetchone()
-        return _tr(row) if row else None
+        return self._one("SELECT * FROM trading_ranges WHERE symbol = ? AND created_at <= ? "
+                         "ORDER BY created_at DESC, rowid DESC LIMIT 1", (symbol.upper(), int(at_ms)))
 
     def active_tr(self, symbol: str) -> dict[str, Any] | None:
-        with self._conn() as conn:
-            row = conn.execute("SELECT * FROM trading_ranges WHERE symbol = ? AND superseded_by IS NULL "
-                               "ORDER BY created_at DESC, rowid DESC LIMIT 1", (symbol.upper(),)).fetchone()
-        return _tr(row) if row else None
+        return self._one("SELECT * FROM trading_ranges WHERE symbol = ? AND superseded_by IS NULL "
+                         "ORDER BY created_at DESC, rowid DESC LIMIT 1", (symbol.upper(),))
 
-    def replace_tr(self, symbol: str, clean: dict[str, Any], old_id: str | None) -> dict[str, Any]:
+    def tr_schematics(self, tr_ids: list[str]) -> dict[str, str]:
+        ids = sorted({i for i in tr_ids if i})
+        if not ids:
+            return {}
+        marks = ", ".join("?" for _ in ids)
+        with self._conn() as conn:
+            rows = conn.execute(f"SELECT id, schematic FROM trading_ranges WHERE id IN ({marks})", ids).fetchall()
+        return {r["id"]: r["schematic"] for r in rows}
+
+    def _write_plan(self, conn, tr_id: str, plan: dict[str, Any], now: int) -> None:
+        fields = dict(plan.get("fields") or {})
+        if "levels" in fields:
+            fields["levels"] = json.dumps(fields["levels"]) if fields["levels"] else None
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        conn.execute(f"UPDATE trading_ranges SET {sets + ', ' if sets else ''}updated_at = ? WHERE id = ?",
+                     (*fields.values(), now, tr_id))
+        for event in plan.get("insert") or []:
+            row = {**event, "tr_id": tr_id, "seq": plan["seq"][event["id"]]}
+            conn.execute(f"INSERT INTO tr_events ({', '.join(EVENT_COLUMNS)}) "
+                         f"VALUES ({', '.join('?' for _ in EVENT_COLUMNS)})", [row.get(k) for k in EVENT_COLUMNS])
+        for change in plan.get("update") or []:
+            values = {k: change[k] for k in EVENT_UPDATABLE if k in change}
+            if values:
+                conn.execute(f"UPDATE tr_events SET {', '.join(f'{k} = ?' for k in values)}, updated_at = ? "
+                             "WHERE id = ? AND tr_id = ?", (*values.values(), now, change["id"], tr_id))
+        for phase in plan.get("phases") or []:
+            conn.execute(
+                "INSERT INTO tr_phases (id, tr_id, phase, start_t, end_t, note, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(tr_id, phase) DO UPDATE SET "
+                "start_t = excluded.start_t, end_t = excluded.end_t, note = excluded.note, "
+                "updated_at = excluded.updated_at",
+                (phase.get("id") or str(uuid.uuid4()), tr_id, phase["phase"], phase["start_t"],
+                 phase["end_t"], phase.get("note"), now, now))
+        self._renumber(conn, tr_id)
+
+    @staticmethod
+    def _renumber(conn, tr_id: str) -> None:
+        rows = conn.execute("SELECT id FROM tr_events WHERE tr_id = ? ORDER BY t, created_at, type",
+                            (tr_id,)).fetchall()
+        for seq, row in enumerate(rows, start=1):
+            conn.execute("UPDATE tr_events SET seq = ? WHERE id = ?", (seq, row["id"]))
+
+    def create_tr(self, symbol: str, clean: dict[str, Any], plan: dict[str, Any], old_id: str | None,
+                  old_status: str = "completed") -> dict[str, Any]:
+        """Neo moi = TR moi. TR cu giu lai (superseded_by + status) de review ngay cu van doc duoc."""
         now = self.now_ms()
         tid = str(uuid.uuid4())
         with self._conn() as conn, conn:
             conn.execute(
                 "INSERT INTO trading_ranges (id, symbol, timeframe, tr_high, tr_low, since, events, "
-                "redraw_rule, superseded_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+                "redraw_rule, superseded_by, created_at, updated_at, events_migrated) "
+                "VALUES (?, ?, ?, ?, ?, ?, '[]', ?, NULL, ?, ?, 1)",
                 (tid, symbol.upper(), clean["timeframe"], clean["tr_high"], clean["tr_low"], clean["since"],
-                 json.dumps(clean["events"]), clean["redraw_rule"], now, now))
+                 clean.get("redraw_rule"), now, now))
+            self._write_plan(conn, tid, plan, now)
             if old_id:
-                conn.execute("UPDATE trading_ranges SET superseded_by = ?, updated_at = ? WHERE id = ?",
-                             (tid, now, old_id))
-        return self.active_tr(symbol)  # type: ignore[return-value]
+                conn.execute("UPDATE trading_ranges SET superseded_by = ?, status = ?, updated_at = ? WHERE id = ?",
+                             (tid, old_status, now, old_id))
+        return self.tr(tid)
+
+    def apply_tr(self, tr_id: str, plan: dict[str, Any]) -> dict[str, Any]:
+        with self._conn() as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._write_plan(conn, tr_id, plan, self.now_ms())
+        return self.tr(tr_id)
+
+    def delete_tr_event(self, tr_id: str, event: dict[str, Any], reason: str) -> list[str]:
+        """Chi cho event tao nham (kiem tra 24h o tang tren). Ghi lai ban da xoa kem ly do."""
+        now = self.now_ms()
+        with self._conn() as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM tr_events WHERE id = ? AND tr_id = ?", (event["id"], tr_id)).fetchone()
+            if row is None:
+                raise ValueError(f"khong tim thay event {event['id']!r} trong TR {tr_id}")
+            linked = [r["id"] for r in conn.execute("SELECT id FROM tr_events WHERE confirmed_by = ?", (row["id"],))]
+            conn.execute("UPDATE tr_events SET confirmed_by = NULL, updated_at = ? WHERE confirmed_by = ?",
+                         (now, row["id"]))
+            conn.execute("DELETE FROM tr_events WHERE id = ?", (row["id"],))
+            conn.execute("INSERT INTO tr_event_deletions (tr_id, event, reason, deleted_at) VALUES (?, ?, ?, ?)",
+                         (tr_id, json.dumps(dict(row), ensure_ascii=False), reason, now))
+            conn.execute("UPDATE trading_ranges SET updated_at = ? WHERE id = ?", (now, tr_id))
+            self._renumber(conn, tr_id)
+        return linked
+
+    def find_tr_event(self, symbol: str, event_id: str) -> tuple[str, str] | None:
+        with self._conn() as conn:
+            row = conn.execute("SELECT e.id, e.tr_id FROM tr_events e JOIN trading_ranges r ON r.id = e.tr_id "
+                               "WHERE e.id = ? AND r.symbol = ?", (event_id, symbol.upper())).fetchone()
+        return (row["id"], row["tr_id"]) if row else None
+
+    def legacy_trs(self) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute("SELECT * FROM trading_ranges WHERE events_migrated = 0 ORDER BY created_at").fetchall()
+        return [_tr(r) for r in rows]
+
+    def migrate_tr_events(self, tr_id: str, events: list[dict[str, Any]]) -> int:
+        """Chuyen event json cu thanh dong tr_events, mot giao dich moi TR, chay lai khong nhan doi."""
+        with self._conn() as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT events_migrated FROM trading_ranges WHERE id = ?", (tr_id,)).fetchone()
+            if row is None or row[0]:
+                return 0
+            for event in tr_logic.number_events(events):
+                conn.execute(f"INSERT OR IGNORE INTO tr_events ({', '.join(EVENT_COLUMNS)}) "
+                             f"VALUES ({', '.join('?' for _ in EVENT_COLUMNS)})",
+                             [{**event, "tr_id": tr_id}.get(k) for k in EVENT_COLUMNS])
+            conn.execute("UPDATE trading_ranges SET events_migrated = 1 WHERE id = ?", (tr_id,))
+            self._renumber(conn, tr_id)
+        return len(events)
 
     # ------------------------------------------------------------ snapshot
 
@@ -179,11 +303,18 @@ class PlanStore:
             raise ValueError(f"khong co revision {revision} cua {symbol.upper()} ngay {day}")
         return {**dict(row), "payload": _loads(row["payload"], {})}
 
-    def version(self) -> int:
-        """Doi moi khi ke hoach doi (moi lan doi deu sinh snapshot): dung lam khoa cache."""
+    def version(self) -> tuple[int, ...]:
+        """Doi moi khi ke hoach doi (moi lan doi deu sinh snapshot): dung lam khoa cache.
+
+        TM - #WYCKOFF-TR: them moc ghi TR/event, vi snapshot la phan phu, loi thi van phai bo cache.
+        """
         with self._conn() as conn:
-            row = conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM plan_snapshots").fetchone()
-        return int(row[0])
+            row = conn.execute(
+                "SELECT (SELECT COALESCE(MAX(rowid), 0) FROM plan_snapshots), "
+                "(SELECT COALESCE(MAX(updated_at), 0) FROM trading_ranges), "
+                "(SELECT COALESCE(MAX(updated_at), 0) FROM tr_events), "
+                "(SELECT COUNT(*) FROM tr_events)").fetchone()
+        return tuple(int(v) for v in row)
 
     # ------------------------------------------------------------ review
 

@@ -48,6 +48,8 @@ COPY entry_logic.py entry_store.py entry_watcher.py notifier.py admin_entry.py .
 COPY dashboard_logic.py dashboard_store.py dashboard_auth.py dashboard_ui.py admin_dashboard.py bamcp_cli.py ./
 # TM - #ADMIN-LOGIN - Form dang nhap admin
 COPY admin_auth.py ./
+# TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+COPY tr_logic.py ./
 COPY static ./static
 # Lenh `bamcp dashboard create-owner <username>`. Sinh ngay trong image de khong phu thuoc
 # kieu xuong dong cua file tren may build.

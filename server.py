@@ -18,6 +18,7 @@ import secrets
 import sys
 import threading
 import time
+import uuid  # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
 from collections import OrderedDict  # TM - #DASHBOARD - Setup dashboard
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -58,6 +59,7 @@ import klines_coverage  # TM - #GANN-TW - Gann Time Windows: do phu & loc theo t
 import kline_store  # TM - #KL-SQL - Kline storage SQLite
 import notifier  # TM - #ENTRY-ALERT - Entry setups & alerts
 import settings    # module cuc bo: luu credential xuong volume
+import tr_logic  # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
 # TM - #ORB - ORB Enhancement
 import admin_orb     # module cuc bo: trang quan ly phien ORB
 import orb           # module cuc bo: logic ORB thuan (OR, tin hieu, sizing)
@@ -2564,12 +2566,24 @@ def save_bias(
     key_levels: vd {"creek": 111000, "ice": 105000}
     action_zone: vung gia cho setup o khung nho
     symbol: bo trong = cap mac dinh. Moi cap co bias rieng.
+    TM - #WYCKOFF-TR: phase bo trong = lay current_phase cua TR khoa (goi update_tr TRUOC save_bias).
+    Khai phase khac current_phase thi van luu nhung tra warnings.
     """
     day = date or _today()
     sym = _resolve_symbol(symbol)
     direction = direction.strip().lower()
     if direction not in ("long", "short", "neutral"):
         raise ValueError("direction phai la long, short hoac neutral")
+    # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: pha cua bias an theo TR khoa
+    warnings: list[str] = []
+    current = ((PLANS.active_tr(sym) if day == _today() else PLANS.tr_at(sym, _day_window_ms(day)[1]))
+               or {}).get("current_phase")
+    phase = str(phase or "").strip()
+    if not phase and current:
+        phase = current
+    elif phase and current and phase.upper() != current:
+        warnings.append(f"phase {phase} khac current_phase {current} cua TR khoa - pha doi thi goi "
+                        "update_tr truoc save_bias")
 
     path = _bias_dir(sym) / f"{day}.json"
     previous = _read_json(path, None)
@@ -2591,6 +2605,8 @@ def save_bias(
     # TM - #DASHBOARD - Setup dashboard
     return {"saved": True, "symbol": sym, "date": day, "file": str(path),
             "revisions": len(history), "plan_revision": _plan_snapshot(sym, day, "save_bias"),
+            # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+            "phase": phase, "warnings": warnings,
             **_dash_link(sym, day)}
 
 
@@ -4345,6 +4361,8 @@ def _setup_view(setup: dict[str, Any], last: dict[str, Any] | None = None) -> di
                                                  WATCHER.params_for(setup["symbol"], setup))
     # TM - #DASHBOARD - Setup dashboard
     out["invalidate_after_confirm"] = bool(setup.get("invalidate_after_confirm"))
+    # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+    out.update({k: setup.get(k) for k in ("tr_id", "event_ref", "expects", "phase")})
     out["state"] = {k: state[k] for k in ("max_chase", "x_max", "min_rr", "last_price",
                                           "came_from", "zone_alerted", "confirm_count",
                                           "entry_valid_count", "trigger", "confirm",
@@ -4400,6 +4418,39 @@ def _setup_trends(symbol: str) -> dict[str, str | None]:
     return out
 
 
+# TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+def _setup_tr_link(symbol: str, raw: dict[str, Any], clean: dict[str, Any],
+                   active: dict[str, Any] | None) -> list[str]:
+    """Setup chi lien ket toi TR, khong chep lai cau truc Wyckoff. Pha lay tu TR luc tao setup;
+    tr_high/tr_low/tr_since lay tu TR lien ket, khai khac thi canh bao."""
+    ref = str(raw.get("tr_id") or "").strip()
+    tr = active
+    if ref:
+        tr = PLANS.tr(ref)
+        if tr["symbol"] != symbol:
+            raise ValueError(f"tr_id {ref} la TR cua {tr['symbol']}, khong phai {symbol}")
+    text = str(raw.get("event_ref") or "").strip()
+    known = next((e for e in (tr or {}).get("events") or [] if e["id"] == text), None) if text else None
+    event_ref = known["ref"] if known else tr_logic.clean_event_ref(text)
+    expects = tr_logic.event_type(raw["expects"]) if str(raw.get("expects") or "").strip() else None
+    clean.update(tr_id=tr["id"] if tr else None, phase=tr["current_phase"] if tr else None,
+                 event_ref=event_ref, expects=expects)
+    if tr is None:
+        return []
+    warnings = []
+    for key, source, show in (("tr_high", "tr_high", lambda v: f"{float(v):.10g}"),
+                              ("tr_low", "tr_low", lambda v: f"{float(v):.10g}"),
+                              ("tr_since", "since", lambda v: _stamp(int(v))[:16])):
+        given = clean.get(key)
+        if given is not None and not math.isclose(float(given), float(tr[source]), rel_tol=1e-9):
+            warnings.append(f"{key} {show(given)} khac TR lien ket {show(tr[source])} - dung so cua TR")
+        clean[key] = tr[source]
+    for name, kind in (("event_ref", tr_logic.ref_type(event_ref)), ("expects", expects)):
+        if kind and not tr_logic.schematic_allows(tr["schematic"], kind):
+            warnings.append(f"{name} {kind} khong khop schematic {tr['schematic']} cua TR")
+    return warnings
+
+
 def _save_setups(symbol: str, setups: list[dict[str, Any]], replace: bool,
                  created_by: str) -> dict[str, Any]:
     if not isinstance(setups, list):
@@ -4411,6 +4462,8 @@ def _save_setups(symbol: str, setups: list[dict[str, Any]], replace: bool,
     price = _last_price(symbol)
     warnings = [] if price is not None or not setups else [
         f"chua co gia dong cua {symbol} - bo qua kiem tra invalidate_level theo gia hien tai"]
+    # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+    active_tr = PLANS.active_tr(symbol) if setups else None
     cleaned, rejected = [], []
     for index, raw in enumerate(setups):
         try:
@@ -4422,6 +4475,9 @@ def _save_setups(symbol: str, setups: list[dict[str, Any]], replace: bool,
                     and entry_logic.invalidate_broken(clean["direction"], clean["invalidate_level"], price)):
                 raise ValueError(f"invalidate_level {clean['invalidate_level']:.10g} da bi pha tai gia "
                                  f"hien tai {price:.10g} - setup se huy ngay")
+            # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+            link_warnings = _setup_tr_link(symbol, raw, clean, active_tr)
+            warnings.extend(f"setup[{index}]: {w}" for w in link_warnings)
             cleaned.append((index, clean))
         except ValueError as exc:
             rejected.append({"index": index, "error": str(exc)})
@@ -4446,6 +4502,8 @@ def _save_setups(symbol: str, setups: list[dict[str, Any]], replace: bool,
                       "max_chase_effective": round(clean["max_chase_effective"], 4),
                       "htf": row["htf"],
                       "htf_counter": entry_logic.htf_counter(row["direction"], row["htf"]),
+                      # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+                      **{k: row[k] for k in ("tr_id", "phase", "event_ref", "expects")},
                       "check_trade": {k: verdict[k] for k in ("would_pass", "rule_violations",
                                                               "rr", "trade_type")}})
     # TM - #DASHBOARD - Setup dashboard
@@ -4489,6 +4547,10 @@ def save_setups(symbol: str, setups: list[dict[str, Any]], replace: bool = False
     muc) thi setup bi tu choi. Setup co confirm_type thi invalidate_after_confirm mac dinh true:
     chi xet invalidate_level sau khi co nen dong dat confirm, nen setup breakout khong bi huy som.
     Tra them dashboard_url va plan_revisions (snapshot ke hoach moi ngay). Goi tiep save_scenarios.
+    TM - #WYCKOFF-TR: tuy chon tr_id (bo trong = TR dang hieu luc), event_ref (event setup dang giao
+    dich, vd "TEST#3" - co the chua xay ra), expects (event ky vong neu setup dung, vd "LPS").
+    Server tu ghi phase = current_phase cua TR luc tao setup. tr_high/tr_low/tr_since lay tu TR lien
+    ket; khai khac TR thi bi thay bang so cua TR va tra warnings.
     """
     return _save_setups(_resolve_symbol(symbol), setups, bool(replace), "claude")
 
@@ -4726,8 +4788,10 @@ def _plan_state(symbol: str, day: str) -> dict[str, Any]:
         # Setup luu truoc khi co save_scenarios van khai TR ngay trong setup
         declared = next((r for r in rows if r.get("tr_high") and r.get("tr_low")), None)
         if declared:
-            tr = {"timeframe": "15m", "tr_high": declared["tr_high"], "tr_low": declared["tr_low"],
-                  "since": declared.get("tr_since"), "events": [], "redraw_rule": None, "source": "setup"}
+            # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: cung dang day du nhu TR khoa
+            tr = tr_logic.decorate_tr({
+                "timeframe": "15m", "tr_high": declared["tr_high"], "tr_low": declared["tr_low"],
+                "since": declared.get("tr_since"), "events": [], "redraw_rule": None, "source": "setup"})
     return {"bias": {k: v for k, v in bias.items() if k != "history"} if bias else None,
             "setups": [_dash_setup(r, last.get(r["id"])) for r in rows],
             "scenarios": [s for s in PLANS.scenarios(symbol, day) if s["status"] != "cancelled"],
@@ -4784,8 +4848,10 @@ def _chart_markers(setups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for setup in setups:
         for event in events.get(setup["id"]) or []:
             if event["event"] in dashboard_logic.MARKER_EVENTS and not (event.get("details") or {}).get("repeat"):
-                out.append({"t": int(event.get("candle_open_time") or event["at"]), "event": event["event"],
-                            "code": setup["code"], "direction": setup["direction"], "price": event.get("price")})
+                # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: kind tach marker setup / Wyckoff
+                out.append({"kind": "setup", "t": int(event.get("candle_open_time") or event["at"]),
+                            "event": event["event"], "code": setup["code"], "direction": setup["direction"],
+                            "price": event.get("price")})
     return sorted(out, key=lambda m: m["t"])
 
 
@@ -4830,13 +4896,18 @@ def _chart_build(symbol: str, tf: str, bars: int, day: str, include_forming: boo
     bias = plan.get("bias")
     last_m5 = _last_closed(symbol, "5m")
     price = float(last_m5["c"]) if last_m5 else (float(window[-1]["close"]) if window else None)
+    # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+    # Snapshot cu chi co events {type, t, price}: decorate_tr bu seq, side, nhan, trang thai.
+    tr = tr_logic.decorate_tr(plan.get("tr"))
+    markers = sorted(_chart_markers(setups) + tr_logic.markers(tr, [int(c[0]) for c in candles], _tf_ms(tf)),
+                     key=lambda m: m["t"])
     return {
         "symbol": symbol, "timeframe": tf, "date": day, "time_zone": str(TZ),
         "day_start_ms": start_ms, "candle_columns": ["t", "o", "h", "l", "c", "v", "is_closed"],
         "candles": candles, "vol_avg": averages, "vol_spike": spikes, "vol_spike_mult": mult,
         "bias": {k: bias.get(k) for k in CHART_BIAS_KEYS} if bias else None,
-        "setups": setups, "scenarios": plan.get("scenarios") or [], "tr": plan.get("tr"),
-        "htf_levels": _chart_htf(symbol, price), "markers": _chart_markers(setups), "last_m5": last_m5,
+        "setups": setups, "scenarios": plan.get("scenarios") or [], "tr": tr,
+        "htf_levels": _chart_htf(symbol, price), "markers": markers, "last_m5": last_m5,
         "plan": {"source": source, "revision": revision if source == "revision" else None,
                  "revisions_used": used, "revisions": PLANS.snapshots(symbol, day)},
         **_dash_link(symbol, day, "review" if revision is not None else "live", tf),
@@ -4941,6 +5012,13 @@ async def get_chart_data(symbol: str = "", timeframe: str = "1h", bars: int = 96
     revision: so revision thi bias/setup/kich ban/TR lay tu snapshot do (nen van la that); 'origin' =
       ke hoach goc, moi phan lay ban dau tien co noi dung. Bo trong = ke hoach dang hieu luc.
     plan.revisions liet ke cac snapshot cua ngay. dashboard_url tro dung symbol/date/tf.
+    TM - #WYCKOFF-TR: tr co schematic, status, current_phase, levels {creek, ice, ...}, phases
+      [{phase, start_t, end_t}] va events [{id, seq, ref "TEST#2", label, type, t, tf, price, side,
+      vol_ratio, spread_ratio, close_pct, status, confirmed_by, note, phase}]. TR cu (superseded) chi
+      ra khi date la ngay TR do con hieu luc.
+    markers: kind "setup" = event watcher {t, event, code}; kind "wyckoff" = moi event cua TR
+      {t_bar, t, price, side, label, status, event_id}; t_bar la gio mo cua nen thuoc timeframe dang
+      xem chua t cua event (vd event M15 22:00 -> nen H1 22:00, nen H4 19:00).
     """
     return await _chart_data(_resolve_symbol(symbol), timeframe, bars, date, include_forming, revision)
 
@@ -4953,12 +5031,225 @@ def _scenario_anchor(symbol: str, tf: str) -> tuple[int, int]:
     return (bar["t"] if bar else int(time.time() * 1000) // span * span - span), span
 
 
+# ---------------------------------------------------------------- TR khoa: pha va su kien Wyckoff
+# TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+# TR la noi duy nhat luu cau truc Wyckoff. Claude gan nhan; server chi kiem tra va tinh so VSA.
+
+_TR_LOCK = threading.Lock()
+
+
+def _tr_bars(symbol: str, tf: str, t: int) -> list[dict[str, Any]]:
+    """Nen DA DONG co open_time <= t, kem 20 nen truoc de tinh so VSA."""
+    rows = KLINE_STORE.get_klines(symbol, tf, limit=tr_logic.VOL_PERIOD + 1, end_time=int(t))
+    return _split_closed(rows, tf)[0]
+
+
+def _tr_ctx(symbol: str, created_by: str = "claude") -> tr_logic.Ctx:
+    return tr_logic.Ctx(bars_at=lambda tf, t: _tr_bars(symbol, tf, t), parse_time=_parse_moment,
+                        timeframes=list(SUPPORTED_TIMEFRAMES), span_ms=_tf_ms,
+                        stamp=lambda ms: _stamp(int(ms))[:16], now_ms=int(time.time() * 1000),
+                        created_by=created_by)
+
+
+def _migrate_tr_events() -> int:
+    """Chuyen event json cu sang tr_events (status tentative, created_by claude), tinh lai seq, side
+    va so VSA tu nen. Chay luc khoi dong va truoc moi lan ghi TR; TR da chuyen thi bo qua."""
+    moved = 0
+    for tr in PLANS.legacy_trs():
+        span = _tf_ms(tr["timeframe"])
+        rows = []
+        for raw in tr["events"]:
+            try:
+                kind, t, price = tr_logic.event_type(raw.get("type")), int(raw["t"]), float(raw["price"])
+            except (KeyError, TypeError, ValueError):
+                print(f"BAMCP: bo qua event TR {tr['id']} khong doc duoc: {raw!r}", file=sys.stderr)
+                continue
+            bars = _tr_bars(tr["symbol"], tr["timeframe"], t)
+            # Event cu chua duoc kiem tra gio mo nen: lay nen chua moc t
+            inside = bool(bars) and int(bars[-1]["open_time"]) <= t < int(bars[-1]["open_time"]) + span
+            numbers = tr_logic.vsa(bars) if inside else {"vol_ratio": None, "spread_ratio": None,
+                                                         "close_pct": None}
+            rows.append({"id": str(uuid.uuid4()), "type": kind, "t": t, "tf": tr["timeframe"], "price": price,
+                         "side": tr_logic.side_of(kind), **numbers, "status": "tentative", "confirmed_by": None,
+                         "note": None, "created_by": "claude", "created_at": int(tr["created_at"]),
+                         "updated_at": int(tr["created_at"])})
+        moved += PLANS.migrate_tr_events(tr["id"], rows)
+    return moved
+
+
+def _tr_target(symbol: str, tr_id: str) -> dict[str, Any]:
+    if str(tr_id or "").strip():
+        tr = PLANS.tr(tr_id)
+        if tr["symbol"] != symbol:
+            raise ValueError(f"TR {tr['id']} la cua {tr['symbol']}, khong phai {symbol}")
+        return tr
+    tr = PLANS.active_tr(symbol)
+    if tr is None:
+        raise ValueError(f"{symbol} chua co TR khoa - tao TR qua save_scenarios(tr={{...}}) truoc")
+    return tr
+
+
+def _tr_report(plan: dict[str, Any], tr: dict[str, Any]) -> dict[str, Any]:
+    """Event moi / doi trong lan goi nay, de bao cao ghi ro (theo nhan sau khi danh so lai)."""
+    by_id = {e["id"]: e for e in tr["events"]}
+    added = [{k: by_id[e["id"]].get(k) for k in ("id", "ref", "label", "type", "t", "price", "status",
+                                                 "vol_ratio", "spread_ratio", "close_pct")}
+             for e in plan["insert"] if e["id"] in by_id]
+    changed = [{"id": u["id"], "ref": by_id[u["id"]]["ref"], "label": by_id[u["id"]]["label"],
+                **{k: v for k, v in u.items() if k != "id"}} for u in plan["update"] if u["id"] in by_id]
+    return {"added": added, "updated": changed,
+            "fields": sorted(plan["fields"]), "phases_changed": plan["phases"] is not None}
+
+
+def _save_tr(symbol: str, raw: dict[str, Any], old_status: str) -> tuple[dict[str, Any], bool, list[str]]:
+    """tr cua save_scenarios. Cung neo (tr_high, tr_low, since) -> gop vao TR dang hieu luc nhu
+    update_tr, gui lai event da co khong nhan doi. Neo khac -> TR moi, TR cu superseded + old_status."""
+    clean = tr_logic.validate_tr_input(raw, parse_time=_parse_moment, timeframes=list(SUPPORTED_TIMEFRAMES))
+    if old_status not in tr_logic.OLD_TR_STATUSES:
+        raise ValueError(f"old_tr_status phai la mot trong {list(tr_logic.OLD_TR_STATUSES)}")
+    _migrate_tr_events()
+    with _TR_LOCK:
+        current = PLANS.active_tr(symbol)
+        ctx = _tr_ctx(symbol)
+        if current is not None and tr_logic.same_anchors(current, clean):
+            adds, updates = tr_logic.split_merge(current, clean["events"], _parse_moment)
+            plan = tr_logic.plan_changes(current, ctx, fields=clean["fields"], add_events=adds,
+                                         update_events=updates, phases=clean["phases"])
+            warnings = list(plan["warnings"])
+            if clean["timeframe"] != current["timeframe"]:
+                warnings.append(f"timeframe {clean['timeframe']} khac TR dang hieu luc - giu "
+                                f"{current['timeframe']} (cung neo nen van la TR cu)")
+            if not plan["changed"]:
+                return current, False, warnings
+            return PLANS.apply_tr(current["id"], plan), True, warnings
+        plan = tr_logic.plan_changes(tr_logic.virtual_tr(clean), ctx, fields=clean["fields"],
+                                     add_events=clean["events"], phases=clean["phases"])
+        created = PLANS.create_tr(symbol, clean, plan, current["id"] if current else None, old_status)
+        return created, True, list(plan["warnings"])
+
+
+def _update_tr(symbol: str, tr_id: str, fields: dict[str, Any], phases: Any, add_events: Any,
+               update_events: Any, anchors: dict[str, Any], created_by: str = "claude") -> dict[str, Any]:
+    for name, value in (("phases", phases), ("add_events", add_events), ("update_events", update_events)):
+        if value is not None and not isinstance(value, list):
+            raise ValueError(f"{name} phai la list")
+    _migrate_tr_events()
+    with _TR_LOCK:
+        tr = _tr_target(symbol, tr_id)
+        moved = []
+        for name, source in (("tr_high", "tr_high"), ("tr_low", "tr_low")):
+            value = anchors.get(name)
+            if value is not None and not math.isclose(float(value), float(tr[source]), rel_tol=1e-9):
+                moved.append(name)
+        if anchors.get("since") not in (None, "") and _parse_moment(anchors["since"]) != int(tr["since"]):
+            moved.append("since")
+        if moved:
+            raise ValueError(f"update_tr khong doi duoc {', '.join(moved)} - doi neo la ve lai TR, "
+                             "goi save_scenarios(tr={...}) voi neo moi")
+        plan = tr_logic.plan_changes(tr, _tr_ctx(symbol, created_by), fields=fields, add_events=add_events,
+                                     update_events=update_events, phases=phases)
+        if plan["changed"]:
+            tr = PLANS.apply_tr(tr["id"], plan)
+    day = _today()
+    return {"symbol": symbol, "changed": plan["changed"], **_tr_report(plan, tr),
+            "warnings": plan["warnings"], "tr": tr,
+            "plan_revision": _plan_snapshot(symbol, day, "update_tr") if plan["changed"] else None,
+            **_dash_link(symbol, day, tf=tr["timeframe"])}
+
+
+@_tool_with_reasons()
+def update_tr(symbol: str, tr_id: str = "", schematic: str = "", status: str = "",
+              levels: dict[str, float | None] | None = None, note: str | None = None,
+              phases: list[dict[str, Any]] | None = None, add_events: list[dict[str, Any]] | None = None,
+              update_events: list[dict[str, Any]] | None = None, tr_high: float | None = None,
+              tr_low: float | None = None, since: str | int | None = None) -> dict[str, Any]:
+    """Cap nhat cau truc Wyckoff cua TR khoa: so do, trang thai, muc, pha va su kien. Goi MOT lan
+    voi moi thay doi, TRUOC save_bias (bias.phase an theo current_phase).
+
+    tr_id: bo trong = TR dang hieu luc cua symbol. Chua co TR thi tao qua save_scenarios.
+    schematic: accumulation | reaccumulation | distribution | redistribution | undetermined.
+      Giu undetermined toi khi co bang chung (SPRING/SOS -> accumulation; UTAD/SOW -> distribution).
+    status: hypothesis | confirmed | failed | completed. note: nhan dinh tong the ve TR.
+    levels: {creek?, ice?, ar_level?, st_level?} gop vao muc dang co, null = xoa muc.
+    add_events: [{type, t, price, tf?, status?, note?, confirmed_by?}]. t = gio mo cua nen DA DONG
+      cua tf (mac dinh = khung TR), price nam trong [low, high] cua nen do. Server tu tinh side, seq,
+      vol_ratio (vol / SMA20 20 nen truoc), spread_ratio, close_pct. Mac dinh status tentative.
+      Tich luy: PS SC ST AR | ST_B mSOW UA | SPRING SHAKEOUT TEST | SOS JAC LPS BU.
+      Phan phoi: PSY BC ST_D AR_D | UT mSOS | UTAD TEST_D | SOW LPSY. TR undetermined nhan moi type.
+    update_events: [{id | ref: "TEST#2", status?, note?, confirmed_by?, price?}]. Gan sai thi
+      status=failed kem note, khong xoa (delete_tr_event chi cho event tao nham trong 24h).
+    phases: [{phase: A-E, start, end?, note?}] upsert theo pha. start/end nhan epoch ms,
+      'YYYY-MM-DD HH:MM' gio VN, hoac {event: "<id | TYPE#n>"} de lay dung t cua event. Mo pha moi thi
+      pha truoc tu dong tai start cua pha moi. Pha khong chong nhau, theo thu tu A -> E.
+    tr_high, tr_low, since: KHONG doi duoc o day (truyen khac TR la bi tu choi) - doi neo = ve lai TR
+      qua save_scenarios.
+    Co loi nao la tu choi ca lan goi, liet ke het loi. Canh bao (khong tu choi): type nam ngoai pha
+    thuong gap, price lech day/dinh nen > 0.1%, SOS/SOW confirmed ma chua co LPS/LPSY sau no.
+    Tra ve TR day du, added/updated (nhan sau khi danh so), warnings, plan_revision, dashboard_url.
+    """
+    fields: dict[str, Any] = {}
+    if str(schematic or "").strip():
+        fields["schematic"] = schematic
+    if str(status or "").strip():
+        fields["status"] = status
+    if levels is not None:
+        fields["levels"] = levels
+    if note is not None:
+        fields["note"] = note
+    return _update_tr(_resolve_symbol(symbol), tr_id, fields, phases, add_events, update_events,
+                      {"tr_high": tr_high, "tr_low": tr_low, "since": since})
+
+
+def _delete_tr_event(symbol: str, event_id: str, reason: str) -> dict[str, Any]:
+    if not str(reason or "").strip():
+        raise ValueError("reason la bat buoc")
+    _migrate_tr_events()
+    with _TR_LOCK:
+        found = PLANS.find_tr_event(symbol, str(event_id or "").strip())
+        tr = PLANS.tr(found[1]) if found else _tr_target(symbol, "")
+        event = tr_logic.resolve_ref(event_id, tr["events"])
+        now = int(time.time() * 1000)
+        if not tr_logic.deletable(event, now):
+            raise ValueError(f"{event['label']} tao luc {_stamp(int(event.get('created_at') or 0))[:16]}, qua 24h "
+                             f"khong xoa duoc - dung update_tr(update_events=[{{ref: '{event['ref']}', "
+                             "status: 'failed', note: '<ly do>'}])")
+        unlinked = PLANS.delete_tr_event(tr["id"], event, reason.strip())
+        tr = PLANS.tr(tr["id"])
+    day = _today()
+    labels = {e["id"]: e["label"] for e in tr["events"]}
+    return {"symbol": symbol, "deleted": {k: event.get(k) for k in ("id", "ref", "label", "type", "t", "price")},
+            "confirmed_by_cleared": [labels.get(i, i) for i in unlinked], "tr": tr,
+            "plan_revision": _plan_snapshot(symbol, day, "delete_tr_event"),
+            **_dash_link(symbol, day, tf=tr["timeframe"])}
+
+
+@_tool_with_reasons()
+def delete_tr_event(symbol: str, event_id: str, reason: str) -> dict[str, Any]:
+    """Xoa han mot event TR tao NHAM (sai cap, sai nen...). Chi xoa duoc event tao trong 24h; sau
+    24h, hoac event gan sai nhan, dung update_tr voi status=failed kem note.
+
+    event_id: id hoac ref "TYPE#n" (ref tinh tren TR dang hieu luc). reason bat buoc, duoc luu lai.
+    Event nao dang confirmed_by toi event bi xoa thi bo lien ket do.
+    """
+    return _delete_tr_event(_resolve_symbol(symbol), event_id, reason)
+
+
+def _tr_changes(symbol: str, day: str) -> dict[str, Any]:
+    """Event them / doi trang thai giua revision 1 va revision cuoi cua ngay (review)."""
+    snaps = PLANS.snapshots(symbol, day, payload=True)
+    first, last = (snaps[0], snaps[-1]) if snaps else ({}, {})
+    diff = tr_logic.tr_diff((first.get("payload") or {}).get("tr"), (last.get("payload") or {}).get("tr"))
+    return {"symbol": symbol, "date": day, "from_revision": first.get("revision"),
+            "to_revision": last.get("revision"), **diff}
+
+
 def _save_scenarios(symbol: str, scenarios: Any, replace: bool, day: str,
-                    tr: dict[str, Any] | None) -> dict[str, Any]:
+                    tr: dict[str, Any] | None, old_tr_status: str = "completed") -> dict[str, Any]:
     if not isinstance(scenarios, list):
         raise ValueError("scenarios phai la list")
-    timeframes = [t for t in SUPPORTED_TIMEFRAMES]
-    clean_tr = dashboard_logic.validate_tr(tr, parse_time=_parse_moment, timeframes=timeframes) if tr else None
+    # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: TR loi thi tu choi truoc khi luu gi
+    tr_out, tr_changed, tr_warnings = (_save_tr(symbol, tr, str(old_tr_status or "completed").strip().lower())
+                                       if tr else (None, False, []))
     known = {s["code"] for s in SETUPS.list(symbol=symbol)}
     fresh, updates, rejected = [], [], []
     for index, raw in enumerate(scenarios):
@@ -4988,13 +5279,8 @@ def _save_scenarios(symbol: str, scenarios: Any, replace: bool, day: str,
             warnings.append(warning)
     updated = [{"code": row["code"], "status": PLANS.set_scenario_status(row["id"], status)["status"]}
                for row, status in updates]
-    tr_out = None
-    tr_changed = False
-    if clean_tr:
-        current = PLANS.active_tr(symbol)
-        tr_changed = dashboard_logic.tr_differs(current, clean_tr)
-        tr_out = (PLANS.replace_tr(symbol, clean_tr, current["id"] if current else None)
-                  if tr_changed else current)
+    # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+    warnings.extend(f"tr: {w}" for w in tr_warnings)
     changed = bool(saved or updated or cancelled or tr_changed)
     return {"symbol": symbol, "bias_date": day, "codes": [s["code"] for s in saved], "saved": saved,
             "updated": updated, "cancelled": cancelled, "rejected": rejected, "warnings": warnings,
@@ -5004,7 +5290,7 @@ def _save_scenarios(symbol: str, scenarios: Any, replace: bool, day: str,
 
 @_tool_with_reasons()
 def save_scenarios(symbol: str, scenarios: list[dict[str, Any]], replace: bool = True, bias_date: str = "",
-                   tr: dict[str, Any] | None = None) -> dict[str, Any]:
+                   tr: dict[str, Any] | None = None, old_tr_status: str = "completed") -> dict[str, Any]:
     """Luu kich ban gia va TR khoa cua mot ngay. Goi ngay sau save_setups.
 
     scenarios: moi kich ban {kind: main|alt, label, setup_codes: [...], points: [...], condition}.
@@ -5014,11 +5300,17 @@ def save_scenarios(symbol: str, scenarios: list[dict[str, Any]], replace: bool =
       Doi trang thai kich ban da co: {code, status: active|played_out|failed|cancelled}.
     replace=true: kich ban active cua ngay chuyen sang cancelled truoc khi luu.
     bias_date: bo trong = hom nay.
-    tr: {timeframe, tr_high, tr_low, since, events: [{type: SC|AR|ST|SPRING|TEST|SOS|LPS|UTAD|SOW|LPSY,
-      t, price}], redraw_rule}. Khac TR dang hieu luc thi TR cu duoc superseded_by, giu lai de review.
-    Tra ve codes, warnings, rejected, dashboard_url.
+    tr: {timeframe, tr_high, tr_low, since, redraw_rule, schematic?, status?, levels?, note?, phases?,
+      events: [{type, t, price, tf?, status?, note?}]}. TM - #WYCKOFF-TR:
+      - Cung neo tr_high, tr_low, since voi TR dang hieu luc -> gop vao TR do nhu update_tr, KHONG tao
+        TR moi; event trung type + t la event da co (gui lai ca danh sach khong bi nhan doi).
+      - Neo khac -> TR moi; TR cu superseded_by va status = old_tr_status (completed | failed).
+      - Event moi kiem tra nhu add_events cua update_tr (nen da dong, price trong nen, khop schematic).
+      Neo khong doi thi khong can truyen lai tr: them/sua event, pha qua update_tr.
+    Tra ve codes, warnings, rejected, tr (day du), dashboard_url.
     """
-    return _save_scenarios(_resolve_symbol(symbol), scenarios, bool(replace), _dash_day(bias_date), tr)
+    return _save_scenarios(_resolve_symbol(symbol), scenarios, bool(replace), _dash_day(bias_date), tr,
+                           old_tr_status)
 
 
 def _review_bars(symbol: str, window: tuple[int, int | None]) -> list[dict[str, Any]]:
@@ -5151,7 +5443,11 @@ def _review_stats(symbol: str, from_date: str, to_date: str, group_by: str) -> d
     setups = [s for s in SETUPS.list(symbol=sym) if from_day <= s["bias_date"] <= to_day]
     reviews = _review_sync(setups)
     events = SETUPS.events_of([s["id"] for s in setups])
+    # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: schematic lay tu TR lien ket
+    schematics = PLANS.tr_schematics([s.get("tr_id") for s in setups])
     rows = [{"symbol": s["symbol"], "trigger_type": s["trigger_type"], "direction": s["direction"],
+             "phase": s.get("phase"), "event_ref_type": tr_logic.ref_type(s.get("event_ref")),
+             "expects": s.get("expects"), "schematic": schematics.get(s.get("tr_id") or ""),
              "triggered": any(e["event"] == "TRIGGERED" for e in events[s["id"]]),
              "outcome": (reviews.get(s["id"]) or {}).get("outcome"),
              "r_multiple": (reviews.get(s["id"]) or {}).get("r_multiple")} for s in setups]
@@ -5167,6 +5463,9 @@ def get_review_stats(symbol: str = "", from_date: str = "", to_date: str = "",
     symbol: bo trong = moi cap. to_date bo trong = hom nay; from_date bo trong = 30 ngay truoc to_date.
     group_by: trigger_type | direction | symbol. win_rate = thang / lenh da dong (tp_hit, sl_hit, be,
     manual_exit); thang la tp_hit, hoac be/manual_exit co R duong. avg_r chi tinh setup co r_multiple.
+    TM - #WYCKOFF-TR: group_by them phase (pha luc tao setup) | event_ref_type (vd TEST) | expects |
+    schematic (cua TR lien ket). Nhom cheo bang dau phay, vd "direction,event_ref_type,phase" = win
+    rate cua long TEST trong pha C. Setup khong co gia tri nam o nhom "chua_co".
     """
     return _review_stats(symbol, from_date, to_date, group_by)
 
@@ -6632,6 +6931,14 @@ async def http_dash_review_stats(request, session):
                                     query.get("group_by") or "trigger_type"))
 
 
+# TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+@_dash_route("/api/tr-changes")
+async def http_dash_tr_changes(request, session):
+    """Bo loc "thay doi TR trong ngay" cua review. Pha, event, the TR moi tai khoan deu xem duoc."""
+    symbol, day = _dash_symbol(request), _dash_day(request.query_params.get("date"))
+    return _dash_json(_tr_changes(symbol, day))
+
+
 @mcp.custom_route(DASH_PATH + "/login", methods=["GET", "POST"])
 async def http_dash_login(request):
     from starlette.responses import HTMLResponse, RedirectResponse
@@ -6938,6 +7245,13 @@ def build_app():
         added = _seed_setup_params()
         if added:
             print(f"BAMCP: da luu setup_params vao SQLite cho {', '.join(added)}", file=sys.stderr)
+        # TM - #WYCKOFF-TR - Chuyen event json cu cua TR sang tr_events (can nen de tinh VSA)
+        try:
+            moved = _migrate_tr_events()
+            if moved:
+                print(f"BAMCP: da chuyen {moved} event TR sang tr_events", file=sys.stderr)
+        except Exception as exc:
+            print(f"CANH BAO: chuyen event TR loi ({type(exc).__name__}: {exc})", file=sys.stderr)
         task = (asyncio.create_task(FETCH_SCHEDULER.run_forever() if FETCH_MODE == "schedules"
                                     else _fetcher_loop()) if FETCH.get("enabled") else None)
         # TM - #ORB - ORB Enhancement: scheduler ORB song cung vong doi app nhu fetcher

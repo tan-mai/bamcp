@@ -109,11 +109,22 @@ def app_page(boot: dict[str, Any], assets: dict[str, str]) -> str:
         <div class="seg" id="tfs" role="group" aria-label="Khung thời gian"></div>
         <select id="revision" aria-label="Revision kế hoạch" hidden></select>
         <label class="check"><input type="checkbox" id="levels"> Mức giá</label>
+        <!-- TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR -->
+        <span class="layers" role="group" aria-label="Lớp Wyckoff">
+          <label class="check"><input type="checkbox" id="layerPhases"> Pha</label>
+          <label class="check"><input type="checkbox" id="layerEvents"> Event</label>
+          <label class="check"><input type="checkbox" id="layerLevels"> Creek/Ice</label>
+          <label class="check"><input type="checkbox" id="showFailed"> Hiện event hỏng</label>
+        </span>
       </div>
-      <div class="chart" id="chart"></div>
+      <div class="chart" id="chart"><div class="popover" id="popover" role="dialog" aria-label="Chi tiết event" hidden></div></div>
       <p class="chart-note" id="chartNote"></p>
     </section>
     <aside class="side">
+      <section class="panel" id="trPanel">
+        <h2>TR khoá</h2>
+        <div id="trCard"></div>
+      </section>
       <section class="panel">
         <h2>Setup</h2>
         <div id="setups"></div>

@@ -1,5 +1,5 @@
 # TM - #DASHBOARD - Setup dashboard
-"""Logic thuan cua setup dashboard: kiem tra kich ban/TR, thong ke volume, muc HTF,
+"""Logic thuan cua setup dashboard: kiem tra kich ban, thong ke volume, muc HTF,
 auto_outcome, thong ke review. Khong dong vao DB hay mang de test duoc doc lap.
 """
 from __future__ import annotations
@@ -12,11 +12,14 @@ import entry_logic
 
 SCENARIO_KINDS = ("main", "alt")
 SCENARIO_STATUSES = ("active", "played_out", "failed", "cancelled")
-WYCKOFF_EVENTS = ("SC", "AR", "ST", "SPRING", "TEST", "SOS", "LPS", "UTAD", "SOW", "LPSY")
 OUTCOMES = ("tp_hit", "sl_hit", "be", "manual_exit", "not_triggered", "missed", "invalidated")
 # Ket qua cua lenh da dong. Cac ket qua con lai la khong co lenh, khong tinh win rate.
 CLOSED_OUTCOMES = ("tp_hit", "sl_hit", "be", "manual_exit")
-GROUP_BY = ("trigger_type", "direction", "symbol")
+GROUP_BY = ("trigger_type", "direction", "symbol",
+            # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
+            "phase", "event_ref_type", "expects", "schematic")
+# Nhom khong co gia tri (setup luu truoc khi co TR, hoac khong khai) gom vao day
+NO_GROUP = "chua_co"
 MARKER_EVENTS = ("IN_ZONE", "TRIGGERED", "MISSED", "INVALIDATED", "EXPIRED")
 VOL_PERIOD = 20
 MAX_BARS = 500
@@ -109,52 +112,6 @@ def start_warning(label: str, points: list[dict[str, Any]], last_close: float | 
         return None
     return (f"{label}: diem dau {points[0]['price']:.10g} cach gia dong cuoi {last_close:.10g} "
             f"{gap * 100:.2f}% (> {START_PRICE_TOLERANCE * 100:g}%)")
-
-
-def validate_tr(raw: Any, *, parse_time: Callable[[Any], int | None],
-                timeframes: list[str]) -> dict[str, Any]:
-    if not isinstance(raw, dict):
-        raise ValueError("tr phai la object")
-    timeframe = str(raw.get("timeframe") or "15m").strip().lower()
-    if timeframe not in timeframes:
-        raise ValueError(f"tr.timeframe phai la mot trong {timeframes}")
-    high, low = _positive(raw.get("tr_high"), "tr_high"), _positive(raw.get("tr_low"), "tr_low")
-    if low >= high:
-        raise ValueError("tr_low phai nho hon tr_high")
-    try:
-        since = parse_time(raw.get("since"))
-    except ValueError:
-        since = None
-    if since is None:
-        raise ValueError(f"tr.since khong hop le: {raw.get('since')!r}")
-    events = raw.get("events") or []
-    if not isinstance(events, list):
-        raise ValueError("tr.events phai la list")
-    clean_events = []
-    for item in events:
-        if not isinstance(item, dict):
-            raise ValueError("moi tr.event phai la object {type, t, price}")
-        kind = str(item.get("type") or "").strip().upper()
-        if kind not in WYCKOFF_EVENTS:
-            raise ValueError(f"tr.event type phai la mot trong {list(WYCKOFF_EVENTS)}, nhan duoc {kind!r}")
-        try:
-            moment = parse_time(item.get("t"))
-        except ValueError:
-            moment = None
-        if moment is None:
-            raise ValueError(f"tr.event {kind}: thoi gian khong hop le")
-        clean_events.append({"type": kind, "t": int(moment),
-                             "price": _positive(item.get("price"), f"gia cua {kind}")})
-    clean_events.sort(key=lambda e: e["t"])
-    return {"timeframe": timeframe, "tr_high": high, "tr_low": low, "since": int(since),
-            "events": clean_events, "redraw_rule": str(raw.get("redraw_rule") or "").strip() or None}
-
-
-def tr_differs(old: dict[str, Any] | None, new: dict[str, Any]) -> bool:
-    if old is None:
-        return True
-    return any(old.get(k) != new.get(k)
-               for k in ("timeframe", "tr_high", "tr_low", "since", "events", "redraw_rule"))
 
 
 def volume_stats(closed: list[dict[str, Any]], count: int, mult: float, *,
@@ -312,12 +269,22 @@ def _stat_row(key: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def group_keys(group_by: str) -> list[str]:
+    """Mot khoa, hoac nhieu khoa cach dau phay de nhom cheo (vd 'direction,event_ref_type,phase')."""
+    keys = [k.strip() for k in str(group_by or "").split(",") if k.strip()]
+    bad = [k for k in keys if k not in GROUP_BY]
+    if not keys or bad or len(set(keys)) != len(keys):
+        raise ValueError(f"group_by phai la mot hoac nhieu khoa (cach dau phay) trong {list(GROUP_BY)}")
+    return keys
+
+
 def review_stats(rows: list[dict[str, Any]], group_by: str) -> dict[str, Any]:
-    if group_by not in GROUP_BY:
-        raise ValueError(f"group_by phai la mot trong {list(GROUP_BY)}")
+    keys = group_keys(group_by)
     groups: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        groups.setdefault(str(row[group_by]), []).append(row)
+        # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: nhom cheo noi bang " / "
+        key = " / ".join(NO_GROUP if row.get(k) in (None, "") else str(row[k]) for k in keys)
+        groups.setdefault(key, []).append(row)
     return {"total": _stat_row("total", rows),
             "groups": [_stat_row(key, groups[key]) for key in sorted(groups)]}
 

@@ -112,7 +112,8 @@ Cần chạy ở nơi có lệnh `sqlite3` và thấy được file DB. Ví dụ
 <data_root>/              # Docker: /data. Chạy local: ./data
 ├── klines/<SYMBOL>/      # 1w.json 1d.json 4h.json 1h.json 15m.json 5m.json (khi kline_store = json)
 ├── bamcp.db              # SQLite: klines (khi kline_store = sqlite), fetch_schedules, setups,
-│                         # setup_events, setup_params, scenarios, trading_ranges, plan_snapshots,
+│                         # setup_events, setup_params, scenarios, trading_ranges, tr_phases,
+│                         # tr_events, tr_event_deletions, plan_snapshots,
 │                         # setup_reviews, dashboard_*
 ├── settings.json         # username/password (hash), credential sàn, danh sách cặp. chmod 600
 ├── rules.json            # rule chung, phần đặt riêng từng cặp, khối orb, lịch sử đổi
