@@ -126,7 +126,11 @@ def app_page(boot: dict[str, Any], assets: dict[str, str]) -> str:
         <div id="trCard"></div>
       </section>
       <section class="panel">
-        <h2>Setup</h2>
+        <!-- TM - #TR-BRANCH - Setup PRUNED an mac dinh -->
+        <div class="panel-head">
+          <h2>Setup</h2>
+          <button type="button" class="toggle" id="showPruned" aria-pressed="false" hidden></button>
+        </div>
         <div id="setups"></div>
       </section>
       <section class="panel" id="fillsPanel" hidden>

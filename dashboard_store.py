@@ -39,6 +39,8 @@ def _tr(row: Any) -> dict[str, Any]:
     out["events"] = _loads(out["events"], [])
     # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
     out["levels"] = _loads(out.get("levels"), {})
+    # TM - #TR-BRANCH - Diem bang chung xac suat tich luy / phan phoi
+    out["prob_evidence"] = _loads(out.get("prob_evidence"), [])
     return out
 
 
@@ -171,9 +173,20 @@ class PlanStore:
         fields = dict(plan.get("fields") or {})
         if "levels" in fields:
             fields["levels"] = json.dumps(fields["levels"]) if fields["levels"] else None
+        # TM - #TR-BRANCH - Diem bang chung luu json; lich su xac suat ghi cung giao dich
+        if "prob_evidence" in fields:
+            fields["prob_evidence"] = json.dumps(fields["prob_evidence"], ensure_ascii=False)
         sets = ", ".join(f"{k} = ?" for k in fields)
         conn.execute(f"UPDATE trading_ranges SET {sets + ', ' if sets else ''}updated_at = ? WHERE id = ?",
                      (*fields.values(), now, tr_id))
+        prob = plan.get("prob")
+        if prob is not None:
+            cur = conn.execute(
+                "INSERT INTO tr_prob_history (tr_id, at, prob_accumulation, prob_distribution, evidence) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (tr_id, now, prob["prob_accumulation"], prob["prob_distribution"],
+                 json.dumps(prob["evidence"], ensure_ascii=False)))
+            plan["prob_history_id"] = int(cur.lastrowid)
         for event in plan.get("insert") or []:
             row = {**event, "tr_id": tr_id, "seq": plan["seq"][event["id"]]}
             conn.execute(f"INSERT INTO tr_events ({', '.join(EVENT_COLUMNS)}) "
@@ -241,6 +254,28 @@ class PlanStore:
             conn.execute("UPDATE trading_ranges SET updated_at = ? WHERE id = ?", (now, tr_id))
             self._renumber(conn, tr_id)
         return linked
+
+    # TM - #TR-BRANCH - Lich su xac suat gan plan revision
+    def set_prob_revision(self, history_id: int | None, revision: int | None, day: str) -> None:
+        if not history_id:
+            return
+        with self._conn() as conn, conn:
+            conn.execute("UPDATE tr_prob_history SET plan_revision = ?, bias_date = ? WHERE id = ?",
+                         (revision, day, int(history_id)))
+
+    def prob_history(self, tr_id: str, start_ms: int | None = None,
+                     end_ms: int | None = None) -> list[dict[str, Any]]:
+        sql = ("SELECT id, at, prob_accumulation, prob_distribution, bias_date, plan_revision "
+               "FROM tr_prob_history WHERE tr_id = ?")
+        params: list[Any] = [tr_id]
+        if start_ms is not None:
+            sql += " AND at >= ?"
+            params.append(int(start_ms))
+        if end_ms is not None:
+            sql += " AND at <= ?"
+            params.append(int(end_ms))
+        with self._conn() as conn:
+            return [dict(r) for r in conn.execute(sql + " ORDER BY at, id", params)]
 
     def find_tr_event(self, symbol: str, event_id: str) -> tuple[str, str] | None:
         with self._conn() as conn:
@@ -313,7 +348,9 @@ class PlanStore:
                 "SELECT (SELECT COALESCE(MAX(rowid), 0) FROM plan_snapshots), "
                 "(SELECT COALESCE(MAX(updated_at), 0) FROM trading_ranges), "
                 "(SELECT COALESCE(MAX(updated_at), 0) FROM tr_events), "
-                "(SELECT COUNT(*) FROM tr_events)").fetchone()
+                "(SELECT COUNT(*) FROM tr_events), "
+                # TM - #TR-BRANCH - revision gan vao lich su xac suat sau snapshot
+                "(SELECT COUNT(*) FROM tr_prob_history WHERE plan_revision IS NOT NULL)").fetchone()
         return tuple(int(v) for v in row)
 
     # ------------------------------------------------------------ review

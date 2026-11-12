@@ -68,6 +68,19 @@ __SETUP_BANNER__
     <div class="actions"><button type="button" class="primary" id="b_config">Lưu cấu hình</button></div>
   </div>
 
+  <!-- TM - #TR-BRANCH - Thang diem xac suat tich luy / phan phoi -->
+  <div class="card">
+    <h2>Thang điểm xác suất TR</h2>
+    <p class="hint">Trọng số mặc định của từng yếu tố khi Claude gửi <code>prob_evidence</code> qua <code>update_tr</code>
+      mà bỏ trống <code>weight</code>. Xác suất tích luỹ = Σ trọng số bên acc / Σ trọng số × 100. Đây là điểm bằng chứng,
+      chưa hiệu chỉnh thống kê. Ô trống = trọng số mặc định. Chỉ áp dụng cho lần gửi sau, không tính lại TR đã lưu.</p>
+    <div class="scroll"><table>
+      <thead><tr><th>Yếu tố</th><th>factor</th><th>Mặc định</th><th>Trọng số</th></tr></thead>
+      <tbody>__WEIGHT_ROWS__</tbody>
+    </table></div>
+    <div class="actions"><button type="button" class="primary" id="b_weights">Lưu thang điểm</button></div>
+  </div>
+
   <div class="card">
     <h2>Audit log</h2>
     <div class="scroll tall"><table>
@@ -133,6 +146,13 @@ $("b_config").addEventListener("click", async (e) => {
   ["session_hours", "remember_days", "login_max_attempts", "login_lockout_minutes", "poll_seconds",
    "vol_spike_mult", "default_bars"].forEach((key) => { config[key] = $("k_" + key).value; });
   if (await act({action: "config_save", config: config}, e.target)) reloadSoon("Đã lưu cấu hình");
+});
+
+// TM - #TR-BRANCH - Thang diem xac suat: chi gui prob_weights, cac cau hinh khac giu nguyen
+$("b_weights").addEventListener("click", async (e) => {
+  const weights = {};
+  document.querySelectorAll("input[data-weight]").forEach((box) => { weights[box.dataset.weight] = box.value.trim(); });
+  if (await act({action: "config_save", config: {prob_weights: weights}}, e.target)) reloadSoon("Đã lưu thang điểm");
 });
 
 document.addEventListener("change", async (e) => {
@@ -216,6 +236,19 @@ def _login_rows(rows: list[dict[str, Any]]) -> str:
         for r in rows)
 
 
+# TM - #TR-BRANCH - Thang diem xac suat tich luy / phan phoi
+def _weight_rows(factors: list[dict[str, Any]], weights: dict[str, Any]) -> str:
+    out = []
+    for factor in factors:
+        key, default = factor["key"], float(factor["default"])
+        current = float(weights.get(key, default))
+        out.append(
+            f'<tr><td>{_e(factor["label"])}</td><td class="id">{_e(key)}</td><td class="num">{default:g}</td>'
+            f'<td><input type="number" min="0.1" max="100" step="0.5" data-weight="{_e(key)}" '
+            f'aria-label="Trọng số {_e(key)}" value="{current:g}" style="width:90px"></td></tr>')
+    return "".join(out)
+
+
 def render(view: dict[str, Any], *, action_path: str, admin_path: str, setup_required: bool,
            nav: list[admin_ui.NavItem] | None = None) -> str:
     cfg = view["config"]
@@ -238,6 +271,8 @@ def render(view: dict[str, Any], *, action_path: str, admin_path: str, setup_req
         "__TF_OPTIONS__": "".join(f'<option{" selected" if t == cfg.get("default_tf") else ""}>{_e(t)}</option>'
                                   for t in view["timeframes"]),
         "__AUDIT_ROWS__": _audit_rows(view["audit"]),
+        # TM - #TR-BRANCH - Thang diem xac suat
+        "__WEIGHT_ROWS__": _weight_rows(view.get("prob_factors") or [], cfg.get("prob_weights") or {}),
         "__LOGIN_ROWS__": _login_rows(view["logins"]),
         "__ACTION_PATH__": json.dumps(action_path).replace("<", "\\u003c"),
     }

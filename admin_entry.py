@@ -47,6 +47,15 @@ __CFG_WARNING__
       <div><label for="s_trigger">trigger_type</label><select id="s_trigger">__TRIGGER_OPTIONS__</select></div>
       <div><label for="s_bias">bias_date</label><input type="date" id="s_bias" value="__TODAY__"></div>
     </div>
+    <!-- TM - #TR-BRANCH - Nhanh kich ban va ten tuong minh -->
+    <div class="row">
+      <div><label for="s_branch">branch <span class="small">· acc chỉ long, dist chỉ short</span></label>
+        <select id="s_branch">__BRANCH_OPTIONS__</select></div>
+      <div><label for="s_entry_event">entry_event</label><select id="s_entry_event">__ENTRY_EVENT_OPTIONS__</select></div>
+      <div><label for="s_ref_event">ref_event <span class="small">· tuỳ chọn</span></label>
+        <input type="text" id="s_ref_event" placeholder="SOW#1"></div>
+      <div><label for="s_label">label <span class="small">· trống = tự sinh</span></label><input type="text" id="s_label"></div>
+    </div>
     <div class="row">
       <div><label for="s_zl">zone_low</label><input type="number" step="any" id="s_zl"></div>
       <div><label for="s_zh">zone_high</label><input type="number" step="any" id="s_zh"></div>
@@ -190,12 +199,15 @@ $("b_create").addEventListener("click", async (e) => {
     stop: num("s_stop"), target: num("s_target"), invalidate_level: num("s_inv"),
     confirm_type: $("s_ctype").value || null, confirm_level: num("s_clevel"), max_chase: num("s_chase"),
     expires_at: $("s_expires").value.trim() || null, m15_filter: $("s_m15").checked,
-    trigger_params: params, note: $("s_note").value.trim()};
+    trigger_params: params, note: $("s_note").value.trim(),
+    // TM - #TR-BRANCH - Nhanh kich ban va ten tuong minh
+    branch: $("s_branch").value, entry_event: $("s_entry_event").value,
+    ref_event: $("s_ref_event").value.trim() || null, label: $("s_label").value.trim() || null};
   const data = await act({action: "setup_create", symbol: $("s_symbol").value, setup: setup}, e.target);
   if (!data) return;
   if (data.rejected.length) { say("Bị từ chối: " + data.rejected[0].error, false); return; }
   const s = data.saved[0];
-  say("Đã tạo " + s.code + " · max_chase " + s.max_chase_effective + " · check_trade "
+  say("Đã tạo " + s.code + " (" + s.label + ") · max_chase " + s.max_chase_effective + " · check_trade "
       + (s.check_trade.would_pass ? "pass" : "fail: " + s.check_trade.rule_violations.join("; ")), true);
   setTimeout(() => location.reload(), 1500);
 });
@@ -250,7 +262,8 @@ SETUP_FIELD = """<div class="card"><label for="setup_token">Setup token</label>
   <input type="text" id="setup_token" autocomplete="off" placeholder="dán chuỗi từ dòng BAMCP SETUP TOKEN"></div>"""
 
 GO = ("ENTRY_VALID",)
-STOPPED = ("BLOCKED", "MISSED", "INVALIDATED", "EXPIRED", "CANCELLED")
+STOPPED = ("BLOCKED", "MISSED", "INVALIDATED", "EXPIRED", "CANCELLED",
+           "PRUNED")  # TM - #TR-BRANCH - loai vi nguoc nhanh TR
 
 
 def _e(value: Any) -> str:
@@ -291,9 +304,14 @@ def _setup_rows(rows: list[dict[str, Any]]) -> str:
         counter = s.get("htf_counter") or []
         htf = (f'<div class="small">{_e(entry_logic.htf_text(s.get("htf")))}</div>'
                + (f'<span class="pill no">NGƯỢC {_e(", ".join(counter))}</span>' if counter else ""))
+        # TM - #TR-BRANCH - Ten tuong minh va ly do loai
+        label = f'<div class="small">{_e(s.get("label"))}</div>' if s.get("label") else ""
+        pruned = ((s.get("state") or {}).get("pruned") or {}).get("reason")
+        pruned = f'<div class="small">{_e(pruned)}</div>' if pruned else ""
         out.append(
             "<tr>"
-            f'<td><b>{_e(s["code"])}</b><div class="small">{_e(s["created_by"])} · {_e(s["created_at"])}</div></td>'
+            f'<td><b>{_e(s["code"])}</b>{label}<div class="small">{_e(s["created_by"])} · {_e(s["created_at"])}</div>'
+            f'{pruned}</td>'
             f'<td>{_e(s["direction"])}{htf}</td><td><span class="pill {css}">{_e(s["status"])}</span></td>'
             f'<td class="num">{_num(s["zone_low"])}–{_num(s["zone_high"])}</td>'
             f'<td class="num">{_num(s["entry"])} / {_num(s["stop"])} / {_num(s["target"])}'
@@ -360,6 +378,10 @@ def render(view: dict[str, Any], *, action_path: str, admin_path: str, schedules
         "__SETUP_ROWS__": _setup_rows(view.get("setups") or []),
         "__SYMBOL_OPTIONS__": _options(view["symbols"]),
         "__TRIGGER_OPTIONS__": _options(view["triggers"]),
+        # TM - #TR-BRANCH - Nhanh kich ban va su kien vao lenh
+        "__BRANCH_OPTIONS__": _options(list(entry_logic.SETUP_BRANCHES), "range"),
+        "__ENTRY_EVENT_OPTIONS__": _options(list(entry_logic.ENTRY_EVENTS), None,
+                                            {e: f"{e} ({d})" for e, d in entry_logic.ENTRY_EVENTS.items()}),
         "__TODAY__": _e(view.get("today")),
         "__ACTION_PATH__": _js(action_path),
         "__PARAM_KEYS__": _js(view["param_keys"]),

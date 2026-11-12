@@ -57,13 +57,13 @@ Chi tiết ở [setups.md](setups.md).
 
 | Tool | Việc |
 |---|---|
-| `save_setups` | Lưu kế hoạch vào lệnh thành setup có cấu trúc. Watcher canh trên nến M5 đã đóng |
-| `get_setups` | Setup kèm trạng thái hiện tại và event gần nhất |
+| `save_setups` | Lưu kế hoạch vào lệnh thành setup có cấu trúc. Watcher canh trên nến M5 đã đóng. Bắt buộc `branch` và `entry_event`, tên setup tự sinh ([chi tiết](setups.md#tên-setup-và-nhánh-kịch-bản)) |
+| `get_setups` | Setup kèm trạng thái hiện tại, event gần nhất, `label`, `branch`; `trs` là nhánh và xác suất của TR liên kết |
 | `get_setup_params` | Tham số setup đang áp dụng cho một cặp, gồm ngưỡng volume gợi ý cho `rejection` |
 | `cancel_setup` | Huỷ đúng một setup (bắt buộc lý do) |
-| `get_setup_events` | Lịch sử chuyển trạng thái và tin đã gửi |
+| `get_setup_events` | Lịch sử chuyển trạng thái và tin đã gửi, kèm `label`. `PRUNED` / `BRANCH_CONFLICT` / `TR_BRANCH` là event của lần loại setup ngược nhánh |
 | `save_scenarios` | Lưu kịch bản giá của một ngày, gọi ngay sau `save_setups`. Kèm `tr` khi tạo TR lần đầu hoặc vẽ lại TR (cùng neo thì gộp vào TR đang hiệu lực) |
-| `update_tr` | Cập nhật TR khoá: sơ đồ Wyckoff, trạng thái, creek/ice, pha A–E, thêm và đổi trạng thái event. Gọi một lần, trước `save_bias` ([chi tiết](dashboard.md#tr-khoá-và-wyckoff)) |
+| `update_tr` | Cập nhật TR khoá: sơ đồ Wyckoff, trạng thái, creek/ice, pha A–E, thêm và đổi trạng thái event, `prob_evidence`. Gọi một lần, trước `save_bias`. TR xác định nhánh thì tự loại setup ngược nhánh ([chi tiết](dashboard.md#tr-khoá-và-wyckoff), [nhánh](dashboard.md#nhánh-kịch-bản-và-xác-suất)) |
 | `delete_tr_event` | Xoá hẳn một event TR tạo nhầm trong 24h (bắt buộc lý do). Gán sai nhãn thì dùng `update_tr` với `status=failed` |
 
 ## Biểu đồ và review
@@ -72,9 +72,9 @@ Chi tiết ở [dashboard.md](dashboard.md).
 
 | Tool | Việc |
 |---|---|
-| `get_chart_data` | Một lần gọi đủ dữ liệu vẽ biểu đồ: nến, `vol_spike`, bias, setup, kịch bản, TR (pha, event kèm số VSA), marker, mức HTF, vị thế |
+| `get_chart_data` | Một lần gọi đủ dữ liệu vẽ biểu đồ: nến, `vol_spike`, bias, setup, kịch bản, TR (pha, event kèm số VSA, nhánh, xác suất), `prob_history`, marker, mức HTF, vị thế |
 | `save_review` | Gắn kết quả review cho một setup. `auto_outcome` của hệ thống giữ nguyên |
-| `get_review_stats` | Thống kê setup theo khoảng ngày: tỉ lệ trigger, win rate, R trung bình. Nhóm theo `trigger_type`, `direction`, `symbol`, `phase`, `event_ref_type`, `expects`, `schematic`, hoặc nhóm chéo `direction,event_ref_type,phase` |
+| `get_review_stats` | Thống kê setup theo khoảng ngày: tỉ lệ trigger, win rate, R trung bình. Nhóm theo `trigger_type`, `direction`, `symbol`, `phase`, `event_ref_type`, `expects`, `schematic`, `branch`, `entry_event`, hoặc nhóm chéo `direction,event_ref_type,phase` |
 
 ## ORB
 

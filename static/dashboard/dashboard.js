@@ -14,8 +14,12 @@
   const STATUS_CLASS = {
     ENTRY_VALID: "go", FILLED: "go", IN_ZONE: "run", TRIGGERED: "run", CONFIRMED: "run",
     MISSED: "stop", BLOCKED: "stop", INVALIDATED: "stop", EXPIRED: "stop", CANCELLED: "stop",
+    PRUNED: "stop",  // TM - #TR-BRANCH
   };
-  const TERMINAL = ["FILLED", "INVALIDATED", "EXPIRED", "CANCELLED"];
+  const TERMINAL = ["FILLED", "INVALIDATED", "EXPIRED", "CANCELLED", "PRUNED"];
+  // TM - #TR-BRANCH - Nhanh kich ban TR
+  const BRANCH_WORDS = { accumulation: ["tăng", "tích luỹ"], distribution: ["giảm", "phân phối"] };
+  const SYSTEM_EVENT_LABEL = { TR_BRANCH: "TR xác định nhánh · loại setup ngược nhánh" };
   const TRIGGER_LABEL = {
     save_bias: "Lưu bias", save_setups: "Lưu setup", save_scenarios: "Lưu kịch bản", cancel_setup: "Huỷ setup",
     // TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
@@ -67,6 +71,9 @@
     trFilter: false,
     trChanges: null,
     trLoading: null,
+    // TM - #TR-BRANCH - Setup PRUNED an mac dinh, khong nho qua lan tai trang
+    showPruned: false,
+    setupRows: null,
   };
   let chartTicket = 0;
   let listTicket = 0;
@@ -91,7 +98,13 @@
     const n = Number(value);
     return (n > 0 ? "+" : "") + num(n, 2);
   }
-  function letter(code) { return String(code || "").split("-").pop(); }
+  // TM - #TR-BRANCH - Ma moi BTC-20261112-S-DIST-D-LPSY-1 -> "S-DIST-D-LPSY-1" (bo cap + ngay, van
+  // duy nhat trong ngay); ma cu BTC-20261101-A -> "A".
+  function letter(code) {
+    const parts = String(code || "").split("-");
+    return parts.length > 3 ? parts.slice(2).join("-") : parts.pop();
+  }
+  const shownSetups = (setups) => (S.showPruned ? setups : setups.filter((s) => s.status !== "PRUNED"));
 
   function el(tag, attrs, ...children) {
     const node = document.createElement(tag);
@@ -417,7 +430,7 @@
     const Solid = LW.LineStyle.Solid;
     const Dashed = LW.LineStyle.Dashed;
     const Dotted = LW.LineStyle.Dotted;
-    d.setups.forEach((setup) => {
+    shownSetups(d.setups).forEach((setup) => {  // TM - #TR-BRANCH - PRUNED an mac dinh
       if (setup.status === "CANCELLED") return;
       const on = S.selected === setup.code;
       const faded = (S.selected && !on) || TERMINAL.includes(setup.status);
@@ -443,8 +456,10 @@
     const span = SPAN[d.timeframe];
     const out = [];
     const snap = (ms) => Math.floor(ms / span) * span / 1000;
+    // TM - #TR-BRANCH - marker cua setup PRUNED an cung the setup
+    const hidden = new Set(d.setups.filter((s) => !shownSetups([s]).length).map((s) => s.code));
     (d.markers || []).forEach((m) => {
-      if (m.kind === "wyckoff") return;
+      if (m.kind === "wyckoff" || hidden.has(m.code)) return;
       const time = snap(m.t);
       if (!times.has(time)) return;
       const up = m.direction === "long";
@@ -573,7 +588,7 @@
       // TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: pha dang chay keo toi nen cuoi
       lastTime: candles.length ? candles[candles.length - 1][0] : null,
       tr: d.tr,
-      zones: d.setups.filter((s) => s.status !== "CANCELLED").map((s) => ({
+      zones: shownSetups(d.setups).filter((s) => s.status !== "CANCELLED").map((s) => ({  // TM - #TR-BRANCH
         code: s.code, low: s.zone_low, high: s.zone_high, start: s.created_ms,
         color: s.direction === "long" ? C.long : C.short, dim: TERMINAL.includes(s.status),
         extra: [s.entry, s.stop, s.target, s.invalidate_level],
@@ -823,6 +838,46 @@
     if (S.chart) renderTr(S.chart.data);
   }
 
+  // TM - #TR-BRANCH - Banner nhanh: "Pha C: UTAD#1 → Nhánh giảm (phân phối)"
+  function branchBanner(tr) {
+    const by = tr.branch_by;
+    if (!tr.branch || !by || !BRANCH_WORDS[tr.branch]) {
+      return el("p", { class: "branch none" }, "Chưa xác định nhánh — TR trung tính tới khi có sự kiện pha C (không có pha C thì pha D).");
+    }
+    const [word, family] = BRANCH_WORDS[tr.branch];
+    const source = by.by === "event" ? `Pha ${by.phase}: ${by.ref || by.type}` : `Sơ đồ ${SCHEMATIC_LABEL[by.schematic] || by.schematic}`;
+    return el("p", { class: "branch " + (tr.branch === "accumulation" ? "long" : "short") }, `${source} → Nhánh ${word} (${family})`);
+  }
+
+  // TM - #TR-BRANCH - Thanh % tich luy / phan phoi kem danh sach bang chung va dien bien trong ngay
+  function probBlock(tr, history) {
+    const evidence = tr.prob_evidence || [];
+    const acc = tr.prob_accumulation;
+    const dist = tr.prob_distribution;
+    if (acc === null || acc === undefined || dist === null || dist === undefined) {
+      return el("p", { class: "empty prob" }, "Chưa có điểm bằng chứng tích luỹ / phân phối.");
+    }
+    const part = (cls, pct) => {
+      const node = el("span", { class: cls });
+      node.style.width = `${pct}%`;
+      return node;
+    };
+    const items = evidence.map((e) => el("li", {},
+      el("span", {}, (BOOT.prob_factors || {})[e.factor] || e.factor),
+      el("span", { class: "pill " + (e.side === "acc" ? "long" : "short") }, e.side === "acc" ? "tích luỹ" : "phân phối"),
+      el("span", { class: "w" }, `+${num(e.weight, 2)}`),
+      e.note ? el("span", { class: "note" }, e.note) : null));
+    const moves = history.filter((h) => h.prob_accumulation !== null && h.prob_accumulation !== undefined);
+    const trail = moves.length > 1 ? el("p", { class: "prob-caption" }, "Trong ngày: " + moves.map((h) =>
+      `${hm(h.at)} TL ${h.prob_accumulation}% / PP ${h.prob_distribution}%${h.plan_revision ? ` (R${h.plan_revision})` : ""}`).join(" → ")) : null;
+    return el("div", { class: "prob" },
+      el("div", { class: "prob-legend" }, el("span", { class: "long" }, `Tích luỹ ${acc}%`), el("span", { class: "short" }, `Phân phối ${dist}%`)),
+      el("div", { class: "prob-bar", role: "img", "aria-label": `Tích luỹ ${acc}%, phân phối ${dist}%` }, part("acc", acc), part("dist", dist)),
+      items.length ? el("ul", { class: "prob-list" }, items) : null,
+      el("p", { class: "prob-caption" }, "Điểm bằng chứng, chưa hiệu chỉnh thống kê."),
+      trail);
+  }
+
   function renderTr(d) {
     const box = $("trCard");
     const tr = d.tr;
@@ -863,9 +918,10 @@
     const body = S.mode === "review" && S.trFilter
       ? (changes && changes.error ? el("p", { class: "empty" }, changes.error) : changeList(changes))
       : eventList(tr);
-    box.replaceChildren(head, facts, body,
+    // TM - #TR-BRANCH - loc null: replaceChildren(null) in ra chu "null" khi TR khong co note
+    box.replaceChildren(...[head, branchBanner(tr), probBlock(tr, d.prob_history || []), facts, body,
       tr.redraw_rule ? el("p", { class: "tr-text" }, el("b", {}, "Vẽ lại khi: "), tr.redraw_rule) : null,
-      tr.note ? el("p", { class: "tr-text" }, el("b", {}, "Nhận định: "), tr.note) : null);
+      tr.note ? el("p", { class: "tr-text" }, el("b", {}, "Nhận định: "), tr.note) : null].filter(Boolean));
   }
 
   // ---------------------------------------------------------------- the setup
@@ -883,11 +939,21 @@
 
   function renderSetups(rows, price) {
     const box = $("setups");
-    if (!rows.length) {
-      box.replaceChildren(el("p", { class: "empty" }, `Không có setup cho ${S.symbol} ngày ${S.date}.`));
+    S.setupRows = { rows, price };
+    // TM - #TR-BRANCH - Setup PRUNED an mac dinh, nut "Hien setup da loai (n)"
+    const pruned = rows.filter((s) => s.status === "PRUNED").length;
+    const toggle = $("showPruned");
+    toggle.hidden = !pruned;
+    toggle.textContent = `${S.showPruned ? "Ẩn" : "Hiện"} setup đã loại (${pruned})`;
+    toggle.setAttribute("aria-pressed", S.showPruned ? "true" : "false");
+    const shown = shownSetups(rows);
+    if (!shown.length) {
+      box.replaceChildren(el("p", { class: "empty" }, pruned
+        ? `Không còn setup theo dõi cho ${S.symbol} ngày ${S.date} — ${pruned} setup đã loại vì ngược nhánh TR.`
+        : `Không có setup cho ${S.symbol} ngày ${S.date}.`));
       return;
     }
-    box.replaceChildren(...rows.map((setup) => setupCard(setup, price)));
+    box.replaceChildren(...shown.map((setup) => setupCard(setup, price)));
   }
 
   function setupCard(setup, price) {
@@ -908,11 +974,14 @@
     const wyckoff = [setup.phase ? `Pha ${setup.phase}` : null,
       setup.event_ref ? `giao dịch ${String(setup.event_ref).replace("#", " ")}` : null,
       setup.expects ? `kỳ vọng ${setup.expects}` : null].filter(Boolean).join(" · ");
+    // TM - #TR-BRANCH - Ten tuong minh lam tieu de, ly do loai voi setup PRUNED
+    const pruned = setup.status === "PRUNED" ? (setup.state || {}).pruned || {} : null;
     return el("article", {
-      class: `setup${S.selected === setup.code ? " on" : ""}${TERMINAL.includes(setup.status) ? " done" : ""}`,
+      class: `setup${S.selected === setup.code ? " on" : ""}${TERMINAL.includes(setup.status) ? " done" : ""}${pruned ? " pruned" : ""}`,
       "data-code": setup.code,
       on: { click: () => focusSetup(setup) },
     },
+    setup.label ? el("div", { class: "setup-label" }, setup.label) : null,
     el("div", { class: "setup-head" },
       el("span", { class: "setup-code" }, setup.code),
       el("span", { class: "pill " + dir }, setup.direction.toUpperCase()),
@@ -928,6 +997,8 @@
       fact("TP", num(setup.target)),
       fact("Điều kiện huỷ", invalid, true),
       S.mode === "live" ? fact("Cách vùng", distanceText(setup, price), true) : null),
+    pruned ? el("p", { class: "pruned-reason" },
+      `Đã loại: ${pruned.reason || "ngược nhánh TR"}${pruned.at_ms ? ` · ${full(pruned.at_ms)}` : ""}`) : null,
     note,
     S.mode === "review" ? reviewBox(setup) : null);
   }
@@ -984,7 +1055,7 @@
   function renderTimeline(events, snapshots) {
     const rows = events.map((e) => ({
       at: e.at,
-      main: `${e.code ? letter(e.code) + " · " : ""}${e.from_status || e.to_status ? `${e.from_status || "—"} → ${e.to_status || "—"}` : e.event}`,
+      main: `${e.code ? letter(e.code) + " · " : ""}${e.from_status || e.to_status ? `${e.from_status || "—"} → ${e.to_status || "—"}` : SYSTEM_EVENT_LABEL[e.event] || e.event}`,
       sub: [e.from_status || e.to_status ? e.event : null, e.price !== null && e.price !== undefined ? `giá ${num(e.price)}` : null,
             e.notify === "sent" ? "đã gửi tin" : e.notify === "error" ? "lỗi gửi tin" : null].filter(Boolean).join(" · "),
       fail: e.notify === "error",
@@ -1198,6 +1269,12 @@
           if (S.chart) renderChart(S.chart.data, false);
         });
       });
+    // TM - #TR-BRANCH - Hien / an setup PRUNED ca o danh sach lan tren bieu do
+    $("showPruned").addEventListener("click", () => {
+      S.showPruned = !S.showPruned;
+      if (S.setupRows) renderSetups(S.setupRows.rows, S.setupRows.price);
+      if (S.chart) renderChart(S.chart.data, false);
+    });
     $("showFailed").checked = S.showFailed;
     $("showFailed").addEventListener("change", (e) => {
       S.showFailed = e.target.checked;

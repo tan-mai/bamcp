@@ -336,6 +336,14 @@ dashboard:
   default_tf: 1h
   default_bars: 96
   hide_pnl: false            # true: khong tra so PnL xuong trinh duyet, ke ca owner
+  # TM - #TR-BRANCH - Thang diem xac suat tich luy / phan phoi (prob_evidence bo trong weight thi lay so nay)
+  prob_weights:
+    htf_trend: 2             # xu huong D/H4 truoc TR
+    phase_b_lows: 1          # cau truc day pha B
+    phase_b_highs: 1         # cau truc dinh pha B
+    test_highs: 1            # hanh vi test dinh
+    test_lows: 1             # hanh vi test day
+    phase_cd_event: 3        # SPRING/SOS hoac UTAD/SOW da confirmed
 
 # Gia tri KHOI TAO. Lan dau update_rules duoc goi, ban sao ghi sang data/rules.json
 # va tu do file do la nguon su that. Sua o day chi anh huong khi rules.json chua co,
@@ -445,6 +453,7 @@ orb:
 # Quy trinh phan tich ma Claude doc luc bat tay. Sua o day, `docker compose restart`,
 # roi tat/bat lai connector trong chat de Claude doc ban moi. Khong can build lai image.
 # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: them muc "TR KHOA & WYCKOFF".
+# TM - #TR-BRANCH - Nhanh kich ban TR: them muc "NHANH KICH BAN TR".
 instructions: |
   Du lieu BTC da khung tu Binance. Moi con so phai lay tu cac tool nay,
   khong duoc uoc luong hay nho lai.
@@ -649,6 +658,22 @@ instructions: |
     da chay qua max_chase, khong duoi; BLOCKED = check_trade khong qua.
   - Vao lenh theo setup thi log_trade(..., setup_id=<code>) de setup sang FILLED.
   - Huy dung mot setup: cancel_setup(id, reason). Khong huy setup khac cung huong.
+
+  NHANH KICH BAN TR (#TR-BRANCH):
+  - Moi setup thuoc mot nhanh, save_setups BAT BUOC khai branch (accumulation chi long | distribution
+    chi short | range ca hai, fade bien pha B) va entry_event (long: SPRING SHAKEOUT TEST SOS JAC LPS BU
+    ST_B; short: UT UTAD TEST_D SOW LPSY ST_D). Them ref_event khi vao lenh sau mot event cu the (vd LPSY
+    sau SOW#1). label bo trong de server tu sinh; bao cao setup bang label, khong can mo note.
+  - TR M15 giu schematic undetermined toi khi co event pha C (khong co pha C thi pha D). Event pha C/D
+    chuyen confirmed (SPRING/SHAKEOUT/SOS/JAC -> nhanh tang; UTAD/SOW -> nhanh giam) hoac doi schematic thi
+    server TU loai moi setup chua ket thuc nguoc nhanh cua TR sang PRUNED va gui mot tin tong hop. Doc
+    branch.pruned / branch.conflicts cua update_tr va noi ro trong bao cao. conflicts = setup da FILLED
+    nguoc nhanh: vi the dang nguoc nhanh, phai noi ra.
+  - Sau khi TR co nhanh, setup nguoc nhanh bi tu choi. Event pha C sau do failed thi setup da PRUNED
+    KHONG tu khoi phuc: doc warnings, can thi luu lai qua save_setups.
+  - Moi lan update_tr gui prob_evidence (thay ca danh sach) theo thang diem: htf_trend, phase_b_lows,
+    phase_b_highs, test_highs, test_lows, phase_cd_event; side acc|dist; bo trong weight = lay thang diem.
+    Nhac den xac suat thi noi ro day la diem bang chung, chua hieu chinh thong ke.
 
   BAMCP KHONG dat lenh. plan chi la de xuat da tinh san phi va truot gia vao R.
   Neu check_orb_signal co warning 'stale_m5' hoac data_status khac 'ok' thi noi ra.

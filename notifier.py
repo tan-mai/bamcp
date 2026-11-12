@@ -296,12 +296,22 @@ def setup_alert(setup: dict[str, Any], event: dict[str, Any], tz: ZoneInfo,
     elif name == "CANCELLED":
         lines = [f"🗑 {setup['code']} · {setup['direction'].upper()} · CANCELLED",
                  f"Lý do: {details.get('reason') or '—'}"]
+    # TM - #TR-BRANCH - Setup bi loai vi nguoc nhanh TR / vi the nguoc nhanh. Thuong gui gop qua TR_BRANCH.
+    elif name == "PRUNED":
+        lines = [f"✂️ {setup['code']} · {setup['direction'].upper()} · PRUNED",
+                 f"Lý do: {details.get('reason') or '—'}"]
+    elif name == "BRANCH_CONFLICT":
+        lines = [f"⚠️ {setup['code']} · {setup['direction'].upper()} · vị thế ngược nhánh TR",
+                 f"{details.get('reason') or '—'} — setup đã FILLED, giữ nguyên trạng thái"]
     else:
         lines = [f"{setup['code']} · {name}"]
+    # Tin MISSED co dong ma setup o dong 2; cac tin khac o dong 1
+    at = 2 if name == "MISSED" else 1
     if name in HTF_EVENTS:
-        # Tin MISSED co dong ma setup o dong 2; cac tin khac o dong 1
-        at = 2 if name == "MISSED" else 1
         lines[at:at] = _htf_lines(setup)
+    # TM - #TR-BRANCH - Ten tuong minh ngay duoi dong ma setup
+    if setup.get("label"):
+        lines.insert(at, f"🏷 {setup['label']}")
     # TM - #DASHBOARD - Setup dashboard
     if link:
         lines.append(f"📊 Dashboard: {link}")
@@ -326,6 +336,20 @@ def system_alert(event: str, details: dict[str, Any], tz: ZoneInfo) -> Alert:
     elif event == "TEST":
         text = (f"✅ BAMCP test — kênh {details.get('channel') or 'thông báo'} hoạt động "
                 f"({_when(details.get('at'), tz)})")
+    # TM - #TR-BRANCH - Mot tin tong hop cho mot lan TR xac dinh nhanh
+    elif event == "TR_BRANCH":
+        pruned = details.get("pruned") or []
+        conflicts = details.get("conflicts") or []
+        rows = [f"🔀 {details.get('symbol')} · {details.get('reason')}"]
+        if pruned:
+            rows.append(f"Loại {len(pruned)} setup ngược nhánh (watcher ngừng theo dõi):")
+            rows += [f"- {s.get('label') or s.get('code')} ({s.get('code')})" for s in pruned]
+        if conflicts:
+            rows.append(f"⚠️ Vị thế ngược nhánh TR — {len(conflicts)} setup đã FILLED, giữ nguyên:")
+            rows += [f"- {s.get('label') or s.get('code')} ({s.get('code')})" for s in conflicts]
+        if details.get("link"):
+            rows.append(f"📊 Dashboard: {details['link']}")
+        text = "\n".join(rows)
     else:
         text = f"{event}: {details}"
     return Alert(text, title=event, meta={"event": event})

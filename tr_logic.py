@@ -45,6 +45,29 @@ PRICE_TOLERANCE = 0.001
 VOL_PERIOD = 20
 DELETE_WINDOW_MS = 24 * 3_600_000
 
+# TM - #TR-BRANCH - Nhanh kich ban TR
+# TR trung tinh cho toi khi co event pha C confirmed; khong co pha C thi event pha D confirmed.
+BRANCH_C = {"SPRING": "accumulation", "SHAKEOUT": "accumulation", "UTAD": "distribution"}
+BRANCH_D = {"SOS": "accumulation", "JAC": "accumulation", "SOW": "distribution"}
+BRANCH_OF_FAMILY = {"acc": "accumulation", "dist": "distribution"}
+BRANCH_WORDS = {"accumulation": ("tăng", "tích luỹ"), "distribution": ("giảm", "phân phối")}
+COUNTER_DIRECTION = {"accumulation": "short", "distribution": "long"}
+# Xac suat tich luy / phan phoi: factor -> (nhan, trong so mac dinh). Trong so sua o trang admin.
+PROB_FACTORS: dict[str, tuple[str, float]] = {
+    "htf_trend": ("Xu hướng D/H4 trước TR (cùng hướng)", 2.0),
+    "phase_b_lows": ("Cấu trúc đáy pha B (cao dần → acc / thấp dần → dist)", 1.0),
+    "phase_b_highs": ("Cấu trúc đỉnh pha B (cao dần → acc / thấp dần → dist)", 1.0),
+    "test_highs": ("Hành vi test đỉnh (cung → dist, hấp thụ → acc)", 1.0),
+    "test_lows": ("Hành vi test đáy (hấp thụ → acc, không có cầu → dist)", 1.0),
+    "phase_cd_event": ("Sự kiện pha C/D đã confirmed (SPRING/SOS → acc; UTAD/SOW → dist)", 3.0),
+}
+PROB_SIDES = ("acc", "dist")
+PROB_KEYS = ("prob_evidence", "prob_accumulation", "prob_distribution")
+PROB_EVENT_TYPES = {"acc": ("SPRING", "SHAKEOUT", "SOS", "JAC"), "dist": ("UTAD", "SOW")}
+PROB_WEIGHT_MAX = 100.0
+PROB_ITEMS_MAX = 30
+PROB_TEXT_MAX = 300
+
 
 @dataclass
 class Ctx:
@@ -56,6 +79,8 @@ class Ctx:
     stamp: Callable[[int], str]
     now_ms: int
     created_by: str = "claude"
+    # TM - #TR-BRANCH - Thang diem xac suat dang ap dung (trang admin); None = mac dinh
+    prob_weights: dict[str, float] | None = None
 
 
 # ---------------------------------------------------------------- danh muc
@@ -242,6 +267,157 @@ def decorate_tr(tr: dict[str, Any] | None) -> dict[str, Any] | None:
         event["phase"] = _group_of(event, phases)
         event["confirmed_by_label"] = labels.get(event.get("confirmed_by"))
     out["events"] = events
+    # TM - #TR-BRANCH - Nhanh kich ban TR va xac suat tich luy / phan phoi
+    info = branch_of(out)
+    out["branch"] = info["branch"] if info else None
+    out["branch_by"] = info
+    out["prob_evidence"] = [dict(e) for e in tr.get("prob_evidence") or [] if isinstance(e, dict)]
+    out["prob_accumulation"] = tr.get("prob_accumulation")
+    out["prob_distribution"] = tr.get("prob_distribution")
+    return out
+
+
+# ---------------------------------------------------------------- nhanh kich ban
+# TM - #TR-BRANCH - Nhanh kich ban TR
+
+def branch_of(tr: dict[str, Any]) -> dict[str, Any] | None:
+    """Nhanh suy ra tu trang thai TR, khong luu rieng. Uu tien event pha C confirmed (muon nhat), roi
+    event pha D confirmed khi khong co pha C, roi ho cua schematic. schematic_allows dam bao event chua
+    failed cung ho voi schematic, nen ba nguon khong mau thuan nhau."""
+    events = tr.get("events") or []
+    for table in (BRANCH_C, BRANCH_D):
+        hits = [e for e in events if e.get("status") == "confirmed" and e.get("type") in table]
+        if hits:
+            event = max(hits, key=lambda e: (int(e["t"]), int(e.get("seq") or 0)))
+            return {"branch": table[event["type"]], "by": "event", "ref": event.get("ref"),
+                    "label": event.get("label"), "event_id": event.get("id"), "type": event["type"],
+                    "phase": usual_phase(event["type"]), "t": int(event["t"])}
+    family = family_of(tr.get("schematic"))
+    if family:
+        return {"branch": BRANCH_OF_FAMILY[family], "by": "schematic", "schematic": tr.get("schematic")}
+    return None
+
+
+def branch_source(info: dict[str, Any]) -> str:
+    if info.get("by") == "event":
+        return f"{info.get('ref') or info.get('type')} (pha {info.get('phase')})"
+    return f"schematic {info.get('schematic')}"
+
+
+def branch_reason(info: dict[str, Any]) -> str:
+    """Vd 'TR xác định nhánh giảm bởi UTAD#1 (pha C)'."""
+    return f"TR xác định nhánh {BRANCH_WORDS[info['branch']][0]} bởi {branch_source(info)}"
+
+
+def branch_events(events: list[dict[str, Any]], branch: str) -> list[dict[str, Any]]:
+    """Event pha C/D confirmed cung nhanh: bang chung de doi schematic ra khoi undetermined."""
+    return [e for e in events if e.get("status") == "confirmed"
+            and {**BRANCH_C, **BRANCH_D}.get(e.get("type")) == branch]
+
+
+# ---------------------------------------------------------------- xac suat tich luy / phan phoi
+# TM - #TR-BRANCH - Diem bang chung, chua hieu chinh thong ke
+
+def default_weights() -> dict[str, float]:
+    return {key: weight for key, (_, weight) in PROB_FACTORS.items()}
+
+
+def _weight(value: Any, name: str) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} phai la so, nhan duoc {value!r}") from None
+    if not math.isfinite(out) or not 0 < out <= PROB_WEIGHT_MAX:
+        raise ValueError(f"{name} phai > 0 va <= {PROB_WEIGHT_MAX:g}")
+    return out
+
+
+def clean_weights(raw: Any) -> dict[str, float]:
+    """Thang diem tu trang admin. O trong = trong so mac dinh."""
+    if not isinstance(raw, dict):
+        raise ValueError("prob_weights phai la object {factor: trong so}")
+    unknown = sorted(set(raw) - set(PROB_FACTORS))
+    if unknown:
+        raise ValueError(f"prob_weights co factor khong ho tro: {unknown}; chi nhan {list(PROB_FACTORS)}")
+    out = default_weights()
+    for key, value in raw.items():
+        if value not in (None, ""):
+            out[key] = _weight(value, f"prob_weights.{key}")
+    return out
+
+
+def clean_evidence(raw: Any, weights: dict[str, float] | None = None) -> tuple[list[dict[str, Any]], list[str]]:
+    """prob_evidence thay ca danh sach moi lan gui. factor co trong thang diem thi bo trong weight = lay
+    trong so cua thang diem; factor ngoai thang diem phai khai weight. Loi nao cung tu choi ca danh sach."""
+    if not isinstance(raw, list):
+        raise ValueError("prob_evidence phai la list [{factor, side: acc|dist, weight?, note?}]")
+    if len(raw) > PROB_ITEMS_MAX:
+        raise ValueError(f"prob_evidence toi da {PROB_ITEMS_MAX} dong")
+    scale = {**default_weights(), **(weights or {})}
+    out: list[dict[str, Any]] = []
+    errors: list[str] = []
+    warnings: list[str] = []
+    first: dict[str, int] = {}
+    for index, item in enumerate(raw):
+        label = f"prob_evidence[{index}]"
+        try:
+            if not isinstance(item, dict):
+                raise ValueError(f"{label} phai la object {{factor, side, weight?, note?}}")
+            text = str(item.get("factor") or "").strip()
+            if not text:
+                raise ValueError(f"{label}: thieu factor")
+            if len(text) > PROB_TEXT_MAX:
+                raise ValueError(f"{label}: factor dai qua {PROB_TEXT_MAX} ky tu")
+            factor = text.lower() if text.lower() in PROB_FACTORS else text
+            side = str(item.get("side") or "").strip().lower()
+            if side not in PROB_SIDES:
+                raise ValueError(f"{label}: side phai la acc hoac dist, nhan duoc {item.get('side')!r}")
+            known = scale.get(factor) if factor in PROB_FACTORS else None
+            if item.get("weight") in (None, ""):
+                if known is None:
+                    raise ValueError(f"{label}: factor {factor!r} ngoai thang diem phai khai weight")
+                weight = known
+            else:
+                weight = _weight(item["weight"], f"{label}.weight")
+                if known is not None and not math.isclose(weight, known):
+                    warnings.append(f"{label}: weight {weight:g} khac thang diem {factor} = {known:g}")
+            if known is None:
+                warnings.append(f"{label}: factor {factor!r} khong co trong thang diem {list(PROB_FACTORS)}")
+            if factor in first:
+                warnings.append(f"{label}: {factor} khai lan hai (lan dau o prob_evidence[{first[factor]}]), "
+                                "trong so cong don")
+            first.setdefault(factor, index)
+            note = str(item.get("note") or "").strip() or None
+            if note and len(note) > PROB_TEXT_MAX:
+                raise ValueError(f"{label}: note dai qua {PROB_TEXT_MAX} ky tu")
+            out.append({"factor": factor, "side": side, "weight": weight, "note": note})
+        except ValueError as exc:
+            errors.append(str(exc))
+    if errors:
+        raise ValueError("; ".join(errors))
+    return out, warnings
+
+
+def prob_split(evidence: list[dict[str, Any]]) -> tuple[int | None, int | None]:
+    """(prob_accumulation, prob_distribution): acc = Σacc / Σ x 100 lam tron nua len, dist = 100 - acc."""
+    total = sum(float(e["weight"]) for e in evidence)
+    if total <= 0:
+        return None, None
+    acc = sum(float(e["weight"]) for e in evidence if e["side"] == "acc")
+    pct = int(math.floor(acc / total * 100 + 0.5))
+    return pct, 100 - pct
+
+
+def evidence_warnings(evidence: list[dict[str, Any]], events: list[dict[str, Any]]) -> list[str]:
+    """phase_cd_event khai ma TR chua co event C/D confirmed cung ben: chi canh bao."""
+    out = []
+    for item in evidence:
+        if item["factor"] != "phase_cd_event":
+            continue
+        kinds = PROB_EVENT_TYPES[item["side"]]
+        if not any(e.get("status") == "confirmed" and e.get("type") in kinds for e in events):
+            out.append(f"prob_evidence phase_cd_event ben {item['side']} nhung TR chua co "
+                       f"{'/'.join(kinds)} confirmed")
     return out
 
 
@@ -293,6 +469,9 @@ def validate_tr_input(raw: Any, *, parse_time: Callable[[Any], int | None],
         out["fields"]["note"] = str(raw["note"]).strip() or None
     if out["redraw_rule"]:
         out["fields"]["redraw_rule"] = out["redraw_rule"]
+    # TM - #TR-BRANCH - Diem bang chung, kiem tra trong plan_changes nhu update_tr
+    if raw.get("prob_evidence") is not None:
+        out["fields"]["prob_evidence"] = raw["prob_evidence"]
     return out
 
 
@@ -478,6 +657,16 @@ def plan_changes(tr: dict[str, Any], ctx: Ctx, *, fields: dict[str, Any] | None 
     for key in ("note", "redraw_rule"):
         if key in fields:
             out_fields[key] = str(fields[key] or "").strip() or None
+    # TM - #TR-BRANCH - prob_evidence thay ca danh sach; server tinh prob_accumulation / prob_distribution
+    evidence = None
+    if fields.get("prob_evidence") is not None:
+        try:
+            evidence, prob_warnings = clean_evidence(fields["prob_evidence"], ctx.prob_weights)
+            warnings.extend(prob_warnings)
+            acc, dist = prob_split(evidence)
+            out_fields.update(prob_evidence=evidence, prob_accumulation=acc, prob_distribution=dist)
+        except ValueError as exc:
+            errors.append(str(exc))
     out_fields = {k: v for k, v in out_fields.items() if v != tr.get(k)}
     schematic = out_fields.get("schematic", tr["schematic"])
 
@@ -577,14 +766,26 @@ def plan_changes(tr: dict[str, Any], ctx: Ctx, *, fields: dict[str, Any] | None 
         if follow and event["status"] == "confirmed" and not any(
                 e["type"] == follow and e["status"] != "failed" and int(e["t"]) > int(event["t"]) for e in after):
             warnings.append(f"{event['label']} confirmed nhung chua co {follow} sau no")
+    # TM - #TR-BRANCH - TR giu undetermined toi khi co event pha C (hoac D); doi schematic van xac dinh nhanh
+    family = family_of(out_fields.get("schematic"))
+    if family and not branch_events(after, BRANCH_OF_FAMILY[family]):
+        warnings.append(f"schematic {schematic} nhung chua co event pha C/D confirmed cung nhanh - TR nen giu "
+                        "undetermined toi khi co SPRING/UTAD (khong co pha C thi SOS/SOW); doi schematic van "
+                        "loai setup nguoc nhanh")
+    if evidence is not None:
+        warnings.extend(evidence_warnings(evidence, after))
 
     phases_changed = new_phases is not None and _phase_rows(new_phases) != _phase_rows(tr["phases"])
+    prob_changed = any(key in out_fields for key in PROB_KEYS)
     return {
         "fields": out_fields, "insert": inserted, "update": updates,
         "phases": new_phases if phases_changed else None,
         "seq": {e["id"]: e["seq"] for e in after},
         "warnings": list(dict.fromkeys(warnings)),
         "changed": bool(out_fields or inserted or updates or phases_changed),
+        # TM - #TR-BRANCH - Dong lich su xac suat ghi cung giao dich voi TR
+        "prob": ({"evidence": evidence, **dict(zip(PROB_KEYS[1:], prob_split(evidence)))}
+                 if prob_changed and evidence is not None else None),
     }
 
 

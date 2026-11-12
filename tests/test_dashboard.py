@@ -420,12 +420,14 @@ def flat_rows(span: int, count: int, *, price: float = 80000.0, volume: float = 
 
 SETUP_A = {"direction": "long", "zone_low": 75400, "zone_high": 75560, "trigger_type": "rejection",
            "trigger_params": {"max_vol_mult": 0.8}, "entry": 75480, "stop": 75090, "target": 76330,
-           "invalidate_level": 75158, "tr_high": 76976.7, "tr_low": 75525, "note": "A long test"}
+           "invalidate_level": 75158, "tr_high": 76976.7, "tr_low": 75525, "note": "A long test",
+           "branch": "accumulation", "entry_event": "TEST"}  # TM - #TR-BRANCH - truong bat buoc
 SETUP_B = {"direction": "short", "zone_low": 77320, "zone_high": 77600, "trigger_type": "rejection",
            "trigger_params": {"max_vol_mult": 0.8}, "entry": 77420, "stop": 77760, "target": 76560,
-           "invalidate_level": 77700, "note": "B short"}
+           "invalidate_level": 77700, "note": "B short", "branch": "range", "entry_event": "UT"}
 SETUP_B_0511 = {"direction": "long", "zone_low": 81400, "zone_high": 81600, "trigger_type": "close_above",
-                "entry": 81500, "stop": 81200, "target": 83000, "invalidate_level": 81350, "m15_filter": False}
+                "entry": 81500, "stop": 81200, "target": 83000, "invalidate_level": 81350, "m15_filter": False,
+                "branch": "accumulation", "entry_event": "SOS"}
 REAL_TR = {"timeframe": "15m", "tr_high": 76976.7, "tr_low": 75525, "since": "2026-11-05 22:45",
            "events": [{"type": "SC", "t": "2026-11-05 22:45", "price": 75525},
                       {"type": "AR", "t": "2026-11-05 23:15", "price": 76976.7},
@@ -452,6 +454,7 @@ def wipe() -> None:
         raise RuntimeError(f"test chi duoc chay tren thu muc tam, dang tro vao {server.SQLITE_PATH}")
     with sqlite_db.connect(server.SQLITE_PATH) as conn:
         for table in ("tr_events", "tr_phases", "tr_event_deletions",  # TM - #WYCKOFF-TR
+                      "tr_prob_history",  # TM - #TR-BRANCH
                       "scenarios", "trading_ranges", "plan_snapshots", "setup_reviews", "setups", "setup_events",
                       "dashboard_users", "dashboard_sessions", "dashboard_audit", "dashboard_login_log",
                       "dashboard_login_guard", "admin_sessions"):

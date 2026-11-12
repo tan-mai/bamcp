@@ -13,7 +13,7 @@ Deep link, cũng là dạng `dashboard_url` mà tool và tin push trả về: `/
 
 ## Quy trình cho Claude
 
-1. `get_chart_data(symbol, "15m", 96+)` đọc TR, pha, event → `update_tr` một lần với mọi thay đổi Wyckoff → `save_bias` → `save_setups` (kèm `event_ref`, `expects`) → `save_scenarios`. Mỗi lần lưu sinh một snapshot bất biến (`plan_snapshots`).
+1. `get_chart_data(symbol, "15m", 96+)` đọc TR, pha, event → `update_tr` một lần với mọi thay đổi Wyckoff và `prob_evidence` → `save_bias` → `save_setups` (kèm `branch`, `entry_event`, `event_ref`, `expects`) → `save_scenarios`. Mỗi lần lưu sinh một snapshot bất biến (`plan_snapshots`).
 2. Cần vẽ biểu đồ inline thì gọi `get_chart_data`, cùng một nguồn với trang.
 3. Cuối ngày: `get_chart_data(date=..., revision="origin")` để so kế hoạch gốc với nến thật, rồi `save_review`.
 
@@ -66,6 +66,46 @@ Số VSA tính trên nến của event: `vol_ratio` = vol / SMA20 của 20 nến
 
 **Chuyển dữ liệu cũ.** Lúc khởi động, event trong cột json `events` cũ của mỗi TR được chuyển thành dòng `tr_events` (`tentative`, `created_by = claude`, tính lại `seq`, `side`, số VSA từ nến). Cột json cũ giữ lại tới khi nghiệm thu xong. Snapshot cũ giữ nguyên và vẫn đọc được.
 
+## Nhánh kịch bản và xác suất
+
+TR khoá M15 trung tính (`branch = null`) cho tới khi có sự kiện pha C, hoặc pha D nếu không có pha C. Nhánh không lưu riêng: server suy ra mỗi lần đọc TR, nên snapshot cũ cũng tính lại được.
+
+| Nguồn (theo thứ tự ưu tiên) | Nhánh tăng (`accumulation`) | Nhánh giảm (`distribution`) |
+|---|---|---|
+| Event pha C `confirmed` (lấy event muộn nhất) | `SPRING`, `SHAKEOUT` | `UTAD` |
+| Không có pha C: event pha D `confirmed` | `SOS`, `JAC` | `SOW` |
+| Không có event nào: `schematic` | `accumulation`, `reaccumulation` | `distribution`, `redistribution` |
+
+Đổi `schematic` sang một họ khi chưa có event pha C/D `confirmed` cùng nhánh thì vẫn xác định nhánh, kèm cảnh báo.
+
+**Loại setup ngược nhánh.** Mỗi lần `update_tr` hoặc `save_scenarios` ghi TR, nếu nhánh vừa được xác định hoặc đổi:
+
+- Mọi setup **chưa kết thúc** của TR đó có hướng ngược nhánh (kể cả `branch=range`) chuyển `PRUNED`, trạng thái kết thúc, watcher ngừng theo dõi. Event `PRUNED` của setup ghi `reason`, vd `TR xác định nhánh giảm bởi UTAD#1 (pha C)`.
+- Setup đã `FILLED` mà review chưa ghi lệnh đã đóng thì giữ nguyên, chỉ ghi event `BRANCH_CONFLICT` và cảnh báo "vị thế ngược nhánh TR".
+- Gửi **một** tin tổng hợp (event hệ thống `TR_BRANCH`) liệt kê label bị loại và vị thế ngược nhánh.
+- Kết quả tool có khối `branch` gồm `reason`, `pruned`, `conflicts`. Snapshot mới cho hôm nay và cho mọi ngày có setup vừa bị loại.
+- Event pha C/D sau đó chuyển `failed`: không tự khôi phục setup đã `PRUNED`, chỉ trả `warnings` để Claude lưu lại nếu cần.
+- Sau khi TR có nhánh, `save_setups` từ chối setup ngược nhánh.
+
+**Xác suất tích luỹ / phân phối.** `update_tr(prob_evidence=[{factor, side: acc|dist, weight?, note?}])` thay toàn bộ danh sách mỗi lần gửi (`[]` là xoá). `prob_accumulation` = Σ trọng số `acc` / Σ trọng số × 100 (làm tròn nửa lên), `prob_distribution` = 100 − `prob_accumulation`. Mỗi lần đổi ghi một dòng `tr_prob_history` gắn plan revision. Đây là điểm bằng chứng, chưa hiệu chỉnh thống kê.
+
+| `factor` | Yếu tố | Trọng số mặc định |
+|---|---|---|
+| `htf_trend` | Xu hướng D/H4 trước TR (cùng hướng) | 2 |
+| `phase_b_lows` | Cấu trúc đáy pha B (cao dần → acc / thấp dần → dist) | 1 |
+| `phase_b_highs` | Cấu trúc đỉnh pha B (cao dần → acc / thấp dần → dist) | 1 |
+| `test_highs` | Hành vi test đỉnh (cung → dist, hấp thụ → acc) | 1 |
+| `test_lows` | Hành vi test đáy (hấp thụ → acc, không có cầu → dist) | 1 |
+| `phase_cd_event` | Sự kiện pha C/D đã confirmed (SPRING/SOS → acc; UTAD/SOW → dist) | 3 |
+
+Bỏ trống `weight` thì lấy trọng số đang đặt ở `/admin/dashboard-accounts` (card "Thang điểm xác suất TR"). Factor ngoài bảng phải khai `weight`. Chỉ cảnh báo, không từ chối: `weight` khác thang điểm, factor ngoài bảng, factor khai hai lần, `phase_cd_event` mà TR chưa có event C/D `confirmed` cùng bên.
+
+**Trên dashboard**
+
+- Thẻ TR có banner nhánh, vd `Pha C: UTAD#1 → Nhánh giảm (phân phối)`, thanh % tích luỹ / phân phối, danh sách bằng chứng (yếu tố, bên, trọng số, note) và diễn biến xác suất trong ngày.
+- Setup `PRUNED` ẩn mặc định khỏi danh sách và biểu đồ. Nút "Hiện setup đã loại (n)" hiện lại, thẻ setup ghi lý do loại.
+- Thẻ setup dùng `label` làm tiêu đề, mã nằm ở dòng dưới.
+
 ## Tài khoản và quyền
 
 Tài khoản nằm trong bảng `dashboard_users`. Mật khẩu hash argon2, không dùng chung với admin: phiên admin không vào được dashboard và ngược lại.
@@ -104,7 +144,7 @@ Mặc định Review vẽ **kế hoạch gốc**: mỗi phần (bias, setup, k�
 
 **`save_review`** ghi đè `outcome`, không đụng `auto_outcome`. Khi lưu, `tp_hit` chuyển kịch bản active gắn với setup sang `played_out`; `sl_hit`, `invalidated` sang `failed`.
 
-**Thống kê.** Win rate = thắng / lệnh đã đóng (`tp_hit`, `sl_hit`, `be`, `manual_exit`). Thắng là `tp_hit`, hoặc `be` / `manual_exit` có R dương. R trung bình chỉ tính setup có `r_multiple`. Nhóm theo `phase` (pha lúc tạo setup), `event_ref_type`, `expects`, `schematic` (của TR liên kết), hoặc nhóm chéo `direction,event_ref_type,phase`. Setup không có giá trị nằm ở nhóm `chua_co`.
+**Thống kê.** Win rate = thắng / lệnh đã đóng (`tp_hit`, `sl_hit`, `be`, `manual_exit`). Thắng là `tp_hit`, hoặc `be` / `manual_exit` có R dương. R trung bình chỉ tính setup có `r_multiple`. Nhóm theo `phase` (pha lúc tạo setup), `event_ref_type`, `expects`, `schematic` (của TR liên kết), `branch`, `entry_event`, hoặc nhóm chéo `direction,event_ref_type,phase`. Setup không có giá trị nằm ở nhóm `chua_co`.
 
 ## Cấu hình
 
@@ -112,6 +152,7 @@ Khối `dashboard` trong `config.yaml` là giá trị khởi tạo. Sửa ở `/
 
 - `enabled: false`: mọi route trả 404 và tool không trả link.
 - `hide_pnl: true`: số PnL không xuống trình duyệt, kể cả owner.
+- `prob_weights`: thang điểm xác suất TR ([chi tiết](#nhánh-kịch-bản-và-xác-suất)).
 
 Nến đang chạy: kho SQLite không lưu nến chưa đóng nên server ghép từ các nến M5 đã đóng, trễ tối đa một nến M5. Khung 5M vì thế không có nến đang chạy.
 

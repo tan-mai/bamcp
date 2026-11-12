@@ -4,9 +4,12 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
+import tr_logic  # TM - #TR-BRANCH - ref_event dung chung danh muc event Wyckoff
+
+# TM - #TR-BRANCH - PRUNED: TR xac dinh nhanh, setup nguoc nhanh bi loai (terminal, watcher bo qua)
 STATUSES = ("WAITING", "IN_ZONE", "TRIGGERED", "CONFIRMED", "ENTRY_VALID", "MISSED",
-            "BLOCKED", "FILLED", "INVALIDATED", "EXPIRED", "CANCELLED")
-TERMINAL = ("FILLED", "INVALIDATED", "EXPIRED", "CANCELLED")
+            "BLOCKED", "FILLED", "INVALIDATED", "EXPIRED", "CANCELLED", "PRUNED")
+TERMINAL = ("FILLED", "INVALIDATED", "EXPIRED", "CANCELLED", "PRUNED")
 FILLABLE = ("TRIGGERED", "CONFIRMED", "ENTRY_VALID", "MISSED")
 DIRECTIONS = ("long", "short")
 TRIGGERS: dict[str, tuple[str, ...]] = {
@@ -45,6 +48,20 @@ RETEST_LOOKBACK = 288
 # TM - #ENTRY-HTF - Huong khung lon luu kem setup: (khoa trong htf, timeframe, nhan hien thi)
 HTF_FRAMES = (("w", "1w", "W"), ("d", "1d", "D"), ("h4", "4h", "H4"))
 HTF_WORDS = {"up": "tăng", "down": "giảm", "range": "đi ngang"}
+# TM - #TR-BRANCH - Nhanh kich ban cua setup: (ma, nhan, huong duoc phep). range = fade bien trong pha B.
+SETUP_BRANCHES: dict[str, tuple[str, str, tuple[str, ...]]] = {
+    "accumulation": ("ACC", "TÍCH LUỸ", ("long",)),
+    "distribution": ("DIST", "PHÂN PHỐI", ("short",)),
+    "range": ("RNG", "RANGE", ("long", "short")),
+}
+# Su kien vao lenh -> huong. Event tich luy la diem vao long, event phan phoi la diem vao short.
+ENTRY_EVENTS: dict[str, str] = {
+    "SPRING": "long", "SHAKEOUT": "long", "TEST": "long", "SOS": "long", "JAC": "long", "LPS": "long",
+    "BU": "long", "ST_B": "long",
+    "UT": "short", "UTAD": "short", "TEST_D": "short", "SOW": "short", "LPSY": "short", "ST_D": "short",
+}
+NO_PHASE = "X"
+LABEL_MAX = 160
 
 
 class InsufficientData(Exception):
@@ -94,6 +111,64 @@ def code_letters(index: int) -> str:
 def code_base(symbol: str) -> str:
     sym = symbol.upper()
     return sym[:-4] if sym.endswith("USDT") and len(sym) > 4 else sym
+
+
+# TM - #TR-BRANCH - Ten setup tuong minh
+def fmt_price(value: Any) -> str:
+    number = float(value)
+    return f"{number:.2f}".rstrip("0").rstrip(".") if abs(number) >= 100 else f"{number:.6g}"
+
+
+def validate_name(raw: dict[str, Any], direction: str) -> dict[str, Any]:
+    """branch, entry_event (bat buoc), ref_event, label (tuy chon). Sai thi tu choi setup kem ly do."""
+    branch = str(raw.get("branch") or "").strip().lower()
+    if not branch:
+        raise ValueError(f"thieu truong bat buoc branch ({' | '.join(SETUP_BRANCHES)})")
+    if branch not in SETUP_BRANCHES:
+        raise ValueError(f"branch phai la mot trong {list(SETUP_BRANCHES)}, nhan duoc {raw.get('branch')!r}")
+    allowed = SETUP_BRANCHES[branch][2]
+    if direction not in allowed:
+        raise ValueError(f"branch={branch} chi nhan {'/'.join(allowed)}, setup nay la {direction}")
+    event = str(raw.get("entry_event") or "").strip().upper()
+    if not event:
+        raise ValueError(f"thieu truong bat buoc entry_event (mot trong {list(ENTRY_EVENTS)})")
+    if event not in ENTRY_EVENTS:
+        raise ValueError(f"entry_event phai la mot trong {list(ENTRY_EVENTS)}, nhan duoc {raw.get('entry_event')!r}")
+    if ENTRY_EVENTS[event] != direction:
+        raise ValueError(f"entry_event {event} la diem vao {ENTRY_EVENTS[event]}, setup nay la {direction}")
+    try:
+        ref = tr_logic.clean_event_ref(raw.get("ref_event"))
+    except ValueError as exc:
+        raise ValueError(f"ref_event: {exc}") from None
+    label = " ".join(str(raw.get("label") or "").split()) or None
+    if label and len(label) > LABEL_MAX:
+        raise ValueError(f"label dai qua {LABEL_MAX} ky tu")
+    return {"branch": branch, "entry_event": event, "ref_event": ref, "label": label}
+
+
+def code_prefix(symbol: str, setup: dict[str, Any]) -> str:
+    """{SYM}-{yyyymmdd}-{L|S}-{ACC|DIST|RNG}-{pha}-{entry_event}- ; so thu tu n do kho them vao."""
+    return "-".join([code_base(symbol), str(setup["bias_date"]).replace("-", ""),
+                     "L" if setup["direction"] == "long" else "S", SETUP_BRANCHES[setup["branch"]][0],
+                     setup.get("phase") or NO_PHASE, setup["entry_event"]]) + "-"
+
+
+def setup_label(setup: dict[str, Any]) -> str:
+    """'BTC 12/11 · SHORT · PHÂN PHỐI · Pha D · LPSY sau SOW#1 · 72400–72740'. Setup cu chua co
+    branch / entry_event thi bo phan do, lay event_ref hoac trigger_type thay cho su kien vao lenh."""
+    day = str(setup.get("bias_date") or "")
+    head = code_base(str(setup.get("symbol") or "")) + (f" {day[8:10]}/{day[5:7]}" if len(day) == 10 else "")
+    parts = [head, str(setup.get("direction") or "").upper()]
+    if setup.get("branch") in SETUP_BRANCHES:
+        parts.append(SETUP_BRANCHES[setup["branch"]][1])
+    if setup.get("phase"):
+        parts.append(f"Pha {setup['phase']}")
+    event = setup.get("entry_event") or setup.get("event_ref") or setup.get("trigger_type")
+    if event:
+        parts.append(str(event) + (f" sau {setup['ref_event']}" if setup.get("ref_event") else ""))
+    if setup.get("zone_low") is not None and setup.get("zone_high") is not None:
+        parts.append(f"{fmt_price(setup['zone_low'])}–{fmt_price(setup['zone_high'])}")
+    return " · ".join(p for p in parts if p)
 
 
 # TM - #ENTRY-HTF - Huong khung lon cua setup

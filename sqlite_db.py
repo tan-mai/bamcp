@@ -259,6 +259,30 @@ ALTER TABLE setups ADD COLUMN event_ref TEXT;
 ALTER TABLE setups ADD COLUMN expects TEXT;
 ALTER TABLE setups ADD COLUMN phase TEXT;
 """,
+    # TM - #TR-BRANCH - Nhanh kich ban TR
+    # Nhanh cua TR khong luu: suy ra tu event va schematic moi lan doc (snapshot cu cung tinh lai duoc).
+    # tr_prob_history: moi lan prob_evidence doi, gan plan revision sinh ra cung lan ghi.
+    """
+ALTER TABLE setups ADD COLUMN branch TEXT;
+ALTER TABLE setups ADD COLUMN entry_event TEXT;
+ALTER TABLE setups ADD COLUMN ref_event TEXT;
+ALTER TABLE setups ADD COLUMN label TEXT;
+CREATE INDEX IF NOT EXISTS ix_setups_tr ON setups(tr_id, status);
+ALTER TABLE trading_ranges ADD COLUMN prob_evidence TEXT;
+ALTER TABLE trading_ranges ADD COLUMN prob_accumulation INTEGER;
+ALTER TABLE trading_ranges ADD COLUMN prob_distribution INTEGER;
+CREATE TABLE IF NOT EXISTS tr_prob_history (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  tr_id             TEXT NOT NULL REFERENCES trading_ranges(id),
+  at                INTEGER NOT NULL,
+  prob_accumulation INTEGER,
+  prob_distribution INTEGER,
+  evidence          TEXT NOT NULL,
+  bias_date         TEXT,
+  plan_revision     INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_tr_prob_history ON tr_prob_history(tr_id, at);
+""",
 ]
 
 _MIGRATED: set[str] = set()

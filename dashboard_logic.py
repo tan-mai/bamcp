@@ -17,7 +17,9 @@ OUTCOMES = ("tp_hit", "sl_hit", "be", "manual_exit", "not_triggered", "missed", 
 CLOSED_OUTCOMES = ("tp_hit", "sl_hit", "be", "manual_exit")
 GROUP_BY = ("trigger_type", "direction", "symbol",
             # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
-            "phase", "event_ref_type", "expects", "schematic")
+            "phase", "event_ref_type", "expects", "schematic",
+            # TM - #TR-BRANCH - Nhanh kich ban TR
+            "branch", "entry_event")
 # Nhom khong co gia tri (setup luu truoc khi co TR, hoac khong khai) gom vao day
 NO_GROUP = "chua_co"
 MARKER_EVENTS = ("IN_ZONE", "TRIGGERED", "MISSED", "INVALIDATED", "EXPIRED")

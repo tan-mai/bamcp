@@ -4363,6 +4363,9 @@ def _setup_view(setup: dict[str, Any], last: dict[str, Any] | None = None) -> di
     out["invalidate_after_confirm"] = bool(setup.get("invalidate_after_confirm"))
     # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
     out.update({k: setup.get(k) for k in ("tr_id", "event_ref", "expects", "phase")})
+    # TM - #TR-BRANCH - Nhanh kich ban va ten tuong minh. Setup cu chua co label thi ghep tu truong dang co.
+    out.update({k: setup.get(k) for k in ("branch", "entry_event", "ref_event")})
+    out["label"] = setup.get("label") or entry_logic.setup_label(setup)
     out["state"] = {k: state[k] for k in ("max_chase", "x_max", "min_rr", "last_price",
                                           "came_from", "zone_alerted", "confirm_count",
                                           "entry_valid_count", "trigger", "confirm",
@@ -4371,6 +4374,10 @@ def _setup_view(setup: dict[str, Any], last: dict[str, Any] | None = None) -> di
         out["state"]["last_candle"] = _stamp(state["last_candle"])
     if state.get("triggered_at"):
         out["state"]["triggered_at"] = _stamp(state["triggered_at"])
+    if isinstance(state.get("pruned"), dict):
+        pruned = state["pruned"]
+        out["state"]["pruned"] = {**pruned, "at": _stamp(pruned["at"]) if pruned.get("at") else None,
+                                  "at_ms": pruned.get("at")}
     if last:
         out["last_event"] = _event_view(last)
     return out
@@ -4383,6 +4390,8 @@ def _event_view(event: dict[str, Any]) -> dict[str, Any]:
     out["candle"] = _stamp(event["candle_open_time"]) if event.get("candle_open_time") else None
     if event.get("code") or event.get("symbol"):
         out["code"], out["symbol"] = event.get("code"), event.get("symbol")
+        # TM - #TR-BRANCH - Nhanh kich ban TR
+        out.update(label=event.get("label"), branch=event.get("branch"))
     return out
 
 
@@ -4435,9 +4444,19 @@ def _setup_tr_link(symbol: str, raw: dict[str, Any], clean: dict[str, Any],
     expects = tr_logic.event_type(raw["expects"]) if str(raw.get("expects") or "").strip() else None
     clean.update(tr_id=tr["id"] if tr else None, phase=tr["current_phase"] if tr else None,
                  event_ref=event_ref, expects=expects)
-    if tr is None:
-        return []
+    # TM - #TR-BRANCH - event_ref la mot lan cu the cua entry_event: khac loai thi canh bao
     warnings = []
+    if event_ref and clean.get("entry_event") and tr_logic.ref_type(event_ref) != clean["entry_event"]:
+        warnings.append(f"event_ref {event_ref} khac entry_event {clean['entry_event']}")
+    if tr is None:
+        return warnings
+    # TM - #TR-BRANCH - TR da xac dinh nhanh thi khong nhan setup nguoc nhanh: luu vao cung khong con nghia
+    if tr.get("branch") and clean["direction"] == tr_logic.COUNTER_DIRECTION[tr["branch"]]:
+        raise ValueError(f"{tr_logic.branch_reason(tr['branch_by'])} - setup {clean['direction']} nguoc nhanh, "
+                         f"khong luu (TR {tr['id']})")
+    ref_event = clean.get("ref_event")
+    if ref_event and "#" in ref_event and not any(e["ref"] == ref_event for e in tr["events"]):
+        warnings.append(f"ref_event {ref_event} chua co tren TR")
     for key, source, show in (("tr_high", "tr_high", lambda v: f"{float(v):.10g}"),
                               ("tr_low", "tr_low", lambda v: f"{float(v):.10g}"),
                               ("tr_since", "since", lambda v: _stamp(int(v))[:16])):
@@ -4471,6 +4490,8 @@ def _save_setups(symbol: str, setups: list[dict[str, Any]], replace: bool,
                 raw, min_rr=min_rr, now_ms=now, parse_time=_parse_moment,
                 default_expiry=lambda day: _parse_moment(day, end=True),
                 default_day=_today(), default_m15=bool(params.get("m15_filter", True)))
+            # TM - #TR-BRANCH - Nhanh kich ban va ten tuong minh: sai la tu choi kem ly do
+            clean.update(entry_logic.validate_name(raw, clean["direction"]))
             if (price is not None and not clean["invalidate_after_confirm"]
                     and entry_logic.invalidate_broken(clean["direction"], clean["invalidate_level"], price)):
                 raise ValueError(f"invalidate_level {clean['invalidate_level']:.10g} da bi pha tai gia "
@@ -4478,6 +4499,8 @@ def _save_setups(symbol: str, setups: list[dict[str, Any]], replace: bool,
             # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
             link_warnings = _setup_tr_link(symbol, raw, clean, active_tr)
             warnings.extend(f"setup[{index}]: {w}" for w in link_warnings)
+            # TM - #TR-BRANCH - label bo trong thi server sinh (can phase cua TR nen dat sau khi lien ket)
+            clean["label"] = clean["label"] or entry_logic.setup_label({**clean, "symbol": symbol})
             cleaned.append((index, clean))
         except ValueError as exc:
             rejected.append({"index": index, "error": str(exc)})
@@ -4504,6 +4527,8 @@ def _save_setups(symbol: str, setups: list[dict[str, Any]], replace: bool,
                       "htf_counter": entry_logic.htf_counter(row["direction"], row["htf"]),
                       # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
                       **{k: row[k] for k in ("tr_id", "phase", "event_ref", "expects")},
+                      # TM - #TR-BRANCH - Nhanh kich ban TR
+                      **{k: row[k] for k in ("label", "branch", "entry_event", "ref_event")},
                       "check_trade": {k: verdict[k] for k in ("would_pass", "rule_violations",
                                                               "rr", "trade_type")}})
     # TM - #DASHBOARD - Setup dashboard
@@ -4539,7 +4564,7 @@ def save_setups(symbol: str, setups: list[dict[str, Any]], replace: bool = False
     rejection BAT BUOC khai max_vol_mult (test, vol thap) va/hoac min_vol_mult (stopping
       action, vol cao), la boi so cua SMA volume M5. Lay so tu get_setup_params cua dung cap.
     Setup co x_max <= 0 (khong dat min_rr ngay tai entry) bi tu choi kem ly do. Moi setup
-    hop le duoc cham check_trade dang thu. Tra ve id + code (vd BTC-20261101-A).
+    hop le duoc cham check_trade dang thu. Tra ve id + code + label.
     Server tu luu htf {w, d, h4, bias}: huong W/D/H4 tinh tu swing nen da dong (up/down/range)
     va bias cua bias_date. htf_counter liet ke cac khung nguoc huong setup - khong chan luu,
     chi gan nhan trong tin va trong ket qua.
@@ -4551,6 +4576,15 @@ def save_setups(symbol: str, setups: list[dict[str, Any]], replace: bool = False
     dich, vd "TEST#3" - co the chua xay ra), expects (event ky vong neu setup dung, vd "LPS").
     Server tu ghi phase = current_phase cua TR luc tao setup. tr_high/tr_low/tr_since lay tu TR lien
     ket; khai khac TR thi bi thay bang so cua TR va tra warnings.
+    TM - #TR-BRANCH: moi setup BAT BUOC khai
+      branch: accumulation (chi long) | distribution (chi short) | range (ca hai, fade bien trong pha B).
+      entry_event: su kien vao lenh. Long: SPRING SHAKEOUT TEST SOS JAC LPS BU ST_B.
+        Short: UT UTAD TEST_D SOW LPSY ST_D. Khac huong setup thi bi tu choi.
+      Tuy chon: ref_event (su kien tham chieu, vd "SOW#1", "SC#1"); label (bo trong = server sinh
+        "BTC 12/11 · SHORT · PHÂN PHỐI · Pha D · LPSY sau SOW#1 · 72400–72740").
+    Ma setup: {SYM}-{yyyymmdd}-{L|S}-{ACC|DIST|RNG}-{pha}-{entry_event}-{n}, vd BTC-20261112-S-DIST-D-LPSY-1
+      (pha = current_phase cua TR, X khi chua co). TR lien ket da xac dinh nhanh (xem update_tr) thi
+      setup nguoc nhanh bi tu choi.
     """
     return _save_setups(_resolve_symbol(symbol), setups, bool(replace), "claude")
 
@@ -4586,6 +4620,9 @@ def get_setups(symbol: str = "", status: str = "", date: str = "") -> dict[str, 
 
     status: mot hoac nhieu trang thai cach nhau dau phay, hoac 'active' (chua ket thuc).
     date: bias_date 'YYYY-MM-DD'. Bo trong ca status lan date = setup dang chay + setup cua hom nay.
+    TM - #TR-BRANCH: moi setup co label, branch, entry_event, ref_event. PRUNED = bi loai vi nguoc nhanh
+    TR (ly do o state.pruned.reason). trs: {tr_id: {branch, branch_by, prob_accumulation,
+    prob_distribution, ...}} cua cac TR ma setup lien ket.
     """
     sym = _resolve_symbol(symbol) if symbol else None
     if status or date:
@@ -4597,7 +4634,9 @@ def get_setups(symbol: str = "", status: str = "", date: str = "") -> dict[str, 
         rows = sorted(seen.values(), key=lambda r: (r["bias_date"], r["code"]), reverse=True)
     last = SETUPS.last_events([r["id"] for r in rows])
     return {"count": len(rows), "watcher_enabled": _watcher_active(),
-            "setups": [_setup_view(r, last.get(r["id"])) for r in rows]}
+            "setups": [_setup_view(r, last.get(r["id"])) for r in rows],
+            # TM - #TR-BRANCH - nhanh va xac suat cua cac TR ma setup lien ket
+            "trs": _tr_briefs([r.get("tr_id") for r in rows])}
 
 
 @_tool_with_reasons()
@@ -4623,6 +4662,9 @@ def get_setup_events(setup_id: str = "", symbol: str = "", date: str = "") -> di
 
     setup_id: id hoac code. symbol: moi setup cua cap + canh bao he thong nhac cap do.
     date: 'YYYY-MM-DD' (gio VN) - loc theo luc xay ra event. Toi da 200 event moi nhat.
+    TM - #TR-BRANCH: event kem label, branch cua setup. PRUNED = loai vi nguoc nhanh TR (details.reason);
+    BRANCH_CONFLICT = setup da FILLED nguoc nhanh TR; TR_BRANCH = tin tong hop cua mot lan loai.
+    trs: nhanh va xac suat cua cac TR lien quan.
     """
     sid = SETUPS.get(setup_id.strip())["id"] if setup_id else None
     start = end = None
@@ -4630,7 +4672,8 @@ def get_setup_events(setup_id: str = "", symbol: str = "", date: str = "") -> di
         start, end = _day_window_ms(date)
     rows = SETUPS.events(setup_id=sid, symbol=_resolve_symbol(symbol) if symbol else None,
                          start_ms=start, end_ms=end)
-    return {"count": len(rows), "events": [_event_view(e) for e in rows]}
+    tr_ids = [e.get("tr_id") or (e.get("details") or {}).get("tr_id") for e in rows]
+    return {"count": len(rows), "events": [_event_view(e) for e in rows], "trs": _tr_briefs(tr_ids)}
 
 
 # ---------------------------------------------------------------- setup dashboard
@@ -4645,6 +4688,8 @@ DASH_DEFAULTS: dict[str, Any] = {
     "enabled": False, "base_url": "", "session_hours": 12, "remember_days": 30,
     "login_max_attempts": 5, "login_lockout_minutes": 15, "poll_seconds": 60,
     "vol_spike_mult": 2.0, "default_tf": "1h", "default_bars": 96, "hide_pnl": False,
+    # TM - #TR-BRANCH - Thang diem xac suat tich luy / phan phoi, sua o /admin/dashboard-accounts
+    "prob_weights": tr_logic.default_weights(),
 }
 DASH_EXCHANGE_TTL = 30.0
 DASH_CHART_CACHE_SIZE = 64
@@ -4677,6 +4722,12 @@ def _dash_cfg() -> dict[str, Any]:
                   file=sys.stderr)
         if isinstance(override, dict):
             cfg.update({k: v for k, v in override.items() if k in DASH_DEFAULTS})
+    # TM - #TR-BRANCH - Thieu factor thi lay mac dinh; file hong thi dung mac dinh, khong lam sap tool
+    try:
+        cfg["prob_weights"] = tr_logic.clean_weights(cfg.get("prob_weights") or {})
+    except ValueError as exc:
+        print(f"CANH BAO: dashboard.prob_weights loi ({exc}) - dang dung thang diem mac dinh", file=sys.stderr)
+        cfg["prob_weights"] = tr_logic.default_weights()
     _DASH_CFG_CACHE.update(key=key, cfg=cfg)
     return cfg
 
@@ -4716,6 +4767,9 @@ def _dash_clean_cfg(raw: Any) -> dict[str, Any]:
         if base and not base.startswith(("https://", "http://")):
             raise ValueError("base_url phai bat dau bang https://")
         out["base_url"] = base
+    # TM - #TR-BRANCH - Thang diem xac suat
+    if "prob_weights" in raw:
+        out["prob_weights"] = tr_logic.clean_weights(raw["prob_weights"])
     return out
 
 
@@ -4901,12 +4955,14 @@ def _chart_build(symbol: str, tf: str, bars: int, day: str, include_forming: boo
     tr = tr_logic.decorate_tr(plan.get("tr"))
     markers = sorted(_chart_markers(setups) + tr_logic.markers(tr, [int(c[0]) for c in candles], _tf_ms(tf)),
                      key=lambda m: m["t"])
+    # TM - #TR-BRANCH - Xac suat thay doi the nao trong ngay (lay theo TR dang ve, ke ca khi xem revision)
+    prob_history = PLANS.prob_history(tr["id"], start_ms, end_ms) if tr and tr.get("id") else []
     return {
         "symbol": symbol, "timeframe": tf, "date": day, "time_zone": str(TZ),
         "day_start_ms": start_ms, "candle_columns": ["t", "o", "h", "l", "c", "v", "is_closed"],
         "candles": candles, "vol_avg": averages, "vol_spike": spikes, "vol_spike_mult": mult,
         "bias": {k: bias.get(k) for k in CHART_BIAS_KEYS} if bias else None,
-        "setups": setups, "scenarios": plan.get("scenarios") or [], "tr": tr,
+        "setups": setups, "scenarios": plan.get("scenarios") or [], "tr": tr, "prob_history": prob_history,
         "htf_levels": _chart_htf(symbol, price), "markers": markers, "last_m5": last_m5,
         "plan": {"source": source, "revision": revision if source == "revision" else None,
                  "revisions_used": used, "revisions": PLANS.snapshots(symbol, day)},
@@ -5019,6 +5075,10 @@ async def get_chart_data(symbol: str = "", timeframe: str = "1h", bars: int = 96
     markers: kind "setup" = event watcher {t, event, code}; kind "wyckoff" = moi event cua TR
       {t_bar, t, price, side, label, status, event_id}; t_bar la gio mo cua nen thuoc timeframe dang
       xem chua t cua event (vd event M15 22:00 -> nen H1 22:00, nen H4 19:00).
+    TM - #TR-BRANCH: tr.branch (accumulation | distribution | null) + tr.branch_by {by: event|schematic,
+      ref, phase, ...}; tr.prob_accumulation, tr.prob_distribution, tr.prob_evidence. prob_history: cac lan
+      xac suat doi trong ngay {at, prob_accumulation, prob_distribution, plan_revision}. Setup co label,
+      branch; PRUNED la setup bi loai vi nguoc nhanh TR (dashboard an mac dinh).
     """
     return await _chart_data(_resolve_symbol(symbol), timeframe, bars, date, include_forming, revision)
 
@@ -5048,7 +5108,9 @@ def _tr_ctx(symbol: str, created_by: str = "claude") -> tr_logic.Ctx:
     return tr_logic.Ctx(bars_at=lambda tf, t: _tr_bars(symbol, tf, t), parse_time=_parse_moment,
                         timeframes=list(SUPPORTED_TIMEFRAMES), span_ms=_tf_ms,
                         stamp=lambda ms: _stamp(int(ms))[:16], now_ms=int(time.time() * 1000),
-                        created_by=created_by)
+                        created_by=created_by,
+                        # TM - #TR-BRANCH - Thang diem xac suat dang ap dung
+                        prob_weights=_dash_cfg()["prob_weights"])
 
 
 def _migrate_tr_events() -> int:
@@ -5101,9 +5163,132 @@ def _tr_report(plan: dict[str, Any], tr: dict[str, Any]) -> dict[str, Any]:
             "fields": sorted(plan["fields"]), "phases_changed": plan["phases"] is not None}
 
 
-def _save_tr(symbol: str, raw: dict[str, Any], old_status: str) -> tuple[dict[str, Any], bool, list[str]]:
+# ---------------------------------------------------------------- nhanh kich ban TR
+# TM - #TR-BRANCH - Nhanh kich ban TR: loai setup nguoc nhanh khi TR xac dinh nhanh
+
+BRANCH_EVENT_TYPES = (*tr_logic.BRANCH_C, *tr_logic.BRANCH_D)
+PROB_NOTE = "diem bang chung, chua hieu chinh thong ke"
+
+
+def _setup_brief(setup: dict[str, Any]) -> dict[str, Any]:
+    return {"code": setup["code"], "label": setup.get("label") or entry_logic.setup_label(setup),
+            "direction": setup["direction"], "status": setup["status"], "bias_date": setup["bias_date"]}
+
+
+def _tr_brief(tr: dict[str, Any]) -> dict[str, Any]:
+    keys = ("id", "symbol", "timeframe", "schematic", "status", "current_phase", "branch", "branch_by",
+            "prob_accumulation", "prob_distribution")
+    return {k: tr.get(k) for k in keys}
+
+
+def _tr_briefs(tr_ids: list[Any]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for tid in dict.fromkeys(str(i) for i in tr_ids if i):
+        try:
+            out[tid] = _tr_brief(PLANS.tr(tid))
+        except ValueError:
+            continue
+    return out
+
+
+def _filled_open(setups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Setup FILLED ma review chua ghi lenh da dong (tp/sl/be/thoat tay): coi nhu con vi the."""
+    filled = [s for s in setups if s["status"] == "FILLED"]
+    reviews = PLANS.reviews([s["id"] for s in filled])
+    closed = dashboard_logic.CLOSED_OUTCOMES
+    return [s for s in filled if (reviews.get(s["id"]) or {}).get("outcome") not in closed
+            and (reviews.get(s["id"]) or {}).get("auto_outcome") not in closed]
+
+
+def _tr_branch_apply(symbol: str, before: dict[str, Any] | None, tr: dict[str, Any],
+                     plan: dict[str, Any]) -> dict[str, Any]:
+    """Goi ngay sau moi lan ghi TR (update_tr, save_scenarios). Nhanh doi sang tang/giam thi moi setup
+    CHUA KET THUC cua TR nguoc nhanh (ke ca branch=range) sang PRUNED; setup da FILLED giu nguyen, chi
+    canh bao. Mot tin tong hop cho ca lan loai. Event pha C/D vua chuyen failed thi khong tu khoi phuc
+    setup da loai, chi tra warning."""
+    old, new, info = (before or {}).get("branch"), tr.get("branch"), tr.get("branch_by")
+    out: dict[str, Any] = {"branch": new, "branch_by": info, "changed": old != new,
+                           "reason": tr_logic.branch_reason(info) if info else None,
+                           "pruned": [], "conflicts": [], "warnings": [], "event_id": None, "days": set()}
+    if not tr.get("id"):
+        return out
+    rows = SETUPS.by_tr(tr["id"])
+    if new and new != old:
+        counter = tr_logic.COUNTER_DIRECTION[new]
+        details = {"tr_id": tr["id"], "branch": new, "ref": info.get("ref") or f"schematic {info.get('schematic')}",
+                   "phase": info.get("phase"), "by": info.get("by")}
+        for setup in rows:
+            if setup["direction"] != counter or setup["status"] in entry_logic.TERMINAL:
+                continue
+            if SETUPS.prune(setup, out["reason"], details) is not None:
+                out["pruned"].append(_setup_brief(setup))
+                out["days"].add(setup["bias_date"])
+        for setup in _filled_open([s for s in rows if s["direction"] == counter]):
+            SETUPS.note_event(setup, "BRANCH_CONFLICT", {**details, "reason": out["reason"]})
+            out["conflicts"].append(_setup_brief(setup))
+            out["days"].add(setup["bias_date"])
+        if out["conflicts"]:
+            out["warnings"].append(f"vi the nguoc nhanh TR: {len(out['conflicts'])} setup FILLED "
+                                   f"({', '.join(s['code'] for s in out['conflicts'])}) giu nguyen trang thai - "
+                                   "can nhac dong lenh")
+        if out["pruned"] or out["conflicts"]:
+            out["event_id"] = SETUPS.system_event("TR_BRANCH", {
+                "symbol": symbol, "tr_id": tr["id"], "branch": new, "reason": out["reason"],
+                "pruned": out["pruned"], "conflicts": out["conflicts"],
+                "link": _dash_url(symbol, _today(), tf=tr.get("timeframe") or "")})
+    by_id = {e["id"]: e for e in tr.get("events") or []}
+    failed = [by_id[u["id"]]["ref"] for u in plan.get("update") or []
+              if u.get("status") == "failed" and by_id.get(u["id"], {}).get("type") in BRANCH_EVENT_TYPES]
+    if failed:
+        pruned = [s for s in SETUPS.by_tr(tr["id"]) if s["status"] == "PRUNED"]
+        state = (f"TR van o nhanh {tr_logic.BRANCH_WORDS[new][0]} theo {tr_logic.branch_source(info)}" if new
+                 else "TR ve trung tinh (chua xac dinh nhanh)")
+        text = f"{', '.join(failed)} chuyen failed - {state}"
+        if pruned:
+            text += (f"; {len(pruned)} setup da PRUNED KHONG tu khoi phuc ({', '.join(s['code'] for s in pruned)})"
+                     " - can thi luu lai qua save_setups")
+        out["warnings"].append(text)
+    return out
+
+
+def _branch_idle(tr: dict[str, Any]) -> dict[str, Any]:
+    """Cung dang ket qua _tr_branch_apply cho lan goi khong ghi gi."""
+    info = tr.get("branch_by")
+    return {"branch": tr.get("branch"), "branch_by": info, "changed": False,
+            "reason": tr_logic.branch_reason(info) if info else None,
+            "pruned": [], "conflicts": [], "warnings": [], "event_id": None}
+
+
+def _branch_view(result: dict[str, Any]) -> dict[str, Any]:
+    return {k: (sorted(v) if isinstance(v, set) else v) for k, v in result.items() if k != "days"}
+
+
+def _prob_view(tr: dict[str, Any]) -> dict[str, Any]:
+    evidence = tr.get("prob_evidence") or []
+    return {"accumulation": tr.get("prob_accumulation"), "distribution": tr.get("prob_distribution"),
+            "evidence": evidence, "weight_acc": sum(e["weight"] for e in evidence if e["side"] == "acc"),
+            "weight_dist": sum(e["weight"] for e in evidence if e["side"] == "dist"), "note": PROB_NOTE}
+
+
+def _tr_written(symbol: str, day: str, trigger: str, tr: dict[str, Any], plan: dict[str, Any] | None,
+                branch: dict[str, Any] | None) -> int | None:
+    """Sau khi ghi TR (ngoai khoa): snapshot ke hoach cua ngay va cac ngay co setup vua bi loai, gan
+    revision vao lich su xac suat, roi gui tin tong hop."""
+    revision = _plan_snapshot(symbol, day, trigger)
+    for other in sorted((branch or {}).get("days") or set()):
+        if other != day:
+            _plan_snapshot(symbol, other, trigger)
+    PLANS.set_prob_revision((plan or {}).get("prob_history_id"), revision, day)
+    if branch and branch.get("event_id"):
+        WATCHER.notify_threadsafe(branch["event_id"])
+    return revision
+
+
+def _save_tr(symbol: str, raw: dict[str, Any], old_status: str
+             ) -> tuple[dict[str, Any], bool, list[str], dict[str, Any] | None, dict[str, Any] | None]:
     """tr cua save_scenarios. Cung neo (tr_high, tr_low, since) -> gop vao TR dang hieu luc nhu
-    update_tr, gui lai event da co khong nhan doi. Neo khac -> TR moi, TR cu superseded + old_status."""
+    update_tr, gui lai event da co khong nhan doi. Neo khac -> TR moi, TR cu superseded + old_status.
+    TM - #TR-BRANCH: tra them plan va ket qua xet nhanh (setup nguoc nhanh da loai)."""
     clean = tr_logic.validate_tr_input(raw, parse_time=_parse_moment, timeframes=list(SUPPORTED_TIMEFRAMES))
     if old_status not in tr_logic.OLD_TR_STATUSES:
         raise ValueError(f"old_tr_status phai la mot trong {list(tr_logic.OLD_TR_STATUSES)}")
@@ -5120,12 +5305,15 @@ def _save_tr(symbol: str, raw: dict[str, Any], old_status: str) -> tuple[dict[st
                 warnings.append(f"timeframe {clean['timeframe']} khac TR dang hieu luc - giu "
                                 f"{current['timeframe']} (cung neo nen van la TR cu)")
             if not plan["changed"]:
-                return current, False, warnings
-            return PLANS.apply_tr(current["id"], plan), True, warnings
+                return current, False, warnings, None, None
+            tr = PLANS.apply_tr(current["id"], plan)
+            branch = _tr_branch_apply(symbol, current, tr, plan)
+            return tr, True, warnings + branch["warnings"], plan, branch
         plan = tr_logic.plan_changes(tr_logic.virtual_tr(clean), ctx, fields=clean["fields"],
                                      add_events=clean["events"], phases=clean["phases"])
         created = PLANS.create_tr(symbol, clean, plan, current["id"] if current else None, old_status)
-        return created, True, list(plan["warnings"])
+        branch = _tr_branch_apply(symbol, None, created, plan)
+        return created, True, list(plan["warnings"]) + branch["warnings"], plan, branch
 
 
 def _update_tr(symbol: str, tr_id: str, fields: dict[str, Any], phases: Any, add_events: Any,
@@ -5148,13 +5336,19 @@ def _update_tr(symbol: str, tr_id: str, fields: dict[str, Any], phases: Any, add
                              "goi save_scenarios(tr={...}) voi neo moi")
         plan = tr_logic.plan_changes(tr, _tr_ctx(symbol, created_by), fields=fields, add_events=add_events,
                                      update_events=update_events, phases=phases)
+        # TM - #TR-BRANCH - Ghi xong thi xet nhanh ngay trong khoa, de hai lan ghi khong cung loai mot setup
+        branch = None
         if plan["changed"]:
+            before = tr
             tr = PLANS.apply_tr(tr["id"], plan)
+            branch = _tr_branch_apply(symbol, before, tr, plan)
     day = _today()
+    revision = _tr_written(symbol, day, "update_tr", tr, plan, branch) if plan["changed"] else None
     return {"symbol": symbol, "changed": plan["changed"], **_tr_report(plan, tr),
-            "warnings": plan["warnings"], "tr": tr,
-            "plan_revision": _plan_snapshot(symbol, day, "update_tr") if plan["changed"] else None,
-            **_dash_link(symbol, day, tf=tr["timeframe"])}
+            "warnings": plan["warnings"] + (branch["warnings"] if branch else []), "tr": tr,
+            # TM - #TR-BRANCH - Nhanh kich ban TR va xac suat tich luy / phan phoi
+            "branch": _branch_view(branch or _branch_idle(tr)), "prob": _prob_view(tr),
+            "plan_revision": revision, **_dash_link(symbol, day, tf=tr["timeframe"])}
 
 
 @_tool_with_reasons()
@@ -5162,7 +5356,8 @@ def update_tr(symbol: str, tr_id: str = "", schematic: str = "", status: str = "
               levels: dict[str, float | None] | None = None, note: str | None = None,
               phases: list[dict[str, Any]] | None = None, add_events: list[dict[str, Any]] | None = None,
               update_events: list[dict[str, Any]] | None = None, tr_high: float | None = None,
-              tr_low: float | None = None, since: str | int | None = None) -> dict[str, Any]:
+              tr_low: float | None = None, since: str | int | None = None,
+              prob_evidence: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Cap nhat cau truc Wyckoff cua TR khoa: so do, trang thai, muc, pha va su kien. Goi MOT lan
     voi moi thay doi, TRUOC save_bias (bias.phase an theo current_phase).
 
@@ -5186,6 +5381,20 @@ def update_tr(symbol: str, tr_id: str = "", schematic: str = "", status: str = "
     Co loi nao la tu choi ca lan goi, liet ke het loi. Canh bao (khong tu choi): type nam ngoai pha
     thuong gap, price lech day/dinh nen > 0.1%, SOS/SOW confirmed ma chua co LPS/LPSY sau no.
     Tra ve TR day du, added/updated (nhan sau khi danh so), warnings, plan_revision, dashboard_url.
+    TM - #TR-BRANCH - Nhanh kich ban:
+      TR trung tinh (branch null) toi khi co event pha C confirmed: SPRING/SHAKEOUT -> nhanh tang
+      (accumulation), UTAD -> nhanh giam (distribution). Khong co pha C thi SOS/JAC hoac SOW confirmed.
+      Doi schematic sang ho tich luy / phan phoi cung xac dinh nhanh (kem canh bao neu chua co event).
+      Nhanh vua xac dinh hoac doi: moi setup CHUA KET THUC cua TR nguoc nhanh (ke ca branch=range) sang
+      PRUNED, watcher ngung theo doi, gui MOT tin tong hop. Setup da FILLED giu nguyen, chi canh bao vi
+      the nguoc nhanh. Event pha C/D sau do chuyen failed: KHONG tu khoi phuc, doc warnings va luu lai
+      setup can thiet qua save_setups. Ket qua: branch {branch, branch_by, reason, pruned, conflicts}.
+    prob_evidence: [{factor, side: acc|dist, weight?, note?}] thay TOAN BO danh sach (gui [] = xoa).
+      factor theo thang diem (bo trong weight = lay trong so trang admin): htf_trend 2 (xu huong D/H4
+      truoc TR), phase_b_lows 1, phase_b_highs 1 (cau truc day / dinh pha B), test_highs 1, test_lows 1
+      (hanh vi test dinh / day), phase_cd_event 3 (SPRING/SOS -> acc, UTAD/SOW -> dist da confirmed).
+      Server tinh prob_accumulation = Σacc / Σ x 100 (lam tron), prob_distribution = 100 - acc, luu lich
+      su gan plan revision. Day la diem bang chung, chua hieu chinh thong ke - noi ro khi bao cao.
     """
     fields: dict[str, Any] = {}
     if str(schematic or "").strip():
@@ -5196,6 +5405,9 @@ def update_tr(symbol: str, tr_id: str = "", schematic: str = "", status: str = "
         fields["levels"] = levels
     if note is not None:
         fields["note"] = note
+    # TM - #TR-BRANCH - Diem bang chung xac suat
+    if prob_evidence is not None:
+        fields["prob_evidence"] = prob_evidence
     return _update_tr(_resolve_symbol(symbol), tr_id, fields, phases, add_events, update_events,
                       {"tr_high": tr_high, "tr_low": tr_low, "since": since})
 
@@ -5248,8 +5460,10 @@ def _save_scenarios(symbol: str, scenarios: Any, replace: bool, day: str,
     if not isinstance(scenarios, list):
         raise ValueError("scenarios phai la list")
     # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: TR loi thi tu choi truoc khi luu gi
-    tr_out, tr_changed, tr_warnings = (_save_tr(symbol, tr, str(old_tr_status or "completed").strip().lower())
-                                       if tr else (None, False, []))
+    # TM - #TR-BRANCH - kem plan (lich su xac suat) va ket qua xet nhanh
+    tr_out, tr_changed, tr_warnings, tr_plan, tr_branch = (
+        _save_tr(symbol, tr, str(old_tr_status or "completed").strip().lower()) if tr
+        else (None, False, [], None, None))
     known = {s["code"] for s in SETUPS.list(symbol=symbol)}
     fresh, updates, rejected = [], [], []
     for index, raw in enumerate(scenarios):
@@ -5282,9 +5496,14 @@ def _save_scenarios(symbol: str, scenarios: Any, replace: bool, day: str,
     # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
     warnings.extend(f"tr: {w}" for w in tr_warnings)
     changed = bool(saved or updated or cancelled or tr_changed)
+    # TM - #TR-BRANCH - snapshot ca ngay co setup vua bi loai, gan revision cho lich su xac suat, gui tin
+    revision = (_tr_written(symbol, day, "save_scenarios", tr_out, tr_plan, tr_branch) if tr_changed
+                else _plan_snapshot(symbol, day, "save_scenarios") if changed else None)
     return {"symbol": symbol, "bias_date": day, "codes": [s["code"] for s in saved], "saved": saved,
             "updated": updated, "cancelled": cancelled, "rejected": rejected, "warnings": warnings,
-            "tr": tr_out, "plan_revision": _plan_snapshot(symbol, day, "save_scenarios") if changed else None,
+            "tr": tr_out, "plan_revision": revision,
+            **({"branch": _branch_view(tr_branch or _branch_idle(tr_out)), "prob": _prob_view(tr_out)}
+               if tr_out else {}),
             **_dash_link(symbol, day)}
 
 
@@ -5307,6 +5526,8 @@ def save_scenarios(symbol: str, scenarios: list[dict[str, Any]], replace: bool =
       - Neo khac -> TR moi; TR cu superseded_by va status = old_tr_status (completed | failed).
       - Event moi kiem tra nhu add_events cua update_tr (nen da dong, price trong nen, khop schematic).
       Neo khong doi thi khong can truyen lai tr: them/sua event, pha qua update_tr.
+      TM - #TR-BRANCH: tr nhan them prob_evidence nhu update_tr; ghi TR xong cung xet nhanh va loai setup
+      nguoc nhanh nhu update_tr (ket qua o branch, prob).
     Tra ve codes, warnings, rejected, tr (day du), dashboard_url.
     """
     return _save_scenarios(_resolve_symbol(symbol), scenarios, bool(replace), _dash_day(bias_date), tr,
@@ -5448,6 +5669,8 @@ def _review_stats(symbol: str, from_date: str, to_date: str, group_by: str) -> d
     rows = [{"symbol": s["symbol"], "trigger_type": s["trigger_type"], "direction": s["direction"],
              "phase": s.get("phase"), "event_ref_type": tr_logic.ref_type(s.get("event_ref")),
              "expects": s.get("expects"), "schematic": schematics.get(s.get("tr_id") or ""),
+             # TM - #TR-BRANCH - Nhanh kich ban cua setup
+             "branch": s.get("branch"), "entry_event": s.get("entry_event"),
              "triggered": any(e["event"] == "TRIGGERED" for e in events[s["id"]]),
              "outcome": (reviews.get(s["id"]) or {}).get("outcome"),
              "r_multiple": (reviews.get(s["id"]) or {}).get("r_multiple")} for s in setups]
@@ -5466,6 +5689,7 @@ def get_review_stats(symbol: str = "", from_date: str = "", to_date: str = "",
     TM - #WYCKOFF-TR: group_by them phase (pha luc tao setup) | event_ref_type (vd TEST) | expects |
     schematic (cua TR lien ket). Nhom cheo bang dau phay, vd "direction,event_ref_type,phase" = win
     rate cua long TEST trong pha C. Setup khong co gia tri nam o nhom "chua_co".
+    TM - #TR-BRANCH: group_by them branch (accumulation | distribution | range) | entry_event.
     """
     return _review_stats(symbol, from_date, to_date, group_by)
 
@@ -6628,6 +6852,9 @@ def _dash_accounts_view() -> dict[str, Any]:
         "logins": [{**row, "when": when(row["at"])} for row in DASH_AUTH.login_log()],
         "config": _dash_cfg(), "timeframes": list(DASH_TFS), "dashboard_path": DASH_PATH,
         "config_file": str(DASH_FILE),
+        # TM - #TR-BRANCH - Thang diem xac suat tich luy / phan phoi
+        "prob_factors": [{"key": key, "label": label, "default": weight}
+                         for key, (label, weight) in tr_logic.PROB_FACTORS.items()],
     }
 
 
@@ -6830,7 +7057,9 @@ async def http_dash_page(request, session):
             "poll_seconds": cfg["poll_seconds"], "default_tf": cfg["default_tf"],
             "default_bars": cfg["default_bars"], "default_symbol": _resolve_symbol(""), "symbols": _symbols(),
             "timeframes": list(DASH_TFS), "outcomes": list(dashboard_logic.OUTCOMES),
-            "group_by": list(dashboard_logic.GROUP_BY)}
+            "group_by": list(dashboard_logic.GROUP_BY),
+            # TM - #TR-BRANCH - Nhan cua factor trong danh sach bang chung
+            "prob_factors": {key: label for key, (label, _) in tr_logic.PROB_FACTORS.items()}}
     page = dashboard_ui.app_page(boot, {name: _dash_asset_url(name) for name in DASH_ASSETS})
     return HTMLResponse(page, headers={"Cache-Control": "no-store"})
 

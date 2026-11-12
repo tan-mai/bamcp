@@ -4,7 +4,7 @@
 
 AI chỉ lập kế hoạch, việc canh giá chạy hoàn toàn trên server. Cuối buổi phân tích bias, Claude gọi `save_setups(symbol, setups, replace=true)` cho từng cặp. Từ đó watcher xét từng setup trên nến **đã đóng** và gửi một tin mỗi lần setup đổi trạng thái.
 
-Mã setup: `<base>-<yyyyMMdd>-<chữ cái>`, vd `BTC-20261101-A`. Tool nhận id hoặc code.
+Mã setup: `{SYM}-{yyyymmdd}-{L|S}-{ACC|DIST|RNG}-{pha}-{entry_event}-{n}`, vd `BTC-20261112-S-DIST-D-LPSY-1` ([chi tiết](#tên-setup-và-nhánh-kịch-bản)). Setup lưu trước bản này giữ mã cũ `BTC-20261101-A`. Tool nhận id hoặc code.
 
 ## Thiết lập sau khi deploy
 
@@ -35,6 +35,7 @@ Mã setup: `<base>-<yyyyMMdd>-<chữ cái>`, vd `BTC-20261101-A`. Tool nhận id
 | ENTRY_VALID | WAITING | hết `entry_valid_candles` nến chưa khớp | "hết cửa sổ entry" |
 | TRIGGERED…MISSED | FILLED | vị thế OKX mới cùng hướng, hoặc `log_trade(setup_id=...)` | có |
 | chưa kết thúc | INVALIDATED / EXPIRED / CANCELLED | đóng quá `invalidate_level` (kèm M15 nếu `m15_filter`) / quá `expires_at` / `cancel_setup` hoặc `replace=true` | có |
+| chưa kết thúc | PRUNED | TR liên kết xác định nhánh ngược hướng setup ([nhánh kịch bản](dashboard.md#nhánh-kịch-bản-và-xác-suất)) | gộp một tin cho cả lần loại |
 
 **Chạm lại vùng.** Giá ra khỏi vùng rồi quay lại thì không gửi tin IN_ZONE nữa (event vẫn ghi, `details.repeat = true`), nhưng trigger vẫn được xét nên TRIGGERED / ENTRY_VALID vẫn báo. Setup đã INVALIDATED thì bỏ qua hoàn toàn, giá quay lại vùng cũng không làm gì.
 
@@ -74,6 +75,24 @@ Lúc lưu setup, server tự ghi `htf` = `{w, d, h4, bias}`.
 - W/D/H4 tính từ swing của nến đã đóng (cùng nguồn `get_context`): `up` khi đỉnh và đáy cao dần, `down` khi đỉnh và đáy thấp dần, còn lại `range`. Đóng vượt swing vừa rồi ngược hướng thì về `range`. Thiếu dữ liệu thì `null`.
 - `bias` lấy từ `save_bias` của `bias_date`, nên phải `save_bias` trước `save_setups`.
 - `htf_counter` liệt kê các khung ngược hướng setup, không chặn lưu. Tin IN_ZONE, TRIGGERED, ENTRY_VALID, MISSED, BLOCKED và trang admin hiện nhãn `NGƯỢC ...` cùng dòng `Khung lớn`.
+
+## Tên setup và nhánh kịch bản
+
+Mỗi setup thuộc một nhánh kịch bản và có tên đọc là hiểu, không cần mở `note`.
+
+| Trường | Giá trị | Bắt buộc |
+|---|---|---|
+| `branch` | `accumulation` (chỉ long), `distribution` (chỉ short), `range` (cả hai, fade biên trong pha B) | có |
+| `entry_event` | Long: `SPRING`, `SHAKEOUT`, `TEST`, `SOS`, `JAC`, `LPS`, `BU`, `ST_B`. Short: `UT`, `UTAD`, `TEST_D`, `SOW`, `LPSY`, `ST_D` | có |
+| `ref_event` | Sự kiện tham chiếu dạng `TYPE#n`, vd `SOW#1`, `SC#1` | không |
+| `label` | Tên hiển thị. Bỏ trống thì server sinh | không |
+
+`save_setups` từ chối setup khi thiếu `branch` / `entry_event`, `branch` không cho hướng đó, hoặc `entry_event` là điểm vào của hướng ngược lại (vd long `UTAD`).
+
+- **Mã**: `{SYM}-{yyyymmdd}-{L|S}-{ACC|DIST|RNG}-{pha}-{entry_event}-{n}`. Pha là `current_phase` của TR lúc tạo, chưa có thì `X`. `n` đếm từ 1 cho cùng tiền tố.
+- **Label tự sinh**: `BTC 12/11 · SHORT · PHÂN PHỐI · Pha D · LPSY sau SOW#1 · 72400–72740`. Hiện trên dashboard, trong tin Discord/Telegram (dòng ngay dưới mã), và trả về trong `get_setups`, `get_chart_data`, `get_setup_events`. Setup cũ không có label thì ghép từ các trường đang có.
+- `event_ref` khác loại `entry_event`, hoặc `ref_event` dạng `TYPE#n` chưa có trên TR, chỉ cảnh báo.
+- TR liên kết đã xác định nhánh thì setup ngược nhánh bị từ chối.
 
 ## Liên kết TR khoá
 
@@ -117,3 +136,4 @@ Tham số theo cặp lưu vào bảng `setup_params`, phần còn lại vào `al
 
 - Setup tạo trước khi có hướng khung lớn thì không có nhãn `NGƯỢC ...`.
 - Setup lưu trước khi có `invalidate_after_confirm` giữ hành vi cũ.
+- Setup lưu trước khi có `branch` giữ mã cũ và để trống `branch`, `entry_event`; `label` được ghép lúc đọc.

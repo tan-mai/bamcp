@@ -681,27 +681,30 @@ class WatcherTest(unittest.TestCase):
 class ServerToolsTest(unittest.TestCase):
     def test_save_get_cancel_log(self):
         raw = {"direction": "long", "zone_low": 67200, "zone_high": 67450, "trigger_type": "spring",
-               "entry": 67500, "stop": 67050, "target": 68400, "invalidate_level": 67000}
+               "entry": 67500, "stop": 67050, "target": 68400, "invalidate_level": 67000,
+               "branch": "accumulation", "entry_event": "SPRING"}  # TM - #TR-BRANCH
         out = server.save_setups(server.DEFAULT_SYMBOL, [raw, {**raw, "target": 68100}, raw])
         self.assertEqual(len(out["saved"]), 2)
         self.assertIn("min_rr", out["rejected"][0]["error"])
+        # TM - #TR-BRANCH - ma {SYM}-{ngay}-L-ACC-{pha}-SPRING-{n}
         base = out["codes"][0][:-1]
-        self.assertEqual(out["codes"], [base + "A", base + "B"])
+        self.assertRegex(base, r"^BTC-\d{8}-L-ACC-[A-EX]-SPRING-$")
+        self.assertEqual(out["codes"], [base + "1", base + "2"])
         self.assertEqual(out["saved"][0]["max_chase_effective"], 90.0)
         again = server.save_setups(server.DEFAULT_SYMBOL, [raw], replace=True)
         self.assertEqual(sorted(again["replaced"]), sorted(out["codes"]))
-        self.assertEqual(again["codes"], [base + "C"])
+        self.assertEqual(again["codes"], [base + "3"])
         listed = server.get_setups()
         statuses = {s["code"]: s["status"] for s in listed["setups"]}
-        self.assertEqual(statuses[base + "A"], "CANCELLED")
-        self.assertEqual(statuses[base + "C"], "WAITING")
+        self.assertEqual(statuses[base + "1"], "CANCELLED")
+        self.assertEqual(statuses[base + "3"], "WAITING")
         logged = server.log_trade(side="long", entry=67500, stop=67050, target=68400,
-                                  margin_usd=10, date="2026-09-02", setup_id=base + "C")
+                                  margin_usd=10, date="2026-09-02", setup_id=base + "3")
         self.assertEqual(logged["setup"]["status"], "FILLED")
-        self.assertEqual(logged["trade"]["setup_code"], base + "C")
+        self.assertEqual(logged["trade"]["setup_code"], base + "3")
         with self.assertRaises(ValueError):
-            server.cancel_setup(base + "C", "test")
-        events = server.get_setup_events(setup_id=base + "C")["events"]
+            server.cancel_setup(base + "3", "test")
+        events = server.get_setup_events(setup_id=base + "3")["events"]
         self.assertEqual([e["event"] for e in events], ["CREATED", "FILLED"])
         server.save_setups(server.DEFAULT_SYMBOL, [], replace=True)
         (server.JOURNAL_DIR / "2026-09-02.json").unlink(missing_ok=True)
@@ -709,7 +712,8 @@ class ServerToolsTest(unittest.TestCase):
     # TM - #ENTRY-HTF - Luu huong khung lon va nhan setup nguoc
     def test_save_stores_htf_and_counter_label(self):
         raw = {"direction": "long", "zone_low": 67200, "zone_high": 67450, "trigger_type": "spring",
-               "entry": 67500, "stop": 67050, "target": 68400, "invalidate_level": 67000}
+               "entry": 67500, "stop": 67050, "target": 68400, "invalidate_level": 67000,
+               "branch": "accumulation", "entry_event": "SPRING"}  # TM - #TR-BRANCH
         down = {"last_closed_bar": {"close": 7}, "swing_highs": [{"price": 12}, {"price": 10}],
                 "swing_lows": [{"price": 6}, {"price": 5}]}
         up = {"last_closed_bar": {"close": 11}, "swing_highs": [{"price": 10}, {"price": 12}],
@@ -739,7 +743,8 @@ class ServerToolsTest(unittest.TestCase):
     # TM - #ENTRY-VOL - Tu choi kem ly do va hien dieu kien volume khi luu qua tool
     def test_save_rejection_needs_volume_and_shows_rule(self):
         raw = {"direction": "long", "zone_low": 67200, "zone_high": 67450, "trigger_type": "rejection",
-               "entry": 67500, "stop": 67050, "target": 68400, "invalidate_level": 67000}
+               "entry": 67500, "stop": 67050, "target": 68400, "invalidate_level": 67000,
+               "branch": "accumulation", "entry_event": "SPRING"}  # TM - #TR-BRANCH
         with mock.patch.object(server, "_setup_trends", lambda sym: {}):
             out = server.save_setups(server.DEFAULT_SYMBOL, [raw, {**raw, "trigger_params": {"max_vol_mult": 0.8}}],
                                      replace=True)
@@ -823,7 +828,8 @@ class ServerToolsTest(unittest.TestCase):
         self.clean_params()
         server._seed_setup_params()
         raw = {"direction": "long", "zone_low": 67200, "zone_high": 67450, "trigger_type": "rejection",
-               "entry": 67500, "stop": 67050, "target": 68400, "invalidate_level": 67000}
+               "entry": 67500, "stop": 67050, "target": 68400, "invalidate_level": 67000,
+               "branch": "accumulation", "entry_event": "SPRING"}  # TM - #TR-BRANCH
         suggested = server.get_setup_params(server.DEFAULT_SYMBOL)["rejection_trigger_params"]
         with mock.patch.object(server, "_setup_trends", lambda sym: {}):
             out = server.save_setups(server.DEFAULT_SYMBOL, [{**raw, "trigger_params": suggested["test"]},

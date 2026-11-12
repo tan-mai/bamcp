@@ -17,7 +17,9 @@ SETUP_FIELDS = ("id", "code", "symbol", "bias_date", "direction", "status", "zon
                 "expires_at", "tr_high", "tr_low", "tr_since", "state_data", "note",
                 "created_by", "created_at", "updated_at", "htf", "invalidate_after_confirm",
                 # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
-                "tr_id", "event_ref", "expects", "phase")
+                "tr_id", "event_ref", "expects", "phase",
+                # TM - #TR-BRANCH - Nhanh kich ban TR
+                "branch", "entry_event", "ref_event", "label")
 EVENT_FIELDS = ("id", "setup_id", "at", "event", "from_status", "to_status", "tf",
                 "candle_open_time", "price", "details", "notified", "notify_error")
 
@@ -71,19 +73,36 @@ class SetupStore:
             index += 1
         return prefix + entry_logic.code_letters(index)
 
+    # TM - #TR-BRANCH - Ma setup {SYM}-{yyyymmdd}-{L|S}-{ACC|DIST|RNG}-{pha}-{entry_event}-{n}
+    @staticmethod
+    def _next_numbered(conn, prefix: str) -> str:
+        # So sanh bang substr, khong dung LIKE: '_' trong ST_B la ky tu dai dien cua LIKE
+        taken = {r[0] for r in conn.execute("SELECT code FROM setups WHERE substr(code, 1, ?) = ?",
+                                            (len(prefix), prefix))}
+        number = 1
+        while f"{prefix}{number}" in taken:
+            number += 1
+        return f"{prefix}{number}"
+
     def insert(self, symbol: str, clean: dict[str, Any], created_by: str) -> dict[str, Any]:
         now = self.now_ms()
         sid = str(uuid.uuid4())
         with self._conn() as conn, conn:
-            code = self._next_code(conn, symbol, clean["bias_date"])
+            # TM - #TR-BRANCH - giu khoa ghi tu luc chon so thu tu toi luc INSERT
+            conn.execute("BEGIN IMMEDIATE")
+            # Setup co ten tuong minh dung ma moi; ban ghi khong co branch (goi thang tu kho) giu ma cu
+            code = (self._next_numbered(conn, entry_logic.code_prefix(symbol, clean))
+                    if clean.get("branch") and clean.get("entry_event")
+                    else self._next_code(conn, symbol, clean["bias_date"]))
             conn.execute(
                 "INSERT INTO setups (id, code, symbol, bias_date, direction, status, zone_low, "
                 "zone_high, trigger_type, trigger_params, confirm_type, confirm_level, entry, stop, "
                 "target, max_chase, invalidate_level, m15_filter, expires_at, tr_high, tr_low, "
                 "tr_since, state_data, note, created_by, created_at, updated_at, htf, "
-                "invalidate_after_confirm, tr_id, event_ref, expects, phase) VALUES "
+                "invalidate_after_confirm, tr_id, event_ref, expects, phase, branch, entry_event, "
+                "ref_event, label) VALUES "
                 "(?, ?, ?, ?, ?, 'WAITING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                "?, ?, ?, ?)",
+                "?, ?, ?, ?, ?, ?, ?, ?)",
                 (sid, code, symbol.upper(), clean["bias_date"], clean["direction"],
                  clean["zone_low"], clean["zone_high"], clean["trigger_type"],
                  json.dumps(clean["trigger_params"]) if clean["trigger_params"] else None,
@@ -94,7 +113,9 @@ class SetupStore:
                  json.dumps(clean["htf"]) if clean.get("htf") else None,
                  int(bool(clean.get("invalidate_after_confirm"))),
                  # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
-                 clean.get("tr_id"), clean.get("event_ref"), clean.get("expects"), clean.get("phase")))
+                 clean.get("tr_id"), clean.get("event_ref"), clean.get("expects"), clean.get("phase"),
+                 # TM - #TR-BRANCH - Nhanh kich ban TR
+                 clean.get("branch"), clean.get("entry_event"), clean.get("ref_event"), clean.get("label")))
             conn.execute(
                 "INSERT INTO setup_events (setup_id, at, event, from_status, to_status, details) "
                 "VALUES (?, ?, 'CREATED', NULL, 'WAITING', ?)",
@@ -134,6 +155,42 @@ class SetupStore:
 
     def active(self, symbol: str | None = None) -> list[dict[str, Any]]:
         return self.list(symbol=symbol, status="ACTIVE")
+
+    # TM - #TR-BRANCH - Nhanh kich ban TR
+    def by_tr(self, tr_id: str) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute("SELECT * FROM setups WHERE tr_id = ? ORDER BY created_at, code",
+                                (tr_id,)).fetchall()
+        return [_setup(r) for r in rows]
+
+    def prune(self, setup: dict[str, Any], reason: str, details: dict[str, Any]) -> int | None:
+        """Sang PRUNED (terminal) chi khi trang thai chua doi tu luc doc: watcher co the vua chuyen setup
+        (vd sang FILLED). Chi them state.pruned, khong ghi de state watcher dang giu. Tra id event."""
+        now = self.now_ms()
+        mark = {"reason": reason, "at": now, **{k: details.get(k) for k in ("tr_id", "branch", "ref", "phase")}}
+        with self._conn() as conn, conn:
+            cur = conn.execute(
+                "UPDATE setups SET status = 'PRUNED', updated_at = ?, "
+                "state_data = json_set(COALESCE(NULLIF(state_data, ''), '{}'), '$.pruned', json(?)) "
+                "WHERE id = ? AND status = ?",
+                (now, json.dumps(mark, default=str), setup["id"], setup["status"]))
+            if not cur.rowcount:
+                return None
+            cur = conn.execute(
+                "INSERT INTO setup_events (setup_id, at, event, from_status, to_status, details) "
+                "VALUES (?, ?, 'PRUNED', ?, 'PRUNED', ?)",
+                (setup["id"], now, setup["status"], json.dumps({**details, "reason": reason}, default=str)))
+            return int(cur.lastrowid)
+
+    def note_event(self, setup: dict[str, Any], event: str, details: dict[str, Any]) -> int:
+        """Ghi event khong doi trang thai (vd BRANCH_CONFLICT cua setup da FILLED)."""
+        with self._conn() as conn, conn:
+            cur = conn.execute(
+                "INSERT INTO setup_events (setup_id, at, event, from_status, to_status, details) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (setup["id"], self.now_ms(), event, setup["status"], setup["status"],
+                 json.dumps(details, default=str)))
+            return int(cur.lastrowid)
 
     def apply(self, setup: dict[str, Any], status: str, state: dict[str, Any],
               events: list[dict[str, Any]], tf: str | None = None) -> list[int]:
@@ -256,8 +313,9 @@ class SetupStore:
     def events(self, *, setup_id: str | None = None, symbol: str | None = None,
                start_ms: int | None = None, end_ms: int | None = None,
                limit: int = 200) -> list[dict[str, Any]]:
-        sql = ("SELECT e.*, s.code AS code, s.symbol AS symbol FROM setup_events e "
-               "LEFT JOIN setups s ON s.id = e.setup_id")
+        # TM - #TR-BRANCH - kem label, branch, tr_id cua setup
+        sql = ("SELECT e.*, s.code AS code, s.symbol AS symbol, s.label AS label, s.branch AS branch, "
+               "s.tr_id AS tr_id FROM setup_events e LEFT JOIN setups s ON s.id = e.setup_id")
         where, params = [], []
         if setup_id:
             where.append("e.setup_id = ?")
@@ -282,5 +340,7 @@ class SetupStore:
             item = _event(r)
             item["code"] = r["code"]
             item["symbol"] = r["symbol"]
+            # TM - #TR-BRANCH - Nhanh kich ban TR
+            item.update(label=r["label"], branch=r["branch"], tr_id=r["tr_id"])
             out.append(item)
         return out

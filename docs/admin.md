@@ -128,7 +128,7 @@ Thiếu credential thì server không dừng mà vào chế độ [setup token](
 | `POST /admin/schedules/action` | có* | Thêm / sửa / bật tắt / xoá / chạy ngay / xem trước cron |
 | `GET /admin/alerts` | có* | Thông báo Discord/Telegram, watcher, setups |
 | `POST /admin/alerts/action` | có* | Lưu thông báo / gửi thử / lưu watcher / huỷ, tạo setup, timeline |
-| `GET /admin/dashboard-accounts` | có* | Tài khoản, cấu hình, audit log và lịch sử đăng nhập của dashboard |
+| `GET /admin/dashboard-accounts` | có* | Tài khoản, cấu hình, thang điểm xác suất TR, audit log và lịch sử đăng nhập của dashboard |
 | `POST /admin/dashboard-accounts/action` | có* | Tạo / sửa / bật tắt / xoá tài khoản, lưu cấu hình |
 | `GET, POST /setup-dashboard/login` | không | Form đăng nhập dashboard, khoá theo IP khi sai nhiều lần |
 | `POST /setup-dashboard/logout` | phiên | Xoá phiên |
