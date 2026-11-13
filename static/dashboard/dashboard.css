@@ -5,6 +5,7 @@
   --line: #e2e5ea; --line-strong: #cdd2da; --grid: #eef0f3; --accent: #2563eb;
   --long: #0a8f6c; --short: #d43a3a; --warn: #a15c07; --warn-soft: #fff7e8; --warn-line: #f2d08a;
   --neutral: #6b7280; --entry: #2563eb; --invalidate: #c2710c; --tr: #7c5cd6;
+  --offplan: #ea7a0c; /* TM - #OFF-PLAN - marker diem vao lenh ngoai ke hoach */
   --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
 }
 @media (prefers-color-scheme: dark) {
@@ -13,6 +14,7 @@
     --line: #262c38; --line-strong: #363e4d; --grid: #1c212b; --accent: #5b96f8;
     --long: #2fc99b; --short: #f26d6d; --warn: #f0b64a; --warn-soft: rgba(240,182,74,.1); --warn-line: rgba(240,182,74,.35);
     --neutral: #9aa3b2; --entry: #6ea3fa; --invalidate: #e39a44; --tr: #a58bf0;
+    --offplan: #fb9a3c;
   }
 }
 * { box-sizing: border-box; }
@@ -177,6 +179,9 @@ th { text-align: left; color: var(--muted); font-size: 12px; font-weight: 600; p
 td { padding: 6px 8px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; white-space: nowrap; }
 tr:last-child td { border-bottom: 0; }
 td.total, tr.total td { font-weight: 650; }
+/* TM - #OFF-PLAN - Lenh ngoai ke hoach */
+.pill.offplan { color: var(--offplan); border-color: currentColor; }
+td.flags { white-space: normal; font-size: 11.5px; color: var(--muted); min-width: 110px; }
 
 @media (min-width: 720px) {
   .summary { grid-template-columns: repeat(4, minmax(0, 1fr)); }

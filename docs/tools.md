@@ -49,7 +49,17 @@ Cần bật đọc tài khoản, xem [account.md](account.md).
 | `get_positions` | Vị thế đang mở **thật trên sàn**, mọi cặp đang theo dõi |
 | `get_fills` | Lệnh đã khớp trong ngày theo từng vị thế, mọi cặp |
 | `get_account_pnl` | PnL thật, tách lãi/lỗ, phí, funding và tách theo cặp |
-| `reconcile_journal` | Đối chiếu nhật ký tự ghi với sàn, chỉ ra chỗ lệch |
+| `reconcile_journal` | Đối chiếu nhật ký tự ghi với sàn, chỉ ra chỗ lệch. `off_plan_pending` là lệnh ngoài kế hoạch chưa đánh giá |
+
+## Lệnh ngoài kế hoạch
+
+Chi tiết ở [off-plan.md](off-plan.md).
+
+| Tool | Việc |
+|---|---|
+| `get_off_plan_trades` | Lệnh có mã `OP-...`: phân loại, cờ, setup ứng viên, TR, kết quả. Docstring có quy trình "đánh giá lệnh OP-..." |
+| `review_off_plan_trade` | Lưu lý do, đánh giá, `verdict`, bài học. Chỉ ghi đè trường có truyền |
+| `reclassify_position` | Hệ thống phân loại sai: gắn vị thế vào setup và phân loại lại |
 
 ## Setup và kế hoạch
 

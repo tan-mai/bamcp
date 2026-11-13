@@ -136,6 +136,11 @@ def app_page(boot: dict[str, Any], assets: dict[str, str]) -> str:
         </div>
         <div id="setups"></div>
       </section>
+      <!-- TM - #OFF-PLAN - Lenh ngoai ke hoach (chi chu tai khoan) -->
+      <section class="panel" id="offPlanPanel" hidden>
+        <h2>Lệnh ngoài kế hoạch</h2>
+        <div id="offPlan"></div>
+      </section>
       <section class="panel" id="fillsPanel" hidden>
         <h2>Lệnh OKX trong ngày</h2>
         <div id="fills"></div>

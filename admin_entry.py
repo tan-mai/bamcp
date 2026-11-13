@@ -98,6 +98,25 @@ __CFG_WARNING__
     <div class="actions"><button type="button" class="primary" id="b_watcher">Lưu watcher</button></div>
   </div>
 
+  <!-- TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach -->
+  <div class="card">
+    <h2>Off-plan · lệnh ngoài kế hoạch</h2>
+    <p class="hint">position_watcher đối chiếu mỗi vị thế mới trên sàn với setup trong ngày và báo lệnh ngoài
+      kế hoạch (mã OP-...). Chỉ cảnh báo, không chặn hay đóng lệnh. Cần bật đọc tài khoản sàn.
+      Lần poll gần nhất: __OP_LAST__</p>
+    __OP_WARNING__
+    <div class="row">
+      <div><label for="op_poll">poll_seconds</label><input type="number" id="op_poll" min="5" max="300" value="__OP_POLL__"></div>
+      <div><label for="op_grace">no_stop_grace_seconds</label><input type="number" id="op_grace" min="0" max="3600" value="__OP_GRACE__"></div>
+      <div><label for="op_revenge">revenge_window_minutes</label><input type="number" id="op_revenge" min="0" max="1440" value="__OP_REVENGE__"></div>
+      <div><label for="op_channel">Kênh</label><select id="op_channel">__OP_CHANNEL_OPTIONS__</select></div>
+      <div class="end pad"><label class="check"><input type="checkbox" id="op_enabled"__OP_ENABLED__> Bật</label></div>
+    </div>
+    <label>Gửi tin cho loại <span class="small">· IN_PLAN = trong kế hoạch nhưng vi phạm rule / thiếu SL</span></label>
+    <div class="row">__OP_KIND_BOXES__</div>
+    <div class="actions"><button type="button" class="primary" id="b_off_plan">Lưu off-plan</button></div>
+  </div>
+
   <div class="card">
     <h2>Thông báo</h2>
     <p class="hint">Secret hiển thị dạng che; để trống ô thì giữ giá trị cũ. Lưu ở <code>__ALERTS_FILE__</code>,
@@ -188,6 +207,15 @@ $("b_watcher").addEventListener("click", async (e) => {
     watch_symbols: Array.from($("w_symbols").selectedOptions).map((o) => o.value),
     defaults: defaults, symbol_overrides: overrides}, e.target);
   if (data) { say("Đã lưu watcher", true); setTimeout(() => location.reload(), 700); }
+});
+
+// TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
+$("b_off_plan").addEventListener("click", async (e) => {
+  const kinds = Array.from(document.querySelectorAll("input[data-op-kind]")).filter((b) => b.checked).map((b) => b.dataset.opKind);
+  const data = await act({action: "off_plan_save", enabled: $("op_enabled").checked, poll_seconds: num("op_poll"),
+    no_stop_grace_seconds: num("op_grace"), revenge_window_minutes: num("op_revenge"),
+    channel: $("op_channel").value, notify_classifications: kinds}, e.target);
+  if (data) { say("Đã lưu off-plan", true); setTimeout(() => location.reload(), 700); }
 });
 
 $("b_create").addEventListener("click", async (e) => {
@@ -345,6 +373,30 @@ def _param_rows(keys: list[str], defaults: dict[str, Any], overrides: dict[str, 
     return "".join(out)
 
 
+# TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
+def _off_plan_parts(op: dict[str, Any]) -> dict[str, str]:
+    poll = op.get("last_poll") or {}
+    last = (f'{poll.get("at_text")} · cặp {", ".join(poll.get("symbols") or []) or "—"} · {poll.get("positions", 0)} vị thế'
+            + (f' · lỗi {poll["errors"]}' if poll.get("errors") else "")) if poll else "chưa poll"
+    warning = ""
+    if op.get("enabled") and not op.get("account_enabled"):
+        warning = '<div class="warn">Đọc tài khoản sàn đang tắt — position_watcher không chạy.</div>'
+    chosen = set(op.get("notify_classifications") or [])
+    boxes = "".join(f'<div class="end pad" style="flex:0 0 auto"><label class="check"><input type="checkbox" '
+                    f'data-op-kind="{_e(k)}"{" checked" if k in chosen else ""}> {_e(k)}</label></div>'
+                    for k in op.get("kinds") or [])
+    return {
+        "__OP_LAST__": _e(last), "__OP_WARNING__": warning,
+        "__OP_POLL__": _e(op.get("poll_seconds")), "__OP_GRACE__": _e(op.get("no_stop_grace_seconds")),
+        "__OP_REVENGE__": _e(op.get("revenge_window_minutes")),
+        "__OP_CHANNEL_OPTIONS__": _options([""] + list(op.get("channels") or []), op.get("channel") or "",
+                                           {"": "kênh chung (notify)", "discord": "Discord", "telegram": "Telegram",
+                                            "both": "Cả hai"}),
+        "__OP_ENABLED__": " checked" if op.get("enabled") else "",
+        "__OP_KIND_BOXES__": boxes,
+    }
+
+
 def render(view: dict[str, Any], *, action_path: str, admin_path: str, schedules_path: str,
            setup_required: bool, nav: list[admin_ui.NavItem] | None = None) -> str:
     notify = view["notify"]
@@ -386,6 +438,8 @@ def render(view: dict[str, Any], *, action_path: str, admin_path: str, schedules
         "__ACTION_PATH__": _js(action_path),
         "__PARAM_KEYS__": _js(view["param_keys"]),
         "__OVERRIDE_SYMBOLS__": _js(override_symbols),
+        # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
+        **_off_plan_parts(view.get("off_plan") or {}),
     }
     page = PAGE
     for needle, value in replacements.items():

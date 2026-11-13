@@ -283,6 +283,62 @@ CREATE TABLE IF NOT EXISTS tr_prob_history (
 );
 CREATE INDEX IF NOT EXISTS ix_tr_prob_history ON tr_prob_history(tr_id, at);
 """,
+    # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
+    # Moi vi the watcher thay deu co mot dong (ke ca IN_PLAN, de so sanh trong / ngoai ke hoach).
+    # code chi cap cho dong can Tan danh gia (ngoai ke hoach, hoac trong ke hoach ma pham rule).
+    # opened_at / closed_at la epoch ms. orders: order id da xu ly (lenh mo dau roi cac lenh them).
+    """
+CREATE TABLE IF NOT EXISTS off_plan_trades (
+  id                TEXT NOT NULL PRIMARY KEY,
+  code              TEXT UNIQUE,
+  position_id       TEXT,
+  symbol            TEXT NOT NULL,
+  side              TEXT NOT NULL,
+  trade_date        TEXT NOT NULL,
+  opened_at         INTEGER NOT NULL,
+  closed_at         INTEGER,
+  entry_avg         REAL,
+  qty               REAL,
+  margin_usd        REAL,
+  leverage          REAL,
+  exchange_sl       REAL,
+  exchange_tp       REAL,
+  classification    TEXT NOT NULL,
+  flags             TEXT NOT NULL DEFAULT '[]',
+  matched_setup_id  TEXT,
+  candidate_setups  TEXT,
+  tr_snapshot       TEXT,
+  rule_check        TEXT,
+  rule_set          TEXT,
+  explain           TEXT,
+  orders            TEXT NOT NULL DEFAULT '[]',
+  realized_pnl      REAL,
+  fee               REAL,
+  r_multiple        REAL,
+  review_status     TEXT NOT NULL DEFAULT 'PENDING',
+  tan_reason        TEXT,
+  claude_assessment TEXT,
+  verdict           TEXT,
+  lesson            TEXT,
+  add_to_plan       INTEGER,
+  notified          INTEGER NOT NULL DEFAULT 0,
+  notify_error      TEXT,
+  created_at        INTEGER NOT NULL,
+  updated_at        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_off_plan_day ON off_plan_trades(trade_date, symbol);
+CREATE INDEX IF NOT EXISTS ix_off_plan_open ON off_plan_trades(symbol, closed_at);
+CREATE TABLE IF NOT EXISTS off_plan_events (
+  id           TEXT NOT NULL PRIMARY KEY,
+  off_plan_id  TEXT NOT NULL REFERENCES off_plan_trades(id),
+  event        TEXT NOT NULL,
+  details      TEXT,
+  at           INTEGER NOT NULL,
+  notified     INTEGER NOT NULL DEFAULT 0,
+  notify_error TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_off_plan_events ON off_plan_events(off_plan_id, at);
+""",
 ]
 
 _MIGRATED: set[str] = set()

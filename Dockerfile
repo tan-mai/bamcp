@@ -50,6 +50,8 @@ COPY dashboard_logic.py dashboard_store.py dashboard_auth.py dashboard_ui.py adm
 COPY admin_auth.py ./
 # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
 COPY tr_logic.py ./
+# TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
+COPY off_plan_logic.py off_plan_store.py off_plan_watcher.py ./
 COPY static ./static
 # Lenh `bamcp dashboard create-owner <username>`. Sinh ngay trong image de khong phu thuoc
 # kieu xuong dong cua file tren may build.

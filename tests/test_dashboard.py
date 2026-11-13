@@ -1046,7 +1046,8 @@ class LoginTest(HttpBase):
             self.assertEqual(page.status_code, 302)
             self.assertEqual(page.headers["location"], f"{BASE}/login?next=%2Fsetup-dashboard%3Fsymbol%3DETHUSDT%26mode%3Dreview")
             self.assertEqual((await c.get(f"{BASE}/login")).status_code, 200)
-            for path in ("symbols", "chart", "setups", "events", "snapshots", "positions", "fills", "review-stats"):
+            for path in ("symbols", "chart", "setups", "events", "snapshots", "positions", "fills", "review-stats",
+                         "off-plan"):  # TM - #OFF-PLAN
                 res = await c.get(f"{BASE}/api/{path}")
                 self.assertEqual(res.status_code, 401, path)
                 self.assertEqual(res.json(), {"error": "unauthorized"})
@@ -1286,7 +1287,8 @@ class RoleTest(HttpBase):
             self.assertNotIn("positions", chart)
             self.assertEqual(len(chart["scenarios"]), 2)
             self.assertIsNone(chart["setups"][0]["last_event"]["price"], "gia khop lay tu san")
-            for path in ("positions", "fills"):
+            # TM - #OFF-PLAN - lenh ngoai ke hoach la vi the that: viewer khong doc duoc
+            for path in ("positions", "fills", "off-plan"):
                 self.assertEqual((await c.get(f"{BASE}/api/{path}", params=today)).status_code, 403, path)
             res = await c.post(f"{BASE}/api/reviews", json={"setup_code": codes[0], "outcome": "be"},
                                headers={"x-csrf-token": self.csrf(token)})
@@ -1294,6 +1296,7 @@ class RoleTest(HttpBase):
             stats = (await c.get(f"{BASE}/api/review-stats", params={"from": "2026-11-01", "to": "2026-11-30"})).json()
             self.assertEqual(stats["total"]["setups"], 2)
             self.assertNotIn("positions", stats)
+            self.assertNotIn("plan_compare", stats)  # TM - #OFF-PLAN - PnL vi the that
             setups = (await c.get(f"{BASE}/api/setups", params=today)).json()["setups"]
             self.assertNotIn("exchange_fill_ids", setups[0]["review"])
             self.assertIsNone(setups[0]["last_event"]["price"])
@@ -1429,6 +1432,11 @@ class RoleTest(HttpBase):
                 out = (await c.get(f"{BASE}/api/fills", params={"symbol": self.symbol, "date": "2026-11-07"})).json()
                 res = await c.post(f"{BASE}/api/reviews", json={"setup_code": codes[0], "outcome": "tp_hit", "r_multiple": 2,
                                                                 "note": "ok"}, headers={"x-csrf-token": self.csrf(token)})
+            # TM - #OFF-PLAN - chu tai khoan doc duoc bang lenh ngoai ke hoach
+            op = await c.get(f"{BASE}/api/off-plan", params={"date": "2026-11-07"})
+            self.assertEqual(op.status_code, 200)
+            self.assertEqual(op.json()["date"], "2026-11-07")
+            self.assertIn("trades", op.json())
             self.assertEqual([p["setup_code"] for p in out["positions"]], [codes[0], None])
             self.assertEqual(out["unlinked"], 1)
             self.assertEqual(out["positions"][1]["entry_price"], 79000.0)

@@ -58,6 +58,9 @@ import gann_windows  # TM - #GANN-TW - Gann Time Windows: chieu thoi gian & cua 
 import klines_coverage  # TM - #GANN-TW - Gann Time Windows: do phu & loc theo thoi gian
 import kline_store  # TM - #KL-SQL - Kline storage SQLite
 import notifier  # TM - #ENTRY-ALERT - Entry setups & alerts
+import off_plan_logic  # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
+import off_plan_store  # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
+import off_plan_watcher  # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
 import settings    # module cuc bo: luu credential xuong volume
 import tr_logic  # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
 # TM - #ORB - ORB Enhancement
@@ -1501,8 +1504,8 @@ def _journal_filter(trades: list[dict[str, Any]], strategy: str = "",
 TRADE_TYPES = ("scalp", "swing")
 
 
-def _evaluate_trade(*, symbol: str, side: str, entry: float, stop: float,
-                    target: float, margin_usd: float, trade_type: str,
+def _evaluate_trade(*, symbol: str, side: str, entry: float, stop: float | None,
+                    target: float | None, margin_usd: float, trade_type: str,
                     trades: list[dict[str, Any]], rules: dict[str, Any],
                     realized: float) -> dict[str, Any]:
     """Cham mot lenh theo bo rule dang hieu luc. Khong ghi gi.
@@ -1518,6 +1521,9 @@ def _evaluate_trade(*, symbol: str, side: str, entry: float, stop: float,
 
     min_rr cua cap ap cho ca scalp lan swing. Lenh ORB khong di qua ham nay -
     no cham bang orb.min_rr (orb_rules.score).
+
+    TM - #OFF-PLAN: vi the that tren san co the chua co SL/TP. stop / target = None thi bo qua
+    cac rule can con so do (SL toi da, TP toi thieu, R:R), van cham quota, daily stop, margin.
     """
     side = side.strip().lower()
     if side not in ("long", "short"):
@@ -1526,16 +1532,17 @@ def _evaluate_trade(*, symbol: str, side: str, entry: float, stop: float,
     if trade_type not in TRADE_TYPES:
         raise ValueError(f"trade_type phai la {' hoac '.join(TRADE_TYPES)}")
 
-    stop_points = round(abs(float(entry) - float(stop)), 2)
-    target_points = round(abs(float(target) - float(entry)), 2)
-    rr = round(target_points / stop_points, 2) if stop_points else None
+    stop_points = None if stop is None else round(abs(float(entry) - float(stop)), 2)
+    target_points = None if target is None else round(abs(float(target) - float(entry)), 2)
+    rr = (round(target_points / stop_points, 2)
+          if stop_points and target_points is not None else None)
     swing_threshold = float(rules["swing_min_take_profit_points"])
     min_rr = float(rules["min_rr"])
 
     violations: list[str] = []
     demoted = False
 
-    if trade_type == "swing" and target_points < swing_threshold:
+    if trade_type == "swing" and target_points is not None and target_points < swing_threshold:
         demoted = True
         trade_type = "scalp"
         violations.append(
@@ -1559,9 +1566,9 @@ def _evaluate_trade(*, symbol: str, side: str, entry: float, stop: float,
             f"da cham daily_stop_loss: PnL hom nay {realized} <= {rules['daily_stop_loss']}")
     if len(trades) >= int(rules["max_trades_per_day"]):
         violations.append(f"vuot max_trades_per_day ({rules['max_trades_per_day']})")
-    if stop_points > max_stop:
+    if stop_points is not None and stop_points > max_stop:
         violations.append(f"SL {stop_points} > {prefix}max_stop_points ({max_stop:g})")
-    if target_points < min_tp:
+    if target_points is not None and target_points < min_tp:
         violations.append(f"TP {target_points} < {prefix}min_take_profit_points ({min_tp:g})")
     # TM - #MIN-RR - min_rr theo cap: so bang chinh con so 'rr' tra ra (lam tron 2
     # chu so), de khong bao "R:R 1.5 < min_rr 1.5" vi sai so float (0.3 / 0.2 =
@@ -1578,8 +1585,8 @@ def _evaluate_trade(*, symbol: str, side: str, entry: float, stop: float,
         "trade_type": trade_type,
         "demoted_to_scalp": demoted,
         "entry": float(entry),
-        "stop": float(stop),
-        "target": float(target),
+        "stop": None if stop is None else float(stop),
+        "target": None if target is None else float(target),
         "stop_points": stop_points,
         "target_points": target_points,
         "rr": rr,
@@ -2720,6 +2727,10 @@ async def get_today_status(date: str = "", symbol: str = "", strategy: str = "",
 
     Khi account.enabled = true, khoi 'exchange' chua so THAT lay tu san va
     'can_trade' duoc tinh theo so that do, khong phai theo nhat ky tu khai.
+
+    TM - #OFF-PLAN: khoi 'off_plan' {count, codes, pending_review, pending_codes, pnl, open,
+    by_classification, in_plan_breach} - lenh ngoai ke hoach hom nay. count >= 2 thi noi ro va
+    nhac Tan can nhac dung giao dich.
     """
     day = date or _today()
     sym = _resolve_symbol(symbol) if symbol else ""
@@ -2827,6 +2838,8 @@ async def get_today_status(date: str = "", symbol: str = "", strategy: str = "",
         "rules_changed_today": edits,
         "exchange": exchange_block,
         "trades": trades,
+        # TM - #OFF-PLAN - Lenh ngoai ke hoach hom nay (vi the that do position_watcher ghi)
+        "off_plan": _op_summary(day),
         **extra,
     }
 
@@ -2854,6 +2867,8 @@ def log_trade(
 
     setup_id: TM - #ENTRY-ALERT. id hoac code cua setup (save_setups) ma lenh nay vao
       theo - setup chuyen sang FILLED va gui tin. Setup phai cung cap.
+      TM - #OFF-PLAN: vi the that vua bi position_watcher danh ngoai ke hoach (mo trong 1 gio quanh
+      luc log) thi duoc gan vao setup nay va phan loai lai - ket qua o khoi 'off_plan'.
 
     symbol: bo trong = cap mac dinh. Nguong SL toi da, TP toi thieu, nguong
       swing va min_rr duoc lay theo DUNG CAP NAY. Quota lenh/ngay, margin va
@@ -2937,6 +2952,14 @@ def log_trade(
         out["setup"] = _setup_finish(linked, "FILLED", "FILLED",
                                      {"trade_id": trade["id"], "source": "log_trade",
                                       "journal_date": day}, price=trade["entry"])
+        # TM - #OFF-PLAN - vi the da bi danh ngoai ke hoach ma log voi setup -> phan loai lai theo setup do.
+        # Phan phu: loi o day khong duoc lam hong viec ghi nhat ky da xong.
+        try:
+            linked_position = _op_link_log_trade(sym, verdict["side"], linked["id"])
+            if linked_position:
+                out["off_plan"] = linked_position
+        except Exception as exc:
+            out["off_plan_error"] = f"{type(exc).__name__}: {exc}"
     if orb_checks:
         # TM - #ORB - ORB Enhancement: da vao lenh thi dung watch phien (BR-04)
         out["orb_checks"] = orb_checks
@@ -3244,24 +3267,32 @@ def _symbol_recently_failed(key: str) -> bool:
     return bool(at and (time.time() - at) < _SYMBOL_MISS_TTL)
 
 
+def _fill_positions(fills: list[dict[str, Any]], symbol: str) -> list[dict[str, Any]]:
+    """Gom fill cua MOT cap thanh vi the, position_id dang {SYMBOL}-P{n} (get_fills va #OFF-PLAN dung chung).
+
+    Gom vi the RIENG tung cap: khoi luong cong don cua BTC va ETH khong the
+    tron vao mot chuoi, tron vao la ranh gioi vi the sai hoan toan.
+    """
+    for row in fills:
+        row["time"] = _stamp(row["ts"])
+        row["symbol"] = symbol
+    positions = _group_fills_into_positions(fills)
+    for group in positions:
+        group["symbol"] = symbol
+        group["position_id"] = f"{symbol}-{group['position_id']}"
+    return positions
+
+
 async def _account_day_one(client, adapter, day: str, symbol: str) -> dict[str, Any]:
     """Fill + settlement cua MOT cap trong mot ngay."""
     start_ms, end_ms = _day_window_ms(day)
     fills = await adapter.fills(client, start_ms, end_ms, symbol)
     settlements = await adapter.settlements(client, start_ms, end_ms, symbol)
-    for row in fills:
-        row["time"] = _stamp(row["ts"])
-        row["symbol"] = symbol
     for row in settlements:
         row["time"] = _stamp(row["ts"])
         row["symbol"] = symbol
-
-    # Gom vi the RIENG tung cap: khoi luong cong don cua BTC va ETH khong the
-    # tron vao mot chuoi, tron vao la ranh gioi vi the sai hoan toan.
-    positions = _group_fills_into_positions(fills)
-    for group in positions:
-        group["symbol"] = symbol
-        group["position_id"] = f"{symbol}-{group['position_id']}"
+    # TM - #OFF-PLAN - tach phan gom vi the ra ham dung chung
+    positions = _fill_positions(fills, symbol)
     return {
         "symbol": symbol,
         "market_symbol": adapter.market_symbol(symbol),
@@ -3469,6 +3500,7 @@ async def reconcile_journal(date: str = "") -> dict[str, Any]:
     """Doi chieu nhat ky tu ghi voi du lieu that tren san. Chi ra cho lech.
 
     Chay cuoi ngay, hoac bat cu luc nao nghi minh quen log mot lenh.
+    TM - #OFF-PLAN: off_plan_pending = vi the ngoai ke hoach (ma OP-...) cua ngay chua danh gia.
     """
     day = date or _today()
     trades = _read_json(JOURNAL_DIR / f"{day}.json", [])
@@ -3502,11 +3534,19 @@ async def reconcile_journal(date: str = "") -> dict[str, Any]:
         findings.append(
             f"{len(open_trades)} lenh trong nhat ky chua dong - so sanh PnL chua tron ven")
 
+    # TM - #OFF-PLAN - Vi the ngoai ke hoach chua review. Khong tinh vao 'matched': day la viec con no,
+    # khong phai lech so giua nhat ky va san.
+    pending = [r for r in OP_STORE.day_rows(day) if r.get("code") and r["review_status"] == "PENDING"]
+
     return {
         "date": day,
         "exchange": data["exchange"],
         "matched": not findings,
         "findings": findings,
+        "off_plan_pending": [{"code": r["code"], "position_id": r["position_id"], "symbol": r["symbol"],
+                              "side": r["side"], "classification": r["classification"], "flags": r["flags"],
+                              "realized_pnl": r["realized_pnl"], "review_prompt": f"đánh giá lệnh {r['code']}"}
+                             for r in pending],
         "journal": {"trades": len(trades), "realized_pnl": journal_pnl},
         "exchange_data": {
             "symbols": data["symbols"],
@@ -4222,7 +4262,14 @@ def get_sq9_levels(symbol: str = "", as_of: str = "", anchors: str = "auto",
 # ---------------------------------------------------------------- entry setups
 # TM - #ENTRY-ALERT - Entry setups & alerts
 
-ALERTS_YAML: dict[str, Any] = {"notify": CFG.get("notify") or {}, "watcher": CFG.get("watcher") or {}}
+ALERTS_YAML: dict[str, Any] = {"notify": CFG.get("notify") or {}, "watcher": CFG.get("watcher") or {},
+                               # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
+                               "off_plan": CFG.get("off_plan") or {}}
+# TM - #OFF-PLAN - Mac dinh cua khoi off_plan. channel "" = dung kenh notify.channel.
+OFF_PLAN_DEFAULTS: dict[str, Any] = {
+    "enabled": True, "poll_seconds": 15, "no_stop_grace_seconds": 60, "revenge_window_minutes": 30,
+    "channel": "", "notify_classifications": list(off_plan_logic.NOTIFY_KINDS),
+}
 ALERTS_FILE = DATA_ROOT / str(PATHS.get("alerts_config_file") or "alerts/config.json")
 ALERT_PARAM_DEFAULTS: dict[str, Any] = {
     "vol_mult": 2.0, "sma_period": 20, "body_pct": 0.6, "wick_pct": 0.6,
@@ -4249,9 +4296,11 @@ def _alerts_cfg() -> dict[str, Any]:
             override = {}
             print(f"CANH BAO: {ALERTS_FILE.name} loi ({type(exc).__name__}) - dang dung config.yaml",
                   file=sys.stderr)
-        for block in ("notify", "watcher"):
+        for block in ("notify", "watcher", "off_plan"):  # TM - #OFF-PLAN
             if isinstance(override, dict) and isinstance(override.get(block), dict):
                 cfg[block] = override[block]
+    # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
+    cfg["off_plan"] = {**OFF_PLAN_DEFAULTS, **(cfg.get("off_plan") or {})}
     watcher = cfg["watcher"]
     watcher["defaults"] = {**ALERT_PARAM_DEFAULTS, **(watcher.get("defaults") or {})}
     # TM - #SETUP-PARAMS - Tham so theo cap nam trong SQLite, khong con doc tu file
@@ -4339,7 +4388,9 @@ WATCHER = entry_watcher.EntryWatcher(
     check=_setup_check, positions=_setup_positions, tz=TZ, span_ms=_tf_ms,
     refresh=_watcher_refresh,
     # TM - #DASHBOARD - Setup dashboard
-    link=lambda setup: _dash_url(setup["symbol"], setup["bias_date"]))
+    link=lambda setup: _dash_url(setup["symbol"], setup["bias_date"]),
+    # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach thay cho UNPLANNED_POSITION khi dang bat
+    unplanned=lambda: not _op_active())
 
 
 def _setup_view(setup: dict[str, Any], last: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -4585,6 +4636,9 @@ def save_setups(symbol: str, setups: list[dict[str, Any]], replace: bool = False
     Ma setup: {SYM}-{yyyymmdd}-{L|S}-{ACC|DIST|RNG}-{pha}-{entry_event}-{n}, vd BTC-20261112-S-DIST-D-LPSY-1
       (pha = current_phase cua TR, X khi chua co). TR lien ket da xac dinh nhanh (xem update_tr) thi
       setup nguoc nhanh bi tu choi.
+    TM - #OFF-PLAN: hai cau trong note duoc position_watcher doc (lenh ngoai ke hoach):
+      "Gợi ý vốn 80% hạn mức" (ti le so voi max_margin_per_trade -> co SIZE_OVER_PLAN khi margin that vuot) va
+      "Chia entry: 1/2 ..., 1/2 chờ retest LPSY 70635–70800" (lenh them trong vung retest la hop le).
     """
     return _save_setups(_resolve_symbol(symbol), setups, bool(replace), "claude")
 
@@ -5051,6 +5105,11 @@ async def _chart_data(symbol: str, timeframe: str, bars: Any, day: Any, include_
     out = {**core, "freshness": _chart_freshness(core, int(time.time() * 1000))}
     if positions:
         out["positions"] = await _dash_positions(symbol)
+        # TM - #OFF-PLAN - Marker cam diem vao lenh ngoai ke hoach. Chi chu tai khoan (lo vi the), khong
+        # vao cache chung cua chart. Khong sua list cua core: core dang nam trong cache.
+        extra = _op_markers(symbol, core["date"])
+        if extra:
+            out["markers"] = sorted(core["markers"] + extra, key=lambda m: m["t"])
     return out
 
 
@@ -5675,7 +5734,9 @@ def _review_stats(symbol: str, from_date: str, to_date: str, group_by: str) -> d
              "outcome": (reviews.get(s["id"]) or {}).get("outcome"),
              "r_multiple": (reviews.get(s["id"]) or {}).get("r_multiple")} for s in setups]
     return {"symbol": sym, "from": from_day, "to": to_day, "group_by": group_by,
-            **dashboard_logic.review_stats(rows, group_by)}
+            **dashboard_logic.review_stats(rows, group_by),
+            # TM - #OFF-PLAN - Trong ke hoach vs ngoai ke hoach tren vi the that
+            "plan_compare": _op_compare(from_day, to_day, sym)}
 
 
 @_tool_with_reasons()
@@ -5690,8 +5751,517 @@ def get_review_stats(symbol: str = "", from_date: str = "", to_date: str = "",
     schematic (cua TR lien ket). Nhom cheo bang dau phay, vd "direction,event_ref_type,phase" = win
     rate cua long TEST trong pha C. Setup khong co gia tri nam o nhom "chua_co".
     TM - #TR-BRANCH: group_by them branch (accumulation | distribution | range) | entry_event.
+    TM - #OFF-PLAN: plan_compare = vi the THAT trong ke hoach vs ngoai ke hoach (so lenh, win rate, tong PnL
+    chua tru phi, R trung binh), them by_classification va by_verdict (lenh ngoai ke hoach da review).
     """
     return _review_stats(symbol, from_date, to_date, group_by)
+
+
+# ---------------------------------------------------------------- lenh ngoai ke hoach
+# TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
+# position_watcher doi chieu moi vi the moi tren san voi ke hoach setup. Chi canh bao va ghi nhan:
+# khong chan lenh, khong dong lenh (chan lenh la ticket gate OKX rieng).
+
+OP_STORE = off_plan_store.OffPlanStore(SQLITE_PATH)
+OP_LOG_WINDOW_MS = 3_600_000     # log_trade cach gio mo vi the trong 1 gio thi coi la cung mot lenh
+OP_VIEW_KEYS = ("code", "position_id", "symbol", "side", "trade_date", "entry_avg", "qty", "margin_usd",
+                "leverage", "exchange_sl", "exchange_tp", "classification", "flags", "candidate_setups",
+                "tr_snapshot", "rule_check", "rule_set", "realized_pnl", "fee", "r_multiple", "review_status",
+                "tan_reason", "claude_assessment", "verdict", "lesson", "add_to_plan", "notified", "notify_error")
+IN_PLAN = off_plan_logic.IN_PLAN
+
+
+def _op_cfg() -> dict[str, Any]:
+    return _alerts_cfg()["off_plan"]
+
+
+def _op_active() -> bool:
+    return bool(_op_cfg().get("enabled")) and _account_enabled()
+
+
+def _op_day(ms: int) -> str:
+    return off_plan_logic.local_day(ms, TZ)
+
+
+def _op_prev_day(day: str) -> str:
+    return (datetime.strptime(day, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+async def _op_read(symbol: str, start_ms: int, end_ms: int) -> dict[str, Any]:
+    """Vi the dang mo + fill tu start_ms gom theo vi the (cung ham voi get_fills). Loi thi nem ra:
+    watcher bo qua cap do trong lan poll, khong doan."""
+    adapter = _exchange()
+    async with httpx.AsyncClient() as client:
+        positions = await adapter.positions(client, symbol)
+        fills = await adapter.fills(client, start_ms, end_ms, symbol)
+    return {"positions": positions, "groups": _fill_positions(fills, symbol)}
+
+
+async def _op_stops(symbol: str) -> list[dict[str, Any]] | None:
+    adapter = _exchange()
+    async with httpx.AsyncClient() as client:
+        return await adapter.stops(client, symbol)
+
+
+def _op_setups(symbol: str, at: int) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """Setup cung cap: bias_date = ngay mo vi the, hoac setup ngay khac con han tai luc do."""
+    day = _op_day(at)
+    seen: dict[str, dict[str, Any]] = {}
+    for row in (SETUPS.list(symbol=symbol, bias_date=day) + SETUPS.list(symbol=symbol, bias_date=_op_prev_day(day))
+                + SETUPS.active(symbol)):
+        seen.setdefault(row["id"], row)
+    rows = [r for r in seen.values() if int(r["created_at"]) <= at
+            and (r["bias_date"] == day or int(r["expires_at"]) >= at)]
+    return rows, SETUPS.events_of([r["id"] for r in rows])
+
+
+def _op_candidates(symbol: str, at: int, min_rr: float) -> list[dict[str, Any]]:
+    rows, events = _op_setups(symbol, at)
+    out = []
+    for setup in rows:
+        status = off_plan_logic.status_at(setup, events[setup["id"]], at)
+        if status and status != "CANCELLED":
+            out.append(off_plan_logic.candidate(setup, status, min_rr))
+    return out
+
+
+def _op_forced(ref: str, symbol: str, side: str, at: int, min_rr: float) -> dict[str, Any]:
+    """Setup Tan gan tay (log_trade / reclassify_position). Trang thai lay tai luc mo vi the, bo qua
+    FILLED (do chinh vi the nay). Setup luu sau luc mo thi lay trang thai ngay truoc khi FILLED."""
+    setup = SETUPS.get(str(ref).strip())
+    if setup["symbol"] != symbol:
+        raise ValueError(f"setup {setup['code']} la cua {setup['symbol']}, vi the la {symbol}")
+    if setup["direction"] != side:
+        raise ValueError(f"setup {setup['code']} la {setup['direction']}, vi the la {side}")
+    events = SETUPS.events_of([setup["id"]])[setup["id"]]
+    status = off_plan_logic.status_at(setup, events, at, ignore_filled=True)
+    if status is None:
+        filled = next((int(e["at"]) for e in events if e["event"] == "FILLED"), None)
+        moment = filled - 1 if filled else int(time.time() * 1000)
+        status = off_plan_logic.status_at(setup, events, moment, ignore_filled=True) or "WAITING"
+    return off_plan_logic.candidate(setup, status, min_rr)
+
+
+def _op_journal_setup(symbol: str, side: str, at: int) -> str | None:
+    """log_trade(setup_id=...) ghi trong 1 gio quanh luc mo vi the -> lay dung setup do, bo auto-match."""
+    day = _op_day(at)
+    used = {r["matched_setup_id"] for r in OP_STORE.day_rows(day) if (r.get("explain") or {}).get("forced_by")}
+    best: tuple[int, str] | None = None
+    for trade in _read_json(JOURNAL_DIR / f"{day}.json", []):
+        if not isinstance(trade, dict) or not trade.get("setup_id") or trade["setup_id"] in used:
+            continue
+        if str(trade.get("symbol") or DEFAULT_SYMBOL) != symbol or trade.get("side") != side:
+            continue
+        try:
+            logged = int(datetime.fromisoformat(str(trade.get("opened_at"))).timestamp() * 1000)
+        except ValueError:
+            continue
+        gap = abs(logged - at)
+        if gap <= OP_LOG_WINDOW_MS and (best is None or gap < best[0]):
+            best = (gap, trade["setup_id"])
+    return best[1] if best else None
+
+
+def _op_tr(symbol: str, at: int) -> dict[str, Any] | None:
+    tr = PLANS.tr_at(symbol, at)
+    if not tr:
+        return None
+    return {"tr_id": tr.get("id"), "timeframe": tr.get("timeframe"), "phase": tr.get("current_phase"),
+            "schematic": tr.get("schematic"), "branch": tr.get("branch"),
+            "prob_accumulation": tr.get("prob_accumulation"), "prob_distribution": tr.get("prob_distribution")}
+
+
+def _op_orb(symbol: str, side: str, at: int) -> dict[str, Any] | None:
+    """Vi the khop phien ORB dang chay (trong trade window, dung huong pha vo, chua skip) -> IN_PLAN.
+    Khong khop thi tra ly do ORB de ghi kem NO_PLAN. ORB tat / khac cap -> None."""
+    if not ORB_ENABLED or symbol != ORB_SYMBOL:
+        return None
+    try:
+        svc = _orb()
+        if not svc.enabled():
+            return None
+        reason = None
+        for session in svc.resolve():
+            sid = session["session_id"]
+            day = svc.default_day(session, at)
+            checks = svc.orb_checks(sid, day.isoformat(), at=at)
+            if checks["opening_range"].get("status") == "no_session":
+                continue
+            direction = svc.signal(session, day, at).get("direction")
+            if checks["in_window"] and not checks["skipped"] and direction == side:
+                return {"match": True, "session_id": sid, "or_date": checks["or_date"],
+                        "reason": f"phiên {sid} phá {direction} trong trade window"}
+            window = f"{str(checks['window_vn']['from'])[11:16]}–{str(checks['window_vn']['to'])[11:16]}"
+            if not checks["in_window"]:
+                why = f"phiên {sid} ngoài trade window ({window})"
+            elif checks["skipped"]:
+                why = f"phiên {sid} đã skip"
+            elif direction is None:
+                why = f"phiên {sid} chưa có tín hiệu phá vỡ"
+            else:
+                why = f"phiên {sid} phá {direction}, ngược hướng vị thế"
+            reason = reason or why
+        return {"match": False, "reason": reason} if reason else None
+    except Exception as exc:
+        print(f"BAMCP off-plan ORB {symbol}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return None
+
+
+def _op_rule_check(symbol: str, side: str, entry: float, sl: float | None, tp: float | None,
+                   margin: float | None, prior: int, realized: float, orb_match: dict[str, Any] | None,
+                   at: int) -> dict[str, Any]:
+    """Cung ham cham voi check_trade, voi gia vao, SL/TP va margin THAT tren san."""
+    if orb_match and orb_match.get("match"):
+        if sl is None or tp is None:
+            return {"rule_set": "orb", "stop": sl, "target": tp, "margin_usd": margin, "violations": [],
+                    "notes": ["chưa có SL/TP trên sàn - chưa chấm rule ORB"]}
+        verdict = _orb().score_trade(orb_match["session_id"], orb_match["or_date"], side=side, entry=entry,
+                                     stop=sl, target=tp, margin_usd=float(margin or 0.0), symbol=symbol, at=at)
+        return {"rule_set": "orb", "stop": sl, "target": tp, "rr": verdict.get("rr"), "margin_usd": margin,
+                "violations": list(verdict["rule_violations"]), "notes": []}
+    rules = _load_rules(symbol)
+    target_points = abs(float(tp) - entry) if tp is not None else None
+    trade_type = ("swing" if target_points is not None
+                  and target_points >= float(rules["swing_min_take_profit_points"]) else "scalp")
+    verdict = _evaluate_trade(symbol=symbol, side=side, entry=entry, stop=sl, target=tp,
+                              margin_usd=float(margin or 0.0), trade_type=trade_type, trades=[{}] * prior,
+                              rules=rules, realized=realized)
+    notes = []
+    if sl is None:
+        notes.append("chưa có SL trên sàn - bỏ qua rule SL và R:R")
+    if tp is None:
+        notes.append("chưa có TP trên sàn - bỏ qua rule TP và R:R")
+    if not margin:
+        notes.append("chưa đọc được margin - bỏ qua rule margin")
+    return {"rule_set": "general", "trade_type": verdict["trade_type"], "stop": sl, "target": tp, "rr": verdict["rr"],
+            "margin_usd": margin, "trades_before": prior, "realized_before": realized,
+            "violations": verdict["rule_violations"], "limits_applied": verdict["limits_applied"], "notes": notes}
+
+
+def _op_revenge(at: int, row_id: str | None) -> dict[str, Any] | None:
+    window = float(_op_cfg().get("revenge_window_minutes") or 0) * 60_000
+    if window <= 0:
+        return None
+    losses = [r for r in OP_STORE.closed_between(int(at - window), at)
+              if r["id"] != row_id and (r["realized_pnl"] or 0) + (r["fee"] or 0) < 0]
+    if not losses:
+        return None
+    last = max(losses, key=lambda r: r["closed_at"])
+    # Phut theo dong ho (09:26 - 09:05 = 21), cach Tan doc gio tren tin
+    return {"ref": last["code"] or last["position_id"] or f"{last['symbol']} {last['side']}",
+            "position_id": last["position_id"], "closed_at": _stamp(last["closed_at"]),
+            "minutes": at // 60_000 - int(last["closed_at"]) // 60_000, "pnl": last["realized_pnl"]}
+
+
+def _op_size(matched: dict[str, Any] | None, margin: float | None, rule: dict[str, Any],
+             symbol: str) -> dict[str, Any] | None:
+    """margin that vuot "Gợi ý vốn N% hạn mức" ghi trong note setup khop."""
+    if not matched or not matched.get("capital_pct") or not margin:
+        return None
+    rules = _load_rules(symbol)
+    swing = rule.get("trade_type") == "swing" and float(rules["swing_max_margin_per_trade"]) > 0
+    limit = float(rules["swing_max_margin_per_trade"] if swing else rules["max_margin_per_trade"])
+    if limit <= 0:
+        return None
+    suggested = round(limit * float(matched["capital_pct"]) / 100, 2)
+    if float(margin) <= suggested * (1 + off_plan_logic.SIZE_TOLERANCE):
+        return None
+    return {"setup_code": matched["code"], "capital_pct": float(matched["capital_pct"]), "limit": limit,
+            "suggested": suggested, "margin_usd": float(margin)}
+
+
+def _op_brief(cand: dict[str, Any]) -> dict[str, Any]:
+    return {k: cand.get(k) for k in ("id", "code", "label", "direction", "status")}
+
+
+def _op_snapshot(cand: dict[str, Any]) -> dict[str, Any]:
+    return {k: cand.get(k) for k in ("id", "code", "label", "direction", "status", "zone_low", "zone_high", "entry",
+                                     "stop", "target", "max_chase", "capital_pct", "split_entry", "retest_zone")}
+
+
+def _op_classify(pos: dict[str, Any], forced: str | None = None) -> dict[str, Any]:
+    """Phan loai + co cho mot vi the. pos: {symbol, side, entry, opened_at, margin_usd?, sl?, tp?, row_id?,
+    forced_by?}. Moi so lieu ke hoach lay TAI LUC MO vi the. NO_STOP do watcher gan (can thoi gian cho)."""
+    symbol, side = str(pos["symbol"]).upper(), pos["side"]
+    at, entry = int(pos["opened_at"]), float(pos["entry"])
+    day = _op_day(at)
+    min_rr = float(_load_rules(symbol)["min_rr"])
+    cands = _op_candidates(symbol, at, min_rr)
+    forced_by = pos.get("forced_by") or ("reclassify" if forced else None)
+    if not forced:
+        forced = _op_journal_setup(symbol, side, at)
+        forced_by = "log_trade" if forced else None
+    forced_cand = _op_forced(forced, symbol, side, at, min_rr) if forced else None
+    result = off_plan_logic.classify(side, entry, symbol, cands, forced=forced_cand)
+    orb_info = None
+    if result["classification"] != IN_PLAN and forced_cand is None:
+        orb_info = _op_orb(symbol, side, at)
+        if orb_info and orb_info.get("match"):
+            result = {"classification": IN_PLAN, "setup": None, "reason": f"khớp ORB: {orb_info['reason']}",
+                      "listing": [], "listing_title": None}
+    matched = result["setup"]
+    others = [r for r in OP_STORE.day_rows(day) if r["id"] != pos.get("row_id") and int(r["opened_at"]) < at]
+    prior = [r for r in others if r.get("rule_set") != "orb"]
+    realized = round(sum((r["realized_pnl"] or 0) + (r["fee"] or 0) for r in prior
+                         if r["closed_at"] and int(r["closed_at"]) <= at), 2)
+    rule = _op_rule_check(symbol, side, entry, pos.get("sl"), pos.get("tp"), pos.get("margin_usd"), len(prior),
+                          realized, orb_info, at)
+    kind = result["classification"]
+    nth = 1 + sum(1 for r in others if r["classification"] != IN_PLAN) if kind != IN_PLAN else 0
+    revenge = _op_revenge(at, pos.get("row_id"))
+    size = _op_size(matched, pos.get("margin_usd"), rule, symbol)
+    tr = _op_tr(symbol, at)
+    flags = off_plan_logic.build_flags(classification=kind, side=side, violations=rule["violations"], tr=tr,
+                                       nth=nth, revenge=revenge, size_over=size)
+    snapshot = [_op_snapshot(c) for c in cands]
+    if forced_cand is not None and all(c["id"] != forced_cand["id"] for c in cands):
+        snapshot.append(_op_snapshot(forced_cand))
+    explain = {"reason": result["reason"], "listing": [_op_brief(c) for c in result["listing"]],
+               "listing_title": result["listing_title"], "nth": nth, "revenge": revenge, "size": size,
+               "forced_by": forced_by, "entry": entry,
+               "orb": orb_info, "orb_reason": (orb_info or {}).get("reason") if kind == "NO_PLAN" else None}
+    return {"classification": kind, "matched_setup_id": matched["id"] if matched else None,
+            "candidates": snapshot, "tr": tr, "rule_check": rule, "flags": flags, "explain": explain,
+            "rule_set": "orb" if orb_info and orb_info.get("match") else "general", "forced_by": forced_by}
+
+
+def _op_check_add(row: dict[str, Any], leg: dict[str, Any]) -> dict[str, Any]:
+    """Phan them hop le khi setup khop co ke hoach chia entry ("Chia entry: ... retest LPSY a–b" trong note)
+    va gia them nam trong vung retest do, hoac gia them khop dung mot setup khac dang IN_PLAN."""
+    symbol, side, at, price = row["symbol"], row["side"], int(leg["at"]), float(leg["price"])
+    min_rr = float(_load_rules(symbol)["min_rr"])
+    cands = _op_candidates(symbol, at, min_rr)
+    matched = None
+    if row.get("matched_setup_id"):
+        try:
+            matched = _op_forced(row["matched_setup_id"], symbol, side, at, min_rr)
+        except ValueError:
+            matched = None
+    reasons = []
+    if matched and matched["split_entry"]:
+        zone = matched["retest_zone"] or [matched["zone_low"], matched["zone_high"]]
+        where = "vùng retest" if matched["retest_zone"] else "vùng setup (note không ghi vùng retest)"
+        text = f"{where} {off_plan_logic.price(zone[0])}–{off_plan_logic.price(zone[1])} của {matched['code']}"
+        if zone[0] <= price <= zone[1]:
+            return {"valid": True, "reason": f"giá thêm {off_plan_logic.price(price)} trong {text} (kế hoạch chia entry)",
+                    "setup_code": matched["code"]}
+        reasons.append(f"giá thêm {off_plan_logic.price(price)} ngoài {text}")
+    elif matched:
+        reasons.append(f"{matched['code']} không có kế hoạch chia entry")
+    others = [c for c in cands if not matched or c["id"] != matched["id"]]
+    result = off_plan_logic.classify(side, price, symbol, others)
+    if result["classification"] == IN_PLAN:
+        return {"valid": True, "reason": f"phần thêm {result['reason']}", "setup_code": result["setup"]["code"]}
+    reasons.append(f"phần thêm: {result['reason']}")
+    return {"valid": False, "reason": "; ".join(reasons), "setup_code": matched["code"] if matched else None}
+
+
+def _op_reclassify(row: dict[str, Any], setup_ref: str, by: str) -> dict[str, Any]:
+    explain = row.get("explain") or {}
+    info = _op_classify({"symbol": row["symbol"], "side": row["side"], "entry": explain.get("entry", row["entry_avg"]),
+                         "opened_at": row["opened_at"], "margin_usd": row.get("margin_usd"), "sl": row["exchange_sl"],
+                         "tp": row["exchange_tp"], "row_id": row["id"], "forced_by": by}, forced=setup_ref)
+    flags = [f for f in off_plan_logic.FLAGS
+             if f in set(info["flags"]) | {f for f in row["flags"] if f in off_plan_logic.KEEP_FLAGS}]
+    new_explain = {**info["explain"], **{k: explain[k] for k in ("late_minutes",) if k in explain}}
+    before = row["classification"]
+    row = OP_STORE.update(row["id"], classification=info["classification"], matched_setup_id=info["matched_setup_id"],
+                          candidate_setups=info["candidates"], tr_snapshot=info["tr"], rule_check=info["rule_check"],
+                          rule_set=info["rule_set"], flags=flags, explain=new_explain)
+    if off_plan_logic.alertable(row) and not row["code"]:
+        row = OP_STORE.update(row["id"], code=OP_STORE.assign_code(row["id"]))
+    setup = SETUPS.get(setup_ref)
+    OP_STORE.add_event(row["id"], "RECLASSIFIED", {"from": before, "to": row["classification"], "by": by,
+                                                   "setup_code": setup["code"], "reason": new_explain.get("reason")})
+    return row
+
+
+def _op_link_log_trade(symbol: str, side: str, setup_id: str) -> dict[str, Any] | None:
+    """log_trade(setup_id) cho vi the watcher da phan loai: gan vi the vao setup do va phan loai lai."""
+    now = int(time.time() * 1000)
+    rows = [r for r in OP_STORE.list(from_date=_op_prev_day(_today()), symbol=symbol)
+            if r["side"] == side and abs(int(r["opened_at"]) - now) <= OP_LOG_WINDOW_MS
+            and not ((r.get("explain") or {}).get("forced_by"))]
+    if not rows:
+        return None
+    row = min(rows, key=lambda r: abs(int(r["opened_at"]) - now))
+    before = row["classification"]
+    if row["matched_setup_id"] == setup_id and before == IN_PLAN:
+        return {"code": row["code"], "position_id": row["position_id"], "classification": before,
+                "reclassified": False}
+    row = _op_reclassify(row, setup_id, "log_trade")
+    return {"code": row["code"], "position_id": row["position_id"], "from": before,
+            "classification": row["classification"], "flags": row["flags"], "reclassified": True}
+
+
+def _op_view(row: dict[str, Any], events: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    out = {k: row.get(k) for k in OP_VIEW_KEYS}
+    explain = row.get("explain") or {}
+    out.update(opened_at=_stamp(row["opened_at"]), opened_ms=int(row["opened_at"]),
+               closed_at=_stamp(row["closed_at"]) if row.get("closed_at") else None,
+               status="closed" if row.get("closed_at") else "open", reason=explain.get("reason"),
+               explain=explain, review_prompt=f"đánh giá lệnh {row['code']}" if row.get("code") else None)
+    if row.get("closed_at") and row.get("r_multiple") is None:
+        out["r_note"] = "không có SL nên không tính được R" if row.get("exchange_sl") is None else "chưa tính được R"
+    if row.get("matched_setup_id"):
+        try:
+            out["matched_setup"] = _setup_brief(SETUPS.get(row["matched_setup_id"]))
+        except ValueError:
+            out["matched_setup"] = None
+    if events is not None:
+        out["events"] = [{"event": e["event"], "at": _stamp(e["at"]), "details": e["details"],
+                          "notified": e["notified"], "notify_error": e["notify_error"]} for e in events]
+    return out
+
+
+def _op_stat(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    closed = [r for r in rows if r.get("closed_at")]
+    wins = sum(1 for r in closed if (r.get("realized_pnl") or 0) > 0)
+    rs = [float(r["r_multiple"]) for r in closed if r.get("r_multiple") is not None]
+    return {"trades": len(rows), "closed": len(closed), "wins": wins,
+            "win_rate": round(100 * wins / len(closed), 1) if closed else None,
+            "pnl": off_plan_logic.round2(sum(float(r.get("realized_pnl") or 0) for r in closed)),
+            "fee": off_plan_logic.round2(sum(float(r.get("fee") or 0) for r in closed)),
+            "avg_r": round(sum(rs) / len(rs), 2) if rs else None, "r_count": len(rs)}
+
+
+def _op_compare(from_day: str, to_day: str, symbol: str | None) -> dict[str, Any]:
+    """Trong ke hoach vs ngoai ke hoach tu vi the that (position_watcher), theo classification va verdict."""
+    rows = OP_STORE.list(from_date=from_day, to_date=to_day, symbol=symbol)
+    inside = [r for r in rows if r["classification"] == IN_PLAN]
+    outside = [r for r in rows if r["classification"] != IN_PLAN]
+
+    def grouped(key: str) -> list[dict[str, Any]]:
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for row in outside if key == "verdict" else rows:
+            groups.setdefault(str(row.get(key) or dashboard_logic.NO_GROUP), []).append(row)
+        return [{"key": k, **_op_stat(v)} for k, v in sorted(groups.items())]
+
+    return {"in_plan": _op_stat(inside), "off_plan": _op_stat(outside),
+            "by_classification": grouped("classification"), "by_verdict": grouped("verdict"),
+            "note": ("Vị thế thật do position_watcher ghi (#OFF-PLAN). pnl = realized_pnl chưa trừ phí, win = "
+                     "pnl > 0, avg_r chỉ tính lệnh có SL trên sàn. by_verdict chỉ gồm lệnh ngoài kế hoạch.")}
+
+
+def _op_summary(day: str) -> dict[str, Any]:
+    rows = OP_STORE.day_rows(day)
+    outside = [r for r in rows if r["classification"] != IN_PLAN]
+    coded = [r for r in rows if r.get("code")]
+    pending = [r["code"] for r in coded if r["review_status"] == "PENDING"]
+    by_class: dict[str, int] = {}
+    for row in outside:
+        by_class[row["classification"]] = by_class.get(row["classification"], 0) + 1
+    return {"enabled": _op_active(), "count": len(outside), "codes": [r["code"] for r in outside if r.get("code")],
+            "pending_review": len(pending), "pending_codes": pending,
+            "pnl": off_plan_logic.round2(sum(float(r.get("realized_pnl") or 0) for r in outside if r.get("closed_at"))),
+            "open": sum(1 for r in outside if not r.get("closed_at")), "by_classification": by_class,
+            "in_plan_breach": [r["code"] for r in coded if r["classification"] == IN_PLAN],
+            "note": "Lệnh ngoài kế hoạch hôm nay - mở Claude: \"đánh giá lệnh <mã>\" để review."}
+
+
+def _op_link(row: dict[str, Any]) -> str | None:
+    return _dash_url(row["symbol"], row["trade_date"])
+
+
+OP_WATCHER = off_plan_watcher.OffPlanWatcher(
+    OP_STORE, cfg=_op_cfg, notify_cfg=lambda: _alerts_cfg()["notify"], active=_op_active, symbols=_symbols,
+    read=_op_read, stops=_op_stops, classify=_op_classify, check_add=_op_check_add, tz=TZ,
+    display_tz=lambda: WATCHER.display_tz(), link=_op_link)
+
+
+def _op_markers(symbol: str, day: str) -> list[dict[str, Any]]:
+    """Marker cam diem vao lenh ngoai ke hoach tren chart. Chi chu tai khoan (lo vi the)."""
+    return [{"kind": "off_plan", "t": int(r["opened_at"]), "price": (r.get("explain") or {}).get("entry", r["entry_avg"]),
+             "side": r["side"], "code": r["code"], "classification": r["classification"]}
+            for r in OP_STORE.day_rows(day) if r["symbol"] == symbol and r.get("code")]
+
+
+@_tool_with_reasons()
+def get_off_plan_trades(date: str = "", status: str = "", symbol: str = "", code: str = "") -> dict[str, Any]:
+    """Lenh ngoai ke hoach (co ma OP-...) do position_watcher bat: phan loai, co, setup ung vien, TR, ket qua.
+
+    date: 'YYYY-MM-DD' ngay mo vi the (bo trong = hom nay). code: ma OP-... (bo qua date).
+    status: PENDING | REVIEWED | open | closed hoac ma phan loai (COUNTER_PLAN...), nhieu gia tri cach dau phay.
+    symbol: loc theo cap.
+    classification: IN_PLAN (chi co ma khi pham rule / thieu SL) | EARLY (setup chua trigger) | CHASE (vuot
+      max_chase hoac setup da MISSED) | OUT_OF_ZONE | COUNTER_PLAN (ke hoach chi co huong nguoc lai) | NO_PLAN
+      | PRUNED_SETUP (chi khop setup da ket thuc). Phan loai theo trang thai setup TAI LUC MO vi the.
+    flags: NO_STOP, REVENGE, RULE_BREACH, AGAINST_TR_BRANCH, REPEAT_OFF_PLAN, SIZE_OVER_PLAN, ADD_OFF_PLAN.
+    candidate_setups: anh chup setup luc phan loai; tr_snapshot: TR luc do; rule_check: ket qua ham check_trade
+    voi gia vao, SL/TP, margin that. realized_pnl chua tru phi (fee rieng); r_multiple null khi khong co SL.
+
+    QUY TRINH khi Tan nhan "danh gia lenh OP-...":
+    1. get_off_plan_trades(code=...) lay lenh; get_setups(date=trade_date) + get_chart_data(symbol, "15m",
+       date=trade_date) lay ke hoach va TR luc do.
+    2. Keo nen M15 (>= 24 nen truoc gio vao) va M5 quanh gio vao bang get_klines - chi doc nen DA DONG tai
+       thoi diem vao lenh, khong dung nen sau do de bien minh.
+    3. Chua co tan_reason thi hoi Tan ly do vao lenh, ghi tan_reason.
+    4. Cham theo checklist vao lenh M15: co vung khong, co trigger khong, khop su kien Wyckoff nao, R:R, SL;
+       so voi cac setup trong ke hoach (candidate_setups).
+    5. Ket luan verdict (valid_unplanned | discipline_breach | execution_error | misclassified) + lesson.
+       valid_unplanned thi de xuat cach bo sung loai setup do vao quy trinh phan tich (add_to_plan=true).
+       He thong phan loai sai thi reclassify_position(position_id, setup_id).
+    6. review_off_plan_trade(code, ...) luu lai.
+    """
+    sym = _resolve_symbol(symbol) if str(symbol or "").strip() else None
+    if str(code or "").strip():
+        rows = [OP_STORE.get(code)]
+    else:
+        day = _dash_day(date)
+        rows = OP_STORE.list(from_date=day, to_date=day, symbol=sym, coded_only=True)
+    wanted = {s.strip().upper() for s in str(status or "").split(",") if s.strip()}
+    if wanted:
+        rows = [r for r in rows if wanted & {r["review_status"], r["classification"],
+                                             "CLOSED" if r.get("closed_at") else "OPEN"}]
+    events = OP_STORE.events([r["id"] for r in rows])
+    return {"count": len(rows), "watcher_enabled": _op_active(),
+            "trades": [_op_view(r, events[r["id"]]) for r in rows],
+            "verdicts": list(off_plan_logic.VERDICTS)}
+
+
+@_tool_with_reasons()
+def review_off_plan_trade(code: str, tan_reason: str | None = None, claude_assessment: str | None = None,
+                          verdict: str | None = None, lesson: str | None = None,
+                          add_to_plan: bool | None = None) -> dict[str, Any]:
+    """Luu danh gia cho mot lenh OP-.... Chi ghi de truong co truyen; co verdict thi review_status = REVIEWED.
+
+    verdict: valid_unplanned (co hoi hop le chua co trong ke hoach) | discipline_breach (vi pham ky luat) |
+      execution_error (loi thao tac) | misclassified (he thong phan loai sai - goi reclassify_position).
+    add_to_plan: co nen bo sung loai setup nay vao quy trinh phan tich khong.
+    """
+    row = OP_STORE.get(str(code or "").strip())
+    changes: dict[str, Any] = {}
+    for key, value in (("tan_reason", tan_reason), ("claude_assessment", claude_assessment), ("lesson", lesson)):
+        if value is not None:
+            changes[key] = str(value).strip() or None
+    if verdict is not None and str(verdict).strip():
+        label = str(verdict).strip().lower()
+        if label not in off_plan_logic.VERDICTS:
+            raise ValueError(f"verdict phai la mot trong {list(off_plan_logic.VERDICTS)}")
+        changes.update(verdict=label, review_status="REVIEWED")
+    if add_to_plan is not None:
+        changes["add_to_plan"] = bool(add_to_plan)
+    if not changes:
+        raise ValueError("can it nhat mot truong: tan_reason, claude_assessment, verdict, lesson, add_to_plan")
+    row = OP_STORE.update(row["id"], **changes)
+    OP_STORE.add_event(row["id"], "REVIEWED", {k: v for k, v in changes.items()})
+    return {"code": row["code"], "review_status": row["review_status"], "trade": _op_view(row)}
+
+
+@_tool_with_reasons()
+def reclassify_position(position_id: str, setup_id: str) -> dict[str, Any]:
+    """He thong phan loai sai: gan vi the vao setup roi phan loai lai (event RECLASSIFIED).
+
+    position_id: dang get_fills (BTCUSDT-P1, uu tien hom nay) hoac ma OP-.... setup_id: id hoac code setup,
+    phai cung cap va cung huong voi vi the. Trang thai setup lay tai luc mo vi the: setup chua trigger thi
+    van ra EARLY - gan tay khong bien lenh vao som thanh trong ke hoach. Khong doi trang thai setup
+    (muon setup sang FILLED thi dung log_trade(setup_id=...)).
+    """
+    row = OP_STORE.find_position(position_id, _today())
+    before = row["classification"]
+    row = _op_reclassify(row, str(setup_id or "").strip(), "reclassify")
+    return {"position_id": row["position_id"], "code": row["code"], "from": before,
+            "classification": row["classification"], "trade": _op_view(row)}
 
 
 # ---------------------------------------------------------------- admin
@@ -6700,6 +7270,11 @@ def _alerts_view(date_text: str, status: str) -> dict[str, Any]:
         "triggers": list(entry_logic.TRIGGERS), "date": date_text, "status": status,
         "today": _today(), "setups": [_setup_view(r, last.get(r["id"])) for r in rows],
         "last_scan": scan, "alerts_file": str(ALERTS_FILE), "warnings": warnings,
+        # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
+        "off_plan": {**cfg["off_plan"], "account_enabled": _account_enabled(), "running": OP_WATCHER.running,
+                     "kinds": list(off_plan_logic.NOTIFY_KINDS), "channels": list(notifier.CHANNELS),
+                     "last_poll": {**OP_WATCHER.last_poll, "at_text": _stamp(OP_WATCHER.last_poll["at"])}
+                     if OP_WATCHER.last_poll.get("at") else {}},
     }
 
 
@@ -6728,6 +7303,34 @@ def _alert_params(raw: Any) -> dict[str, Any]:
     if unknown:
         raise ValueError(f"tham so khong ho tro: {unknown}")
     return {k: _alert_param(k, v) for k, v in raw.items() if v is not None and v != ""}
+
+
+# TM - #OFF-PLAN - Kiem tra khoi off_plan tu trang admin truoc khi ghi
+def _off_plan_clean(payload: dict[str, Any]) -> dict[str, Any]:
+    def whole(name: str, low: int, high: int) -> int:
+        try:
+            value = float(payload.get(name))
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} phai la so, nhan duoc {payload.get(name)!r}") from None
+        if not low <= value <= high or value != int(value):
+            raise ValueError(f"{name} phai la so nguyen tu {low} den {high}")
+        return int(value)
+
+    channel = str(payload.get("channel") or "").strip().lower()
+    if channel and channel not in notifier.CHANNELS:
+        raise ValueError(f"channel phai de trong (dung kenh chung) hoac mot trong {list(notifier.CHANNELS)}")
+    kinds = payload.get("notify_classifications")
+    if not isinstance(kinds, list):
+        raise ValueError("notify_classifications phai la list")
+    unknown = sorted(set(map(str, kinds)) - set(off_plan_logic.NOTIFY_KINDS))
+    if unknown:
+        raise ValueError(f"notify_classifications khong ho tro: {unknown}")
+    return {"enabled": payload.get("enabled") in (True, 1, "1", "true", "on"),
+            "poll_seconds": whole("poll_seconds", 5, 300),
+            "no_stop_grace_seconds": whole("no_stop_grace_seconds", 0, 3600),
+            "revenge_window_minutes": whole("revenge_window_minutes", 0, 1440),
+            "channel": channel,
+            "notify_classifications": [k for k in off_plan_logic.NOTIFY_KINDS if k in set(map(str, kinds))]}
 
 
 async def _alerts_action(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -6787,6 +7390,10 @@ async def _alerts_action(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             block.pop("symbol_overrides", None)
             SETUPS.save_params(pair_params, "admin")
             _alerts_save("watcher", block)
+            return 200, {"ok": True}
+        # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
+        if action == "off_plan_save":
+            _alerts_save("off_plan", _off_plan_clean(payload))
             return 200, {"ok": True}
         if action == "setup_cancel":
             reason = str(payload.get("reason") or "").strip()
@@ -7141,6 +7748,24 @@ async def http_dash_fills(request, session):
     return _dash_json({"symbol": symbol, **await _dash_fills(symbol, _dash_day(request.query_params.get("date")))})
 
 
+# TM - #OFF-PLAN - Bang lenh ngoai ke hoach theo ngay (moi cap). Chi chu tai khoan: lo vi the va PnL.
+@_dash_route("/api/off-plan", owner=True)
+async def http_dash_off_plan(request, session):
+    day = _dash_day(request.query_params.get("date"))
+    hide = _dash_cfg()["hide_pnl"]
+    rows = []
+    for row in OP_STORE.list(from_date=day, to_date=day, coded_only=True):
+        item = {"code": row["code"], "symbol": row["symbol"], "side": row["side"],
+                "classification": row["classification"], "flags": row["flags"], "opened_ms": int(row["opened_at"]),
+                "closed": bool(row.get("closed_at")), "entry": (row.get("explain") or {}).get("entry", row["entry_avg"]),
+                "review_status": row["review_status"], "verdict": row.get("verdict"),
+                "reason": (row.get("explain") or {}).get("reason")}
+        if not hide:
+            item.update(realized_pnl=row.get("realized_pnl"), fee=row.get("fee"), r_multiple=row.get("r_multiple"))
+        rows.append(item)
+    return _dash_json({"date": day, "enabled": _op_active(), "trades": rows})
+
+
 @_dash_route("/api/reviews", methods=("POST",), owner=True)
 async def http_dash_reviews(request, session):
     try:
@@ -7156,8 +7781,17 @@ async def http_dash_reviews(request, session):
 @_dash_route("/api/review-stats")
 async def http_dash_review_stats(request, session):
     query = request.query_params
-    return _dash_json(_review_stats(query.get("symbol") or "", query.get("from") or "", query.get("to") or "",
-                                    query.get("group_by") or "trigger_type"))
+    data = _review_stats(query.get("symbol") or "", query.get("from") or "", query.get("to") or "",
+                         query.get("group_by") or "trigger_type")
+    # TM - #OFF-PLAN - plan_compare la vi the va PnL that: viewer khong duoc thay, hide_pnl thi bo so tien
+    if session["role"] != "owner":
+        data.pop("plan_compare", None)
+    elif _dash_cfg()["hide_pnl"]:
+        for block in [data["plan_compare"]["in_plan"], data["plan_compare"]["off_plan"],
+                      *data["plan_compare"]["by_classification"], *data["plan_compare"]["by_verdict"]]:
+            block.pop("pnl", None)
+            block.pop("fee", None)
+    return _dash_json(data)
 
 
 # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
@@ -7488,11 +8122,13 @@ def build_app():
                     if ORB_SCHEDULER is not None else None)
         # TM - #ENTRY-ALERT - Entry setups & alerts
         watch_task = asyncio.create_task(WATCHER.run_forever())
+        # TM - #OFF-PLAN - position_watcher, chay doc lap voi watcher setup M5
+        op_task = asyncio.create_task(OP_WATCHER.run_forever())
         try:
             async with inner(scope):
                 yield
         finally:
-            for running in (task, orb_task, watch_task):
+            for running in (task, orb_task, watch_task, op_task):
                 if running:
                     running.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
@@ -7544,6 +8180,8 @@ if __name__ == "__main__":
     # TM - #ENTRY-ALERT - Entry setups & alerts
     print(f"BAMCP watcher enabled={_watcher_active()} channel={_alerts_cfg()['notify'].get('channel')} "
           f"admin={ADMIN_ALERTS_PATH}", file=sys.stderr)
+    # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
+    print(f"BAMCP off-plan enabled={_op_active()} poll={_op_cfg().get('poll_seconds')}s", file=sys.stderr)
     # TM - #ORB - ORB Enhancement
     if ORB_ENABLED:
         print(f"BAMCP ORB: symbol={ORB_SYMBOL} sessions={ORB_SESSIONS.ids()} "

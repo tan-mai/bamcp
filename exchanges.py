@@ -95,6 +95,15 @@ class BaseExchange:
                           end_ms: int, symbol: str = "") -> list[dict[str, Any]]:
         raise NotImplementedError
 
+    # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
+    async def stops(self, client: httpx.AsyncClient,
+                    symbol: str = "") -> list[dict[str, Any]] | None:
+        """Lenh SL/TP dang cho tren san: [{algo_id, ord_type, side, pos_side, sl, tp, trigger, size}].
+
+        None = adapter nay chua doc duoc lenh algo, KHONG phai "khong co SL".
+        """
+        return None
+
     async def _request(self, client: httpx.AsyncClient, url: str,
                        headers: dict[str, str]) -> Any:
         try:
@@ -364,7 +373,33 @@ class OkxV5(BaseExchange):
                 "leverage": _f(row.get("lever")) or None,
                 # TM - #ENTRY-ALERT - Entry setups & alerts
                 "opened_ms": int(_f(row.get("cTime"))) or None,
+                # TM - #OFF-PLAN - margin that (isolated: margin, cross: imr) va TP/SL dat cho ca vi the
+                "margin_usd": _f(row.get("margin")) or _f(row.get("imr")) or None,
+                "close_algos": [{"sl": _f(a.get("slTriggerPx")) or None,
+                                 "tp": _f(a.get("tpTriggerPx")) or None, "pos_side": side}
+                                for a in row.get("closeOrderAlgo") or [] if isinstance(a, dict)],
             })
+        return out
+
+    # TM - #OFF-PLAN - Lenh algo dang cho: TP/SL dinh kem lenh (conditional, oco) va lenh trigger
+    _ALGO_TYPES = ("conditional", "oco", "trigger")
+
+    async def stops(self, client, symbol=""):
+        out = []
+        for ord_type in self._ALGO_TYPES:
+            rows = await self._get(client, "/api/v5/trade/orders-algo-pending", {
+                "ordType": ord_type, "instType": self._inst_type, "instId": self.market_symbol(symbol)})
+            for row in rows:
+                out.append({
+                    "algo_id": str(row.get("algoId")),
+                    "ord_type": row.get("ordType") or ord_type,
+                    "side": str(row.get("side", "")).lower(),
+                    "pos_side": str(row.get("posSide") or "net").lower(),
+                    "sl": _f(row.get("slTriggerPx")) or None,
+                    "tp": _f(row.get("tpTriggerPx")) or None,
+                    "trigger": _f(row.get("triggerPx")) or None,
+                    "size": _f(row.get("sz")),
+                })
         return out
 
     async def fills(self, client, start_ms, end_ms, symbol=""):

@@ -126,8 +126,8 @@ Thiếu credential thì server không dừng mà vào chế độ [setup token](
 | `GET /admin/gann`, `POST /admin/gann/action` | có* | Cặp phân tích, pivot thủ công, sự kiện, config GANN |
 | `GET /admin/schedules` | có* | Lịch kéo nến theo từng khung |
 | `POST /admin/schedules/action` | có* | Thêm / sửa / bật tắt / xoá / chạy ngay / xem trước cron |
-| `GET /admin/alerts` | có* | Thông báo Discord/Telegram, watcher, setups |
-| `POST /admin/alerts/action` | có* | Lưu thông báo / gửi thử / lưu watcher / huỷ, tạo setup, timeline |
+| `GET /admin/alerts` | có* | Thông báo Discord/Telegram, watcher, setups, mục Off-plan ([lệnh ngoài kế hoạch](off-plan.md)) |
+| `POST /admin/alerts/action` | có* | Lưu thông báo / gửi thử / lưu watcher / lưu off-plan / huỷ, tạo setup, timeline |
 | `GET /admin/dashboard-accounts` | có* | Tài khoản, cấu hình, thang điểm xác suất TR, audit log và lịch sử đăng nhập của dashboard |
 | `POST /admin/dashboard-accounts/action` | có* | Tạo / sửa / bật tắt / xoá tài khoản, lưu cấu hình |
 | `GET, POST /setup-dashboard/login` | không | Form đăng nhập dashboard, khoá theo IP khi sai nhiều lần |

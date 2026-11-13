@@ -36,9 +36,13 @@ class EntryWatcher:
                  sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
                  deliver: Callable[..., Awaitable[str | None]] = notifier.deliver,
                  refresh: Callable[[str, str], Awaitable[None]] | None = None,
-                 link: Callable[[dict[str, Any]], str | None] | None = None) -> None:
+                 link: Callable[[dict[str, Any]], str | None] | None = None,
+                 unplanned: Callable[[], bool] | None = None) -> None:
         self.store = store
         self.refresh = refresh
+        # TM - #OFF-PLAN - position_watcher dang chay thi no bao lenh ngoai ke hoach (chi tiet hon),
+        # watcher setup khong gui UNPLANNED_POSITION nua de khong bao hai lan
+        self.unplanned = unplanned
         # TM - #DASHBOARD - Setup dashboard: link dashboard kem trong tin push
         self.link = link
         self.klines = klines
@@ -201,7 +205,7 @@ class EntryWatcher:
                 ids = self.store.apply(best, "FILLED", best["state"], [event])
                 fillable.remove(best)
                 out.append((ids[-1], {**best, "status": "FILLED"}))
-            else:
+            elif self.unplanned is None or self.unplanned():
                 eid = self.store.system_event("UNPLANNED_POSITION",
                                               {"symbol": symbol, "position": position,
                                                "position_key": key},

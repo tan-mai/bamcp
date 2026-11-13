@@ -320,6 +320,18 @@ setup_params:
   ETHUSDT: *setup_params_base
   XAUUSDT: *setup_params_base
 
+# TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach (position_watcher). Gia tri KHOI TAO: sua o trang
+# /admin/alerts (muc Off-plan) thi ghi vao paths.alerts_config_file va thang khoi nay, co hieu luc ngay.
+# Chi chay khi doc tai khoan san dang bat. Chi canh bao va ghi nhan: khong chan lenh, khong dong lenh.
+off_plan:
+  enabled: true
+  poll_seconds: 15                   # doc vi the + fill trong ngay moi 15 giay
+  no_stop_grace_seconds: 60          # vi the mo qua muc nay ma san khong co lenh SL -> co NO_STOP, gui tin bo sung
+  revenge_window_minutes: 30         # mo lenh trong 30 phut sau mot vi the dong lo -> co REVENGE
+  channel: ""                        # "" = dung kenh notify.channel; discord | telegram | both de tach rieng
+  # Loai gui tin. IN_PLAN = trong ke hoach nhung pham rule / thieu SL. Bo khoi list = van ghi, khong gui.
+  notify_classifications: [IN_PLAN, EARLY, CHASE, OUT_OF_ZONE, COUNTER_PLAN, NO_PLAN, PRUNED_SETUP, ADD_OFF_PLAN]
+
 # TM - #DASHBOARD - Setup dashboard
 # Gia tri KHOI TAO. Sua o trang /admin/dashboard-accounts thi ban moi ghi vao
 # paths.dashboard_config_file (tren volume) va thang khoi nay, co hieu luc ngay.
@@ -674,6 +686,15 @@ instructions: |
   - Moi lan update_tr gui prob_evidence (thay ca danh sach) theo thang diem: htf_trend, phase_b_lows,
     phase_b_highs, test_highs, test_lows, phase_cd_event; side acc|dist; bo trong weight = lay thang diem.
     Nhac den xac suat thi noi ro day la diem bang chung, chua hieu chinh thong ke.
+
+  LENH NGOAI KE HOACH (#OFF-PLAN): position_watcher doi chieu moi vi the moi tren san voi setup trong
+  ngay, lenh lech ke hoach co ma OP-{yyyymmdd}-{SYM}-{n} va tin canh bao.
+  - get_today_status tra khoi off_plan: count >= 2 hoac pending_review > 0 thi noi ra truoc khi ban lenh moi.
+  - Khi Tan nhan "danh gia lenh OP-...": lam dung quy trinh trong docstring get_off_plan_trades (lay lenh,
+    ke hoach, TR, nen M15/M5 DA DONG tai luc vao, hoi ly do, cham checklist M15, ket luan verdict + lesson,
+    review_off_plan_trade luu lai). He thong phan loai sai thi reclassify_position(position_id, setup_id).
+  - Ghi "Gợi ý vốn N% hạn mức" va "Chia entry: ... retest LPSY a–b" trong note setup: watcher dung de
+    gan co SIZE_OVER_PLAN va xet lenh them (ADD_OFF_PLAN).
 
   BAMCP KHONG dat lenh. plan chi la de xuat da tinh san phi va truot gia vao R.
   Neu check_orb_signal co warning 'stale_m5' hoac data_status khac 'ok' thi noi ra.

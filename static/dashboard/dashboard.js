@@ -178,6 +178,7 @@
       surface: token("--surface"), ink: token("--ink"), muted: token("--muted"), grid: token("--grid"), line: token("--line-strong"),
       long: token("--long"), short: token("--short"), entry: token("--entry"), invalidate: token("--invalidate"),
       tr: token("--tr"), neutral: token("--neutral"),
+      offplan: token("--offplan"),  // TM - #OFF-PLAN
     };
   }
   let C = palette();
@@ -471,6 +472,15 @@
     // TM - #TR-BRANCH - marker cua setup PRUNED an cung the setup
     const hidden = new Set(d.setups.filter((s) => !shownSetups([s]).length).map((s) => s.code));
     (d.markers || []).forEach((m) => {
+      // TM - #OFF-PLAN - Diem vao lenh ngoai ke hoach: marker cam, chi chu tai khoan nhan duoc
+      if (m.kind === "off_plan") {
+        const at = snap(m.t);
+        if (!times.has(at)) return;
+        const up = m.side === "long";
+        out.push({ time: at, position: up ? "belowBar" : "aboveBar", shape: up ? "arrowUp" : "arrowDown",
+                   color: C.offplan, text: `${String(m.code).replace(/^OP-\d{8}-/, "OP ")} ${m.classification}` });
+        return;
+      }
       if (m.kind === "wyckoff" || hidden.has(m.code)) return;
       const time = snap(m.t);
       if (!times.has(time)) return;
@@ -1129,6 +1139,31 @@
         el("td", {}, p.setup_code ? letter(p.setup_code) : el("span", { class: "pill warn" }, "Không gắn setup"))))))));
   }
 
+  // TM - #OFF-PLAN - Bang lenh ngoai ke hoach trong ngay (moi cap)
+  const REVIEW_LABEL = { PENDING: "chưa đánh giá", REVIEWED: "đã đánh giá" };
+
+  function renderOffPlan(block) {
+    const panel = $("offPlanPanel");
+    panel.hidden = !OWNER || !block;
+    if (panel.hidden) return;
+    const box = $("offPlan");
+    if (!block.trades.length) {
+      box.replaceChildren(el("p", { class: "empty" }, block.enabled ? "Không có lệnh ngoài kế hoạch trong ngày." : "position_watcher đang tắt."));
+      return;
+    }
+    const hide = !("realized_pnl" in block.trades[0]);
+    box.replaceChildren(el("div", { class: "table-wrap" }, el("table", {},
+      el("thead", {}, el("tr", {}, ["Mã", "Cặp", "Hướng", "Phân loại", "Cờ", hide ? null : "PnL", "Review"].filter(Boolean).map((h) => el("th", {}, h)))),
+      el("tbody", {}, block.trades.map((t) => el("tr", { title: t.reason || "" },
+        el("td", {}, el("div", {}, String(t.code).replace(/^OP-\d{8}-/, "")), el("div", { class: "sub" }, hm(t.opened_ms))),
+        el("td", {}, t.symbol),
+        el("td", { class: t.side === "long" ? "long" : "short" }, t.side),
+        el("td", {}, el("span", { class: "pill " + (t.classification === "IN_PLAN" ? "warn" : "offplan") }, t.classification)),
+        el("td", { class: "flags" }, (t.flags || []).join(" · ") || "—"),
+        hide ? null : el("td", {}, t.closed ? num(t.realized_pnl, 2) : "đang mở"),
+        el("td", {}, t.verdict || REVIEW_LABEL[t.review_status] || t.review_status)))))));
+  }
+
   function renderStats(data) {
     const box = $("stats");
     if (!data.total.setups) {
@@ -1204,16 +1239,19 @@
     const ticket = ++listTicket;
     const base = { symbol: S.symbol, date: S.date };
     try {
-      const [setups, events, snapshots, fills] = await Promise.all([
+      const [setups, events, snapshots, fills, offPlan] = await Promise.all([
         api("/setups", base),
         api("/events", base),
         api("/snapshots", base),
         S.mode === "review" && OWNER ? api("/fills", base) : Promise.resolve(null),
+        // TM - #OFF-PLAN - Lenh ngoai ke hoach: ca live lan review, chi chu tai khoan
+        OWNER ? api("/off-plan", { date: S.date }).catch(() => null) : Promise.resolve(null),
       ]);
       if (ticket !== listTicket) return;
       renderSetups(setups.setups, setups.price);
       renderTimeline(events.events, snapshots.snapshots);
       renderFills(fills);
+      renderOffPlan(offPlan);
     } catch (err) {
       if (ticket === listTicket) setBanner(`Không tải được dữ liệu: ${err.message}`);
     }

@@ -27,6 +27,7 @@ Sàn (tuỳ chọn, chỉ đọc) ─┤
 | Quy định | Chấm lệnh theo quota, SL/TP, R:R. Mỗi lần đổi quy định đều phải có lý do | [rules.md](docs/rules.md) |
 | Setup và cảnh báo | Lưu kế hoạch vào lệnh, server canh trên nến M5 đã đóng rồi báo tin | [setups.md](docs/setups.md) |
 | Dashboard | Vẽ bias, setup, kịch bản lên biểu đồ nến và review theo ngày | [dashboard.md](docs/dashboard.md) |
+| Lệnh ngoài kế hoạch | Đối chiếu vị thế thật với setup trong ngày, báo lệnh lệch kế hoạch kèm mã OP để đánh giá cùng Claude | [off-plan.md](docs/off-plan.md) |
 | ORB | Tín hiệu và backtest Opening Range Breakout theo phiên | [orb.md](docs/orb.md) |
 | GANN | Pivot, cửa sổ thời gian, mốc giá Square of 9 | [gann.md](docs/gann.md) |
 | Tài khoản thật (tuỳ chọn) | Đọc vị thế và PnL từ Binance, Bybit, OKX bằng key chỉ đọc | [account.md](docs/account.md) |

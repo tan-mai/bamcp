@@ -173,4 +173,5 @@ Tất cả dưới `/setup-dashboard/api`, cần phiên, trả JSON, dùng chung
 | `GET /tr-changes?symbol&date` | Event thêm / đổi trạng thái giữa revision 1 và revision cuối của ngày | mọi tài khoản |
 | `GET /positions?symbol` | Vị thế mở, gọi sàn cache 30 giây | owner |
 | `GET /fills?symbol&date` | Lệnh OKX trong ngày, `setup_code` rỗng là lệnh không gắn setup | owner |
+| `GET /off-plan?date` | Lệnh ngoài kế hoạch trong ngày, mọi cặp ([chi tiết](off-plan.md)). Marker cam trên chart chỉ có ở owner | owner |
 | `POST /reviews` | Lưu review `{setup_code, outcome, r_multiple, note}` | owner |
