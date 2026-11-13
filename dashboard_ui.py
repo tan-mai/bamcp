@@ -114,6 +114,9 @@ def app_page(boot: dict[str, Any], assets: dict[str, str]) -> str:
           <label class="check"><input type="checkbox" id="layerPhases"> Pha</label>
           <label class="check"><input type="checkbox" id="layerEvents"> Event</label>
           <label class="check"><input type="checkbox" id="layerLevels"> Creek/Ice</label>
+          <!-- TM - #SCN-TOGGLE - Bat tat duong kich ban -->
+          <label class="check"><input type="checkbox" id="layerScenarios"> Kịch bản</label>
+          <span class="scn-chips" id="scnChips" role="group" aria-label="Từng kịch bản" hidden></span>
           <label class="check"><input type="checkbox" id="showFailed"> Hiện event hỏng</label>
         </span>
       </div>

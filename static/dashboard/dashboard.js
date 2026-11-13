@@ -37,6 +37,14 @@
   const $ = (id) => document.getElementById(id);
   const params = new URLSearchParams(location.search);
 
+  // TM - #SCN-TOGGLE - Bat tat duong kich ban
+  function loadHiddenScn() {
+    try { return new Set(JSON.parse(localStorage.getItem("bamcp.dash.hiddenScn") || "[]")); } catch (e) { return new Set(); }
+  }
+  function saveHiddenScn() {
+    try { localStorage.setItem("bamcp.dash.hiddenScn", JSON.stringify([...S.hiddenScn].slice(-200))); } catch (e) { /* trinh duyet chan */ }
+  }
+
   function loadPref(key, fallback) {
     try {
       const value = localStorage.getItem("bamcp.dash." + key);
@@ -64,7 +72,11 @@
     chart: null,
     openNotes: new Set(),
     // TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: lop nho theo trinh duyet, event hong an mac dinh
-    layers: { phases: loadPref("phases", true), events: loadPref("events", true), levels: loadPref("creek", true) },
+    layers: { phases: loadPref("phases", true), events: loadPref("events", true), levels: loadPref("creek", true),
+      // TM - #SCN-TOGGLE - Bat tat duong kich ban
+      scenarios: loadPref("scenarios", true) },
+    // TM - #SCN-TOGGLE - Bat tat duong kich ban
+    hiddenScn: loadHiddenScn(),
     showFailed: false,
     markerIndex: {},
     popover: null,
@@ -594,10 +606,32 @@
         extra: [s.entry, s.stop, s.target, s.invalidate_level],
       })),
       levels,
-      scenarios: d.scenarios.filter((s) => s.points && s.points.length >= 2).map((s) => ({
+      // TM - #SCN-TOGGLE - Bat tat duong kich ban
+      scenarios: !S.layers.scenarios ? [] : d.scenarios.filter((s) => s.points && s.points.length >= 2 && !S.hiddenScn.has(s.code)).map((s) => ({
         kind: s.kind, label: s.label, points: s.points, color: scenarioColor(s, d.setups),
       })),
     };
+  }
+
+  // TM - #SCN-TOGGLE - Bat tat duong kich ban
+  function renderScnChips(d) {
+    const box = $("scnChips");
+    const list = S.layers.scenarios ? d.scenarios.filter((s) => s.points && s.points.length >= 2) : [];
+    box.hidden = !list.length;
+    box.replaceChildren(...list.map((s) => {
+      const on = !S.hiddenScn.has(s.code);
+      const color = scenarioColor(s, d.setups);
+      return el("button", {
+        type: "button", class: "toggle scn-chip", title: s.label || s.code,
+        "aria-pressed": on ? "true" : "false",
+        style: on ? `color:${color};border-color:${color}` : "",
+        on: { click: () => {
+          if (S.hiddenScn.has(s.code)) S.hiddenScn.delete(s.code); else S.hiddenScn.add(s.code);
+          saveHiddenScn();
+          if (S.chart) renderChart(S.chart.data, false);
+        } },
+      }, String(s.label || s.code).split(" · ")[0]);
+    }));
   }
 
   function priceFormat(candles) {
@@ -644,6 +678,7 @@
     const oldFirst = S.chart && S.chart.data.candles.length ? S.chart.data.candles[0][0] : null;
 
     buildOverlay(d);
+    renderScnChips(d);  // TM - #SCN-TOGGLE - Bat tat duong kich ban
     candleSeries.applyOptions({ priceFormat: priceFormat(candles) });
     candleSeries.setData(rows);
     volumeSeries.setData(volumes);
@@ -1260,7 +1295,8 @@
       overlay.refresh();
     });
     // TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: bat / tat lop, nho theo trinh duyet
-    [["layerPhases", "phases", "phases"], ["layerEvents", "events", "events"], ["layerLevels", "levels", "creek"]]
+    [["layerPhases", "phases", "phases"], ["layerEvents", "events", "events"], ["layerLevels", "levels", "creek"],
+      ["layerScenarios", "scenarios", "scenarios"]]  // TM - #SCN-TOGGLE - Bat tat duong kich ban
       .forEach(([id, key, pref]) => {
         $(id).checked = S.layers[key];
         $(id).addEventListener("change", (e) => {
