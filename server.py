@@ -7655,11 +7655,10 @@ def _dash_for_role(session: dict[str, Any], setup: dict[str, Any]) -> dict[str, 
     return out
 
 
-@_dash_route("", page=True)
-async def http_dash_page(request, session):
-    from starlette.responses import HTMLResponse
+# TM - #DASH-LAYOUT - Bố cục dashboard & full page: trang chinh va full page dung chung mot bo boot
+def _dash_boot(session: dict[str, Any], view: str) -> dict[str, Any]:
     cfg = _dash_cfg()
-    boot = {"base": DASH_PATH, "role": session["role"], "username": session["username"],
+    return {"base": DASH_PATH, "view": view, "role": session["role"], "username": session["username"],
             "csrf": session["csrf_token"], "tz": str(TZ), "today": _today(),
             "poll_seconds": cfg["poll_seconds"], "default_tf": cfg["default_tf"],
             "default_bars": cfg["default_bars"], "default_symbol": _resolve_symbol(""), "symbols": _symbols(),
@@ -7667,7 +7666,21 @@ async def http_dash_page(request, session):
             "group_by": list(dashboard_logic.GROUP_BY),
             # TM - #TR-BRANCH - Nhan cua factor trong danh sach bang chung
             "prob_factors": {key: label for key, (label, _) in tr_logic.PROB_FACTORS.items()}}
-    page = dashboard_ui.app_page(boot, {name: _dash_asset_url(name) for name in DASH_ASSETS})
+
+
+@_dash_route("", page=True)
+async def http_dash_page(request, session):
+    from starlette.responses import HTMLResponse
+    page = dashboard_ui.app_page(_dash_boot(session, "main"), {name: _dash_asset_url(name) for name in DASH_ASSETS})
+    return HTMLResponse(page, headers={"Cache-Control": "no-store"})
+
+
+# TM - #DASH-LAYOUT - Bố cục dashboard & full page: chart chiem ca cua so, mo o tab rieng. Chung cookie va
+# guard voi trang chinh: chua dang nhap thi ve form login voi next = URL day du query, viewer mo duoc.
+@_dash_route("/full", page=True)
+async def http_dash_full(request, session):
+    from starlette.responses import HTMLResponse
+    page = dashboard_ui.full_page(_dash_boot(session, "full"), {name: _dash_asset_url(name) for name in DASH_ASSETS})
     return HTMLResponse(page, headers={"Cache-Control": "no-store"})
 
 
@@ -7692,6 +7705,31 @@ async def http_dash_symbols(request, session):
     return _dash_json({"symbols": _symbols(), "default": _resolve_symbol("")})
 
 
+# TM - #DASH-LAYOUT - Bố cục dashboard & full page
+def _dash_pick_tr(data: dict[str, Any], tr_id: Any) -> dict[str, Any]:
+    """O chon TR: ve TR khac TR cua ke hoach ngay. Chi thay khoi tr, marker Wyckoff va lich su xac suat;
+    nen, setup, kich ban giu nguyen. Lam tren ban sao: data["markers"] co the dang nam trong cache chart."""
+    tr_id = str(tr_id or "").strip()
+    if not tr_id or (data.get("tr") or {}).get("id") == tr_id:
+        return data
+    tr = _tr_target(data["symbol"], tr_id)
+    opens = [int(c[0]) for c in data["candles"]]
+    markers = [m for m in data["markers"] if m.get("kind") != "wyckoff"]
+    markers += tr_logic.markers(tr, opens, _tf_ms(data["timeframe"]))
+    start_ms, end_ms = _day_window_ms(data["date"])
+    return {**data, "tr": tr, "markers": sorted(markers, key=lambda m: m["t"]),
+            "prob_history": PLANS.prob_history(tr["id"], start_ms, end_ms)}
+
+
+@_dash_route("/api/trs")
+async def http_dash_trs(request, session):
+    """TR cua mot cap, moi nhat truoc. TR la thong tin moi tai khoan deu xem duoc."""
+    symbol = _dash_symbol(request)
+    rows = PLANS.tr_list(symbol)
+    active = next((r["id"] for r in rows if not r["superseded_by"]), None)
+    return _dash_json({"symbol": symbol, "active_id": active, "trs": rows})
+
+
 @_dash_route("/api/chart")
 async def http_dash_chart(request, session):
     query = request.query_params
@@ -7700,6 +7738,7 @@ async def http_dash_chart(request, session):
                              query.get("bars") or _dash_cfg()["default_bars"], query.get("date"),
                              query.get("include_forming") in ("1", "true"), query.get("revision"),
                              positions=owner)
+    data = _dash_pick_tr(data, query.get("tr_id"))  # TM - #DASH-LAYOUT
     if not owner:
         data["setups"] = [_dash_for_role(session, s) for s in data["setups"]]
         data["scenarios"] = [{**s, "points": [{k: v for k, v in p.items() if k != "note"} for p in s["points"]]}

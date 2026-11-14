@@ -596,11 +596,12 @@ class DashboardTrTest(HttpBase):
         async def main(c):
             await self.login(c)
             page = (await c.get(BASE)).text
-            for marker in ('id="trCard"', 'id="layerPhases"', 'id="layerEvents"', 'id="layerLevels"',
-                           'id="showFailed"', 'id="popover"'):
+            # TM - #DASH-LAYOUT - Checkbox lop do JS sinh trong menu "Lop" o goc chart, tu danh sach LAYERS
+            for marker in ('id="trCard"', 'id="layerMenu"', 'id="layerList"', 'id="popover"'):
                 self.assertIn(marker, page)
             script = (await c.get(server._dash_asset_url("dashboard.js"))).text
-            for marker in ("hoveredObjectId", "update_tr", "/tr-changes"):
+            for marker in ("hoveredObjectId", "update_tr", "/tr-changes", '["phase", "Pha"', '["event", "Sự kiện Wyckoff"',
+                           '["creek", "Creek/Ice"', '["failed", "Event hỏng", false]'):
                 self.assertIn(marker, script)
         self.session(main)
 

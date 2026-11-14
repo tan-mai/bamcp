@@ -67,105 +67,203 @@ def login_page(*, action: str, next_url: str, error: str = "", username: str = "
 </html>"""
 
 
-def app_page(boot: dict[str, Any], assets: dict[str, str]) -> str:
-    data = json.dumps(boot, ensure_ascii=False).replace("<", "\\u003c")
-    base = html.escape(str(boot["base"]))
+# TM - #DASH-LAYOUT - Bố cục dashboard & full page: chart la thanh phan chinh, sidebar tom tat ben phai,
+# bang chi tiet xuong tab duoi chart. Phan dau trang va the boot dung chung cho trang chinh va full page.
+def _head(title: str, assets: dict[str, str]) -> str:
     return f"""<!doctype html>
 <html lang="vi">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BAMCP Setup Dashboard</title>
+<title>{html.escape(title)}</title>
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="{html.escape(assets['dashboard.css'])}">
-</head>
-<body>
-<header class="bar">
+</head>"""
+
+
+def _tail(boot: dict[str, Any], assets: dict[str, str]) -> str:
+    data = json.dumps(boot, ensure_ascii=False).replace("<", "\\u003c")
+    return f"""<script type="application/json" id="boot">{data}</script>
+<script src="{html.escape(assets['lightweight-charts.js'])}"></script>
+<script src="{html.escape(assets['dashboard.js'])}"></script>
+</body>
+</html>"""
+
+
+# Nut Reset zoom va menu lop: JS dung chung cho ca hai trang, sinh checkbox tu danh sach lop
+_CHART_TOOLS = """<button type="button" class="btn sm" id="resetZoom" title="Về khung nhìn mặc định (phím 0)">⟲<span class="lbl"> Reset zoom</span></button>
+  <div class="layer-wrap">
+    <button type="button" class="btn sm" id="layerBtn" aria-expanded="false" aria-controls="layerMenu">Lớp ▾</button>
+    <div class="layer-menu" id="layerMenu" role="group" aria-label="Lớp trên biểu đồ" hidden>
+      <div id="layerList"></div>
+      <!-- TM - #SCN-TOGGLE - Bat tat duong kich ban -->
+      <div class="scn-chips" id="scnChips" role="group" aria-label="Từng kịch bản" hidden></div>
+    </div>
+  </div>"""
+
+_CHART_BOX = ('<div class="chart" id="chart"><div class="popover" id="popover" role="dialog" '
+              'aria-label="Chi tiết event" hidden></div></div>')
+
+
+def app_page(boot: dict[str, Any], assets: dict[str, str]) -> str:
+    base = html.escape(str(boot["base"]))
+    return f"""{_head("BAMCP Setup Dashboard", assets)}
+<body class="dash">
+<header class="bar" id="bar">
   <div class="bar-row">
     <strong class="logo">Setup Dashboard</strong>
     <select id="symbol" aria-label="Chọn cặp"></select>
-    <input type="date" id="date" aria-label="Chọn ngày">
-    <div class="seg" role="group" aria-label="Chế độ">
-      <button type="button" data-mode="live">Live</button>
-      <button type="button" data-mode="review">Review</button>
+    <div class="bar-more" id="barMore">
+      <input type="date" id="date" aria-label="Chọn ngày (bias_date)">
+      <select id="trSel" aria-label="Chọn TR" hidden></select>
+      <div class="seg" role="group" aria-label="Chế độ">
+        <button type="button" data-mode="live">Live</button>
+        <button type="button" data-mode="review">Review</button>
+      </div>
+      <button type="button" class="btn" id="refresh" title="Làm mới dữ liệu">↻ Làm mới</button>
+      <span class="updated" id="updated" aria-live="polite"></span>
+      <form class="logout" method="post" action="{base}/logout">
+        <input type="hidden" name="csrf" value="{html.escape(str(boot['csrf']))}">
+        <button type="submit" class="btn" title="Đăng xuất {html.escape(str(boot['username']))}">Đăng xuất</button>
+      </form>
     </div>
-    <span class="updated" id="updated" aria-live="polite"></span>
-    <form class="logout" method="post" action="{base}/logout">
-      <input type="hidden" name="csrf" value="{html.escape(str(boot['csrf']))}">
-      <button type="submit" title="Đăng xuất {html.escape(str(boot['username']))}">Đăng xuất</button>
-    </form>
+    <a class="btn full-link" id="fullLink" href="{base}/full" target="_blank" rel="noopener"
+       title="Mở dashboard full page ở tab mới">⤢<span class="lbl"> Mở full page</span></a>
+    <button type="button" class="btn icon" id="sideToggle" aria-pressed="false" aria-controls="side"
+            title="Thu / mở sidebar">◨</button>
+    <button type="button" class="btn icon" id="menuBtn" aria-expanded="false" aria-controls="barMore"
+            title="Menu">☰</button>
   </div>
   <div class="banner" id="banner" role="alert" hidden></div>
 </header>
-<main>
-  <section class="summary" id="summary" aria-label="Tóm tắt"></section>
-  <div class="seg tabs" id="tabs" role="group" aria-label="Nội dung review" hidden>
-    <button type="button" data-tab="plan">Kế hoạch</button>
-    <button type="button" data-tab="stats">Thống kê</button>
-  </div>
+<main class="dash-main">
   <div class="layout" id="planView">
     <section class="panel chart-panel" id="chartPanel">
       <div class="chart-tools">
         <div class="seg" id="tfs" role="group" aria-label="Khung thời gian"></div>
         <select id="revision" aria-label="Revision kế hoạch" hidden></select>
-        <label class="check"><input type="checkbox" id="levels"> Mức giá</label>
-        <!-- TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR -->
-        <span class="layers" role="group" aria-label="Lớp Wyckoff">
-          <label class="check"><input type="checkbox" id="layerPhases"> Pha</label>
-          <label class="check"><input type="checkbox" id="layerEvents"> Event</label>
-          <label class="check"><input type="checkbox" id="layerLevels"> Creek/Ice</label>
-          <!-- TM - #SCN-TOGGLE - Bat tat duong kich ban -->
-          <label class="check"><input type="checkbox" id="layerScenarios"> Kịch bản</label>
-          <span class="scn-chips" id="scnChips" role="group" aria-label="Từng kịch bản" hidden></span>
-          <label class="check"><input type="checkbox" id="showFailed"> Hiện event hỏng</label>
-        </span>
+        <span class="chart-note" id="chartNote"></span>
+  {_CHART_TOOLS}
       </div>
-      <div class="chart" id="chart"><div class="popover" id="popover" role="dialog" aria-label="Chi tiết event" hidden></div></div>
-      <p class="chart-note" id="chartNote"></p>
+      {_CHART_BOX}
     </section>
-    <aside class="side">
+    <aside class="side" id="side" aria-label="Tóm tắt">
+      <section class="summary" id="summary" aria-label="Bias, giá, vị thế"></section>
       <section class="panel" id="trPanel">
-        <h2>TR khoá</h2>
+        <h2>Tóm tắt TR</h2>
         <div id="trCard"></div>
       </section>
       <section class="panel">
-        <!-- TM - #TR-BRANCH - Setup PRUNED an mac dinh -->
-        <div class="panel-head">
-          <h2>Setup</h2>
-          <button type="button" class="toggle" id="showPruned" aria-pressed="false" hidden></button>
-        </div>
-        <div id="setups"></div>
-      </section>
-      <!-- TM - #OFF-PLAN - Lenh ngoai ke hoach (chi chu tai khoan) -->
-      <section class="panel" id="offPlanPanel" hidden>
-        <h2>Lệnh ngoài kế hoạch</h2>
-        <div id="offPlan"></div>
-      </section>
-      <section class="panel" id="fillsPanel" hidden>
-        <h2>Lệnh OKX trong ngày</h2>
-        <div id="fills"></div>
-      </section>
-      <section class="panel">
-        <h2>Timeline</h2>
-        <ol class="timeline" id="timeline"></ol>
+        <h2>Setup đang chạy</h2>
+        <div id="sideSetups"></div>
       </section>
     </aside>
   </div>
-  <section class="panel" id="statsView" hidden>
-    <h2>Thống kê review</h2>
-    <div class="chart-tools">
-      <div class="seg" id="ranges" role="group" aria-label="Khoảng thời gian">
-        <button type="button" data-range="7">7 ngày</button>
-        <button type="button" data-range="30">30 ngày</button>
-        <button type="button" data-range="90">90 ngày</button>
-      </div>
-      <select id="groupBy" aria-label="Nhóm theo"></select>
+  <nav class="tabbar" id="tabbar" role="tablist" aria-label="Chi tiết">
+    <button type="button" role="tab" data-tab="setups" aria-controls="pane-setups">Setups chi tiết</button>
+    <button type="button" role="tab" data-tab="events" aria-controls="pane-events">Sự kiện Wyckoff</button>
+    <button type="button" role="tab" data-tab="plan" aria-controls="pane-plan">Kịch bản/Bias</button>
+    <!-- TM - #OFF-PLAN - Lenh ngoai ke hoach (chi chu tai khoan) -->
+    <button type="button" role="tab" data-tab="offplan" aria-controls="pane-offplan" hidden>Lệnh ngoài kế hoạch</button>
+    <button type="button" role="tab" data-tab="stats" aria-controls="pane-stats" hidden>Thống kê</button>
+  </nav>
+  <section class="tabpane" id="pane-setups" role="tabpanel" hidden>
+    <div class="pane-tools">
+      <!-- TM - #TR-BRANCH - Setup PRUNED an mac dinh -->
+      <button type="button" class="toggle" id="showPruned" aria-pressed="false" hidden></button>
     </div>
-    <div id="stats"></div>
+    <div class="pane-grid">
+      <div id="setups"></div>
+      <section class="panel">
+        <h2>Timeline</h2>
+        <div id="timeline"></div>
+      </section>
+    </div>
+  </section>
+  <section class="tabpane" id="pane-events" role="tabpanel" hidden>
+    <div class="pane-grid">
+      <section class="panel">
+        <div class="panel-head"><h2>Sự kiện Wyckoff</h2><span class="pane-tools" id="eventTools"></span></div>
+        <div id="eventList"></div>
+      </section>
+      <section class="panel">
+        <h2>Bằng chứng xác suất</h2>
+        <div id="evidence"></div>
+      </section>
+    </div>
+  </section>
+  <section class="tabpane" id="pane-plan" role="tabpanel" hidden>
+    <div class="pane-grid">
+      <section class="panel">
+        <h2>Bias</h2>
+        <div id="biasBox"></div>
+      </section>
+      <section class="panel">
+        <h2>Kịch bản</h2>
+        <div id="scenarioBox"></div>
+      </section>
+    </div>
+  </section>
+  <section class="tabpane" id="pane-offplan" role="tabpanel" hidden>
+    <section class="panel">
+      <h2>Lệnh ngoài kế hoạch</h2>
+      <div id="offPlan"></div>
+    </section>
+    <section class="panel" id="fillsPanel" hidden>
+      <h2>Lệnh OKX trong ngày</h2>
+      <div id="fills"></div>
+    </section>
+  </section>
+  <section class="tabpane" id="pane-stats" role="tabpanel" hidden>
+    <section class="panel">
+      <h2>Thống kê review</h2>
+      <div class="chart-tools">
+        <div class="seg" id="ranges" role="group" aria-label="Khoảng thời gian">
+          <button type="button" data-range="7">7 ngày</button>
+          <button type="button" data-range="30">30 ngày</button>
+          <button type="button" data-range="90">90 ngày</button>
+        </div>
+        <select id="groupBy" aria-label="Nhóm theo"></select>
+      </div>
+      <div id="stats"></div>
+    </section>
   </section>
 </main>
-<script type="application/json" id="boot">{data}</script>
-<script src="{html.escape(assets['lightweight-charts.js'])}"></script>
-<script src="{html.escape(assets['dashboard.js'])}"></script>
-</body>
-</html>"""
+{_tail(boot, assets)}"""
+
+
+# TM - #DASH-LAYOUT - Bố cục dashboard & full page: chart 100vw x (100vh - thanh 40px), panel noi an mac dinh.
+# Khong co thao tac ghi nao: khong o review, khong dang xuat.
+def full_page(boot: dict[str, Any], assets: dict[str, str]) -> str:
+    return f"""{_head("BAMCP Chart", assets)}
+<body class="full">
+<header class="fbar" id="bar">
+  <select id="symbol" aria-label="Chọn cặp"></select>
+  <select id="trSel" aria-label="Chọn TR" hidden></select>
+  <select id="tfSel" aria-label="Khung thời gian"></select>
+  <span class="fdate" id="fDate" hidden></span>
+  <span class="pill run" id="fPhase" hidden></span>
+  <span class="fprob" id="fProb" hidden></span>
+  <span class="updated" id="updated" aria-live="polite"></span>
+  <button type="button" class="btn sm" id="refresh" title="Làm mới (R)">↻<span class="lbl"> Làm mới</span></button>
+  <button type="button" class="btn sm" id="panelBtn" aria-expanded="false" aria-controls="fPanel"
+          title="Setup và sự kiện (S)">☰<span class="lbl"> Setup</span></button>
+  {_CHART_TOOLS}
+  <button type="button" class="btn sm" id="fsBtn" title="Toàn màn hình (F)">⛶<span class="lbl"> Toàn màn hình</span></button>
+</header>
+<main class="fmain">
+  <div class="banner fbanner" id="banner" role="alert" hidden></div>
+  {_CHART_BOX}
+  <span class="chart-note fnote" id="chartNote"></span>
+  <aside class="fpanel" id="fPanel" aria-label="Setup và sự kiện Wyckoff" hidden>
+    <div class="panel-head">
+      <h2>Setup &amp; sự kiện</h2>
+      <button type="button" class="pop-close" id="panelClose" aria-label="Đóng (Esc)">×</button>
+    </div>
+    <h3>Setup</h3>
+    <div id="sideSetups"></div>
+    <h3>Sự kiện Wyckoff</h3>
+    <div id="eventList"></div>
+  </aside>
+</main>
+{_tail(boot, assets)}"""

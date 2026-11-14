@@ -160,6 +160,15 @@ class PlanStore:
         return self._one("SELECT * FROM trading_ranges WHERE symbol = ? AND superseded_by IS NULL "
                          "ORDER BY created_at DESC, rowid DESC LIMIT 1", (symbol.upper(),))
 
+    # TM - #DASH-LAYOUT - Bố cục dashboard & full page: danh sach gon cho o chon TR, khong doc event
+    def tr_list(self, symbol: str, limit: int = 30) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT id, timeframe, tr_high, tr_low, since, schematic, status, superseded_by, created_at "
+                "FROM trading_ranges WHERE symbol = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (symbol.upper(), int(limit))).fetchall()
+        return [dict(r) for r in rows]
+
     def tr_schematics(self, tr_ids: list[str]) -> dict[str, str]:
         ids = sorted({i for i in tr_ids if i})
         if not ids:

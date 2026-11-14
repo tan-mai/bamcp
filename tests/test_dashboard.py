@@ -1047,7 +1047,8 @@ class LoginTest(HttpBase):
             self.assertEqual(page.headers["location"], f"{BASE}/login?next=%2Fsetup-dashboard%3Fsymbol%3DETHUSDT%26mode%3Dreview")
             self.assertEqual((await c.get(f"{BASE}/login")).status_code, 200)
             for path in ("symbols", "chart", "setups", "events", "snapshots", "positions", "fills", "review-stats",
-                         "off-plan"):  # TM - #OFF-PLAN
+                         "off-plan",  # TM - #OFF-PLAN
+                         "trs"):  # TM - #DASH-LAYOUT
                 res = await c.get(f"{BASE}/api/{path}")
                 self.assertEqual(res.status_code, 401, path)
                 self.assertEqual(res.json(), {"error": "unauthorized"})

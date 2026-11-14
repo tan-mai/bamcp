@@ -6,6 +6,43 @@ Trang `https://<domain>/setup-dashboard` vẽ bias, setup, kịch bản và TR c
 
 Deep link, cũng là dạng `dashboard_url` mà tool và tin push trả về: `/setup-dashboard?symbol=ETHUSDT&date=2026-11-07&mode=review&tf=15m`.
 
+## Bố cục và full page
+
+**Trang chính.** Chart TR là thành phần chính:
+
+- Top bar cố định khi cuộn: cặp, ngày (`bias_date`), ô chọn TR (chỉ hiện khi cặp có hơn một TR, mặc định "TR khoá"), Live/Review, nút Làm mới kèm giờ cập nhật, nút **⤢ Mở full page**, nút thu/mở sidebar. Dưới 768px, các mục phụ gom vào menu ☰. Nút full page luôn hiện.
+- Từ 1280px trở lên: chart chiếm khoảng 75% chiều ngang, cao bằng màn hình trừ top bar và thanh tab (tối thiểu 560px). Sidebar bên phải (25%, 300–380px) cuộn riêng, gồm Bias / giá / vị thế, tóm tắt TR (pha, nhánh, xác suất TL/PP, biên TR) và thẻ gọn "Setup đang chạy". Thu sidebar thì chart giãn hết chiều ngang. Trạng thái thu/mở nhớ theo trình duyệt.
+- Từ 768 đến 1279px, sidebar xuống dưới chart, chart cao 70vh. Dưới 768px xếp dọc, chart cao 60vh.
+- Tab dưới chart: Setups chi tiết (thẻ đầy đủ, ô review, timeline), Sự kiện Wyckoff (event theo pha, bằng chứng xác suất), Kịch bản/Bias, Lệnh ngoài kế hoạch (chỉ owner, kèm lệnh OKX khi Review), Thống kê (chỉ Review). Chỉ tab đang mở được vẽ và gọi API của tab. Bảng hơn 100 dòng thì chia trang.
+- Bấm một setup ở sidebar, bảng hay panel: chart zoom tới vùng setup, viền đậm 2 giây và cuộn lên nếu chart đang khuất. Bấm lại để bỏ chọn.
+
+**Chart.** Chart đổi kích thước theo khung chứa (ResizeObserver, debounce 100ms). Đổi kích thước, thu/mở sidebar hay làm mới dữ liệu vẫn giữ nguyên đoạn nến đang xem. Nút **⟲ Reset zoom** đưa về khung nhìn mặc định. Menu **Lớp** ở góc chart bật/tắt từng lớp, nhớ theo trình duyệt:
+
+| Khoá (`layers=`) | Lớp | Mặc định |
+|---|---|---|
+| `tr` | Biên TR (dải + nét đứt) | bật |
+| `phase` | Dải pha A–E | bật |
+| `event` | Marker sự kiện Wyckoff | bật |
+| `zone` | Vùng setup | bật |
+| `levels` | Đường entry / SL / TP / huỷ | bật |
+| `trades` | Marker lệnh của watcher, marker off-plan, đường vị thế | bật |
+| `pruned` | Setup đã `PRUNED` (chart và danh sách) | tắt |
+| `creek` | Creek / Ice | bật |
+| `scn` | Đường kịch bản (từng kịch bản bật/tắt riêng trong menu) | bật |
+| `keylv` | Mức giá của bias và swing W/D | bật |
+| `failed` | Event Wyckoff `failed` | tắt |
+
+**Full page ở tab riêng.** `/setup-dashboard/full?symbol=BTCUSDT&date=2026-11-13&tr_id=<id>&layers=tr,phase,event,zone,levels,trades`
+
+- Nút "⤢ Mở full page" là link `target="_blank"`, mang theo cặp, ngày, TR, lớp, khung, chế độ và revision đang xem. Chuột giữa hay Ctrl+click mở tab nền. Mở được nhiều tab cùng lúc, mỗi tab một cặp, tự làm mới độc lập.
+- Thiếu tham số thì lấy như trang chính: cặp mặc định, hôm nay, TR khoá, lớp theo trình duyệt. Có `layers=` thì chỉ các lớp ghi trong đó bật.
+- Chart chiếm `100vw × (100vh − 40px)`. Thanh mảnh trên cùng gồm cặp, ô chọn TR, khung, pha + nhánh, xác suất TL/PP, giờ cập nhật, Làm mới, panel Setup, Reset zoom, Lớp, Toàn màn hình. Panel nổi bên phải (ẩn mặc định) liệt kê setup và sự kiện Wyckoff.
+- Phím tắt: `F` toàn màn hình, `R` làm mới, `S` panel setup, `0` reset zoom, `Esc` đóng panel / menu / thoát toàn màn hình.
+- Đổi cặp, TR, khung hay lớp thì URL cập nhật (`history.replaceState`) để copy hay bookmark đúng trạng thái.
+- Dùng chung phiên với trang chính. Chưa đăng nhập thì chuyển về form login với `next` là URL đầy đủ, đăng nhập xong quay lại đúng URL đó. Tài khoản viewer mở được, trang không có thao tác ghi.
+
+**Tự làm mới** (cả hai trang): chu kỳ `poll_seconds`, chỉ ở Live. Tab bị ẩn thì không gọi API, hiện lại thì làm mới ngay. Lỗi API thì giữ dữ liệu cũ trên chart và hiện banner "Mất kết nối – thử lại sau Xs". Một lần làm mới gọi mỗi API một lần: trang chính gọi `/chart`, `/setups` và API của tab đang mở; full page chỉ gọi `/chart`.
+
 ## Bắt đầu
 
 1. Tạo tài khoản ở `/admin/dashboard-accounts`. Dashboard có đăng nhập riêng, không dùng chung với admin.
@@ -60,9 +97,9 @@ Số VSA tính trên nến của event: `vol_ratio` = vol / SMA20 của 20 nến
 - Marker: event đáy đặt dưới nến (mũi tên lên), event đỉnh đặt trên nến. Màu theo sơ đồ: tích luỹ xanh, phân phối đỏ, chưa xác định xám. `confirmed` màu đậm, `tentative` nhạt kèm `?`, `failed` xám gạch ngang và ẩn mặc định (bật "Hiện event hỏng"). Ở H1/H4, event M15 rơi vào nến chứa nó; nhiều marker cùng nến thì xếp chồng.
 - Creek, ice: nét đứt có nhãn, bắt đầu từ `since`.
 - Bấm hoặc chạm marker: popover có thời gian, giá, `vol_ratio`, `spread_ratio`, `close_pct`, trạng thái, `note`, event xác nhận.
-- Bật / tắt lớp Pha, Event, Creek/Ice, nhớ theo trình duyệt.
+- Bật / tắt lớp Pha, Sự kiện Wyckoff, Creek/Ice, Event hỏng trong menu Lớp, nhớ theo trình duyệt ([bảng lớp](#bố-cục-và-full-page)).
 
-**Thẻ TR** nằm trên thẻ setup: sơ đồ và trạng thái, pha hiện tại đã kéo dài bao lâu, TR high/low/since, creek/ice, danh sách event theo pha (bấm một dòng thì biểu đồ cuộn tới nến đó), `redraw_rule` và `note`. Ở Review, chọn revision nào thì TR, pha, event vẽ theo snapshot đó; nút "Thay đổi TR trong ngày" liệt kê event thêm và đổi trạng thái giữa revision 1 và revision cuối.
+**Tóm tắt TR** ở sidebar: sơ đồ và trạng thái, pha hiện tại đã kéo dài bao lâu, nhánh, xác suất TL/PP, TR high/low/since, creek/ice. **Tab Sự kiện Wyckoff**: danh sách event theo pha (bấm một dòng thì biểu đồ cuộn tới nến đó), bằng chứng xác suất, `redraw_rule` và `note`. Ở Review, chọn revision nào thì TR, pha, event vẽ theo snapshot đó; nút "Thay đổi TR trong ngày" trong tab liệt kê event thêm và đổi trạng thái giữa revision 1 và revision cuối. Ô chọn TR ở top bar vẽ một TR khác của cặp (vd TR cũ đã `superseded`) lên cùng nến và kế hoạch của ngày.
 
 **Chuyển dữ liệu cũ.** Lúc khởi động, event trong cột json `events` cũ của mỗi TR được chuyển thành dòng `tr_events` (`tentative`, `created_by = claude`, tính lại `seq`, `side`, số VSA từ nến). Cột json cũ giữ lại tới khi nghiệm thu xong. Snapshot cũ giữ nguyên và vẫn đọc được.
 
@@ -102,8 +139,8 @@ Bỏ trống `weight` thì lấy trọng số đang đặt ở `/admin/dashboard
 
 **Trên dashboard**
 
-- Thẻ TR có banner nhánh, vd `Pha C: UTAD#1 → Nhánh giảm (phân phối)`, thanh % tích luỹ / phân phối, danh sách bằng chứng (yếu tố, bên, trọng số, note) và diễn biến xác suất trong ngày.
-- Setup `PRUNED` ẩn mặc định khỏi danh sách và biểu đồ. Nút "Hiện setup đã loại (n)" hiện lại, thẻ setup ghi lý do loại.
+- Tóm tắt TR ở sidebar có banner nhánh, vd `Pha C: UTAD#1 → Nhánh giảm (phân phối)`, và thanh % tích luỹ / phân phối. Danh sách bằng chứng (yếu tố, bên, trọng số, note) và diễn biến xác suất trong ngày nằm ở tab Sự kiện Wyckoff.
+- Setup `PRUNED` ẩn mặc định khỏi danh sách và biểu đồ. Lớp "Setup đã PRUNED" (hoặc nút "Hiện setup đã loại (n)" ở tab Setups chi tiết) hiện lại, nhớ theo trình duyệt và đi theo link full page. Thẻ setup ghi lý do loại.
 - Thẻ setup dùng `label` làm tiêu đề, mã nằm ở dòng dưới.
 
 ## Tài khoản và quyền
@@ -165,7 +202,8 @@ Tất cả dưới `/setup-dashboard/api`, cần phiên, trả JSON, dùng chung
 | Method + path | Dùng cho | Quyền |
 |---|---|---|
 | `GET /symbols` | Danh sách cặp | mọi tài khoản |
-| `GET /chart?symbol&tf&bars&date&revision&include_forming` | Toàn bộ dữ liệu biểu đồ, cache tới khi có nến mới hoặc kế hoạch đổi | mọi tài khoản |
+| `GET /chart?symbol&tf&bars&date&revision&include_forming&tr_id` | Toàn bộ dữ liệu biểu đồ, cache tới khi có nến mới hoặc kế hoạch đổi. `tr_id` (ô chọn TR) chỉ thay khối `tr`, marker Wyckoff và `prob_history`; TR của cặp khác hoặc không có thì 400. Tool `get_chart_data` không đổi | mọi tài khoản |
+| `GET /trs?symbol` | Danh sách TR của cặp, mới nhất trước (`id`, biên, `since`, `schematic`, `status`, `superseded_by`) và `active_id` | mọi tài khoản |
 | `GET /setups?symbol&date` | Thẻ setup và review | mọi tài khoản |
 | `GET /events?symbol&date` | Timeline | mọi tài khoản |
 | `GET /snapshots?symbol&date` | Danh sách revision | mọi tài khoản |

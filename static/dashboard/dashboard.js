@@ -1,12 +1,16 @@
 // TM - #DASHBOARD - Setup dashboard
 // Trang chi doc: khong co thao tac dat, sua, huy lenh hay setup. Moi chu tu server dua vao DOM
 // bang textContent, khong dung innerHTML, nen label, note khong the chen ma vao trang.
+// TM - #DASH-LAYOUT - Bố cục dashboard & full page: mot file cho trang chinh (BOOT.view "main") va full page
+// o tab rieng (BOOT.view "full"). Code ve chart giu nguyen; chi doi container, them lop bat/tat, resize theo
+// container, reset zoom, phim tat, dong bo URL va tu lam moi dung khi tab an.
 (function () {
   "use strict";
 
   const BOOT = JSON.parse(document.getElementById("boot").textContent);
   const API = BOOT.base + "/api";
   const OWNER = BOOT.role === "owner";
+  const FULL = BOOT.view === "full";  // TM - #DASH-LAYOUT
   const TF_LABEL = { "1d": "1D", "4h": "4H", "1h": "1H", "15m": "15M", "5m": "5M" };
   const SPAN = { "5m": 3e5, "15m": 9e5, "1h": 36e5, "4h": 144e5, "1d": 864e5 };
   const MAX_BARS = 500;
@@ -33,6 +37,18 @@
   const FAMILY = { accumulation: "acc", reaccumulation: "acc", distribution: "dist", redistribution: "dist" };
   const TR_STATUS_LABEL = { hypothesis: "giả thuyết", confirmed: "đã xác nhận", failed: "thất bại", completed: "đã hoàn tất" };
   const EVENT_STATUS_LABEL = { tentative: "chưa chắc", confirmed: "đã xác nhận", failed: "hỏng" };
+  // TM - #DASH-LAYOUT - Bố cục dashboard & full page
+  // Lop tren chart: [khoa trong ?layers=, nhan, mac dinh]. Setup PRUNED va event hong an mac dinh nhu truoc.
+  const LAYERS = [
+    ["tr", "Biên TR", true], ["phase", "Pha", true], ["event", "Sự kiện Wyckoff", true],
+    ["zone", "Vùng setup", true], ["levels", "Entry/SL/TP", true], ["trades", "Marker lệnh (gồm off-plan)", true],
+    ["pruned", "Setup đã PRUNED", false], ["creek", "Creek/Ice", true], ["scn", "Kịch bản", true],
+    ["keylv", "Mức giá bias/HTF", true], ["failed", "Event hỏng", false],
+  ];
+  // Khoa localStorage truoc #DASH-LAYOUT: lop nguoi dung da tat thi van tat
+  const LEGACY_PREF = { phase: "phases", event: "events", creek: "creek", scn: "scenarios", keylv: "levels" };
+  const TABS = ["setups", "events", "plan", "offplan", "stats"];
+  const PAGE_ROWS = 100;
 
   const $ = (id) => document.getElementById(id);
   const params = new URLSearchParams(location.search);
@@ -55,40 +71,80 @@
     try { localStorage.setItem("bamcp.dash." + key, value ? "1" : "0"); } catch (e) { /* trinh duyet chan */ }
   }
 
+  // TM - #DASH-LAYOUT - ?layers= co mat thi la danh sach lop BAT (lop khong ghi la tat); khong co thi theo localStorage
+  function loadLayers() {
+    const out = {};
+    const asked = params.get("layers");
+    if (asked !== null) {
+      const on = new Set(asked.split(",").map((s) => s.trim()).filter(Boolean));
+      LAYERS.forEach(([key]) => { out[key] = on.has(key); });
+      return out;
+    }
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem("bamcp.dash.layers") || "null"); } catch (e) { saved = null; }
+    LAYERS.forEach(([key, , fallback]) => {
+      if (saved && typeof saved[key] === "boolean") out[key] = saved[key];
+      else out[key] = LEGACY_PREF[key] ? loadPref(LEGACY_PREF[key], fallback) : fallback;
+    });
+    return out;
+  }
+  function saveLayers() {
+    try { localStorage.setItem("bamcp.dash.layers", JSON.stringify(S.layers)); } catch (e) { /* trinh duyet chan */ }
+  }
+  const layerQuery = () => LAYERS.filter(([key]) => S.layers[key]).map(([key]) => key).join(",");
+
+  function loadTab() {
+    try {
+      const tab = localStorage.getItem("bamcp.dash.tab");
+      return TABS.includes(tab) ? tab : "setups";
+    } catch (e) { return "setups"; }
+  }
+  function saveTab() {
+    try { localStorage.setItem("bamcp.dash.tab", S.tab); } catch (e) { /* trinh duyet chan */ }
+  }
+
   const askedDate = params.get("date");
   const validDate = /^\d{4}-\d{2}-\d{2}$/.test(askedDate || "") ? askedDate : BOOT.today;
   const askedTf = params.get("tf");
+  const askedRevision = params.get("revision");
   const S = {
     symbol: (params.get("symbol") || BOOT.default_symbol).toUpperCase(),
     date: validDate,
     mode: params.get("mode") === "review" || (!params.get("mode") && validDate < BOOT.today) ? "review" : "live",
     tf: SPAN[askedTf] ? askedTf : (SPAN[BOOT.default_tf] ? BOOT.default_tf : "1h"),
-    revision: "origin",
-    tab: "plan",
+    revision: /^(origin|\d+)$/.test(askedRevision || "") ? askedRevision : "origin",
+    // TM - #DASH-LAYOUT - TR dang chon: "" la TR cua ke hoach ngay (TR dang khoa)
+    trId: (params.get("tr_id") || "").trim(),
+    trs: null,
+    tab: loadTab(),
     range: 30,
     groupBy: "trigger_type",
     selected: null,
-    showLevels: loadPref("levels", true),
     chart: null,
     openNotes: new Set(),
-    // TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: lop nho theo trinh duyet, event hong an mac dinh
-    layers: { phases: loadPref("phases", true), events: loadPref("events", true), levels: loadPref("creek", true),
-      // TM - #SCN-TOGGLE - Bat tat duong kich ban
-      scenarios: loadPref("scenarios", true) },
+    // TM - #DASH-LAYOUT - Lop tren chart, nho theo trinh duyet (gom lop Wyckoff, kich ban, PRUNED cu)
+    layers: loadLayers(),
     // TM - #SCN-TOGGLE - Bat tat duong kich ban
     hiddenScn: loadHiddenScn(),
-    showFailed: false,
     markerIndex: {},
     popover: null,
     trFilter: false,
     trChanges: null,
     trLoading: null,
-    // TM - #TR-BRANCH - Setup PRUNED an mac dinh, khong nho qua lan tai trang
-    showPruned: false,
     setupRows: null,
+    // TM - #DASH-LAYOUT - Du lieu rieng cua tung tab duoi chart, tai khi tab mo; moi lan lam moi xoa sach
+    lists: {},
+    pages: {},
+    flash: null,
+    doneOpen: false,
+    sideCollapsed: loadPref("sideCollapsed", false),
+    failed: false,
   };
+  S.doneOpen = S.mode === "review";
+  if (S.tab === "offplan" && !OWNER) S.tab = "setups";
   let chartTicket = 0;
   let listTicket = 0;
+  let listGen = 0;
   let pollTimer = null;
 
   // ---------------------------------------------------------------- dinh dang
@@ -116,7 +172,8 @@
     const parts = String(code || "").split("-");
     return parts.length > 3 ? parts.slice(2).join("-") : parts.pop();
   }
-  const shownSetups = (setups) => (S.showPruned ? setups : setups.filter((s) => s.status !== "PRUNED"));
+  // TM - #DASH-LAYOUT - Setup PRUNED theo lop "Setup đã PRUNED" (danh sach lan chart)
+  const shownSetups = (setups) => (S.layers.pruned ? setups : setups.filter((s) => s.status !== "PRUNED"));
 
   function el(tag, attrs, ...children) {
     const node = document.createElement(tag);
@@ -133,11 +190,26 @@
     });
     return node;
   }
+  const empty = (text) => el("p", { class: "empty" }, text);
 
-  // ---------------------------------------------------------------- goi API
+  // TM - #DASH-LAYOUT - Bang > 100 dong: chia trang 100 dong, rerender chi ve lai dung bang do
+  function paged(key, rows, renderRows, rerender) {
+    const pages = Math.max(1, Math.ceil(rows.length / PAGE_ROWS));
+    const page = Math.min(S.pages[key] || 0, pages - 1);
+    const body = renderRows(rows.slice(page * PAGE_ROWS, (page + 1) * PAGE_ROWS));
+    if (pages === 1) return [body];
+    const go = (n) => { S.pages[key] = n; rerender(); };
+    return [body, el("div", { class: "pager" },
+      el("button", { type: "button", class: "btn sm", disabled: page === 0, on: { click: () => go(page - 1) } }, "‹ Trước"),
+      el("span", {}, `Trang ${page + 1}/${pages} · ${rows.length} dòng`),
+      el("button", { type: "button", class: "btn sm", disabled: page >= pages - 1, on: { click: () => go(page + 1) } }, "Sau ›"))];
+  }
+
+  // ---------------------------------------------------------------- goi API, URL
 
   function loginRedirect() {
-    const next = BOOT.base + location.search;
+    // TM - #DASH-LAYOUT - Quay lai dung trang dang xem (trang chinh hay full page) kem du query
+    const next = location.pathname + location.search;
     location.href = BOOT.base + "/login?next=" + encodeURIComponent(next);
   }
 
@@ -147,17 +219,92 @@
       if (value !== null && value !== undefined && value !== "") search.set(key, value);
     });
     const url = API + path + (search.toString() ? "?" + search : "");
-    const res = await fetch(url, { credentials: "same-origin", ...(options || {}) });
-    if (res.status === 401) { loginRedirect(); throw new Error("Phiên đăng nhập đã hết"); }
+    let res;
+    try {
+      res = await fetch(url, { credentials: "same-origin", ...(options || {}) });
+    } catch (e) {
+      throw Object.assign(new Error("Mất kết nối"), { status: 0 });
+    }
+    if (res.status === 401) { loginRedirect(); throw Object.assign(new Error("Phiên đăng nhập đã hết"), { status: 401 }); }
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
+    if (!res.ok) throw Object.assign(new Error(data.error || "HTTP " + res.status), { status: res.status });
     return data;
   }
 
-  function setBanner(text) {
+  // TM - #DASH-LAYOUT - Query de doc va bookmark: null la bo, dau phay giu nguyen (?layers=tr,phase)
+  function qs(obj) {
+    return Object.entries(obj).filter(([, v]) => v !== null && v !== undefined)
+      .map(([k, v]) => `${k}=${encodeURIComponent(v).replace(/%2C/gi, ",")}`).join("&");
+  }
+  function fullQuery() {
+    const review = S.mode === "review";
+    return qs({ symbol: S.symbol, date: S.date, tr_id: S.trId || null, layers: layerQuery(), tf: S.tf,
+                mode: review ? "review" : null, revision: review && S.revision !== "origin" ? S.revision : null });
+  }
+  function syncUrl() {
+    if (FULL) {
+      history.replaceState(null, "", `${BOOT.base}/full?${fullQuery()}`);
+      return;
+    }
+    const review = S.mode === "review";
+    history.replaceState(null, "", `${BOOT.base}?${qs({ symbol: S.symbol, date: S.date, mode: S.mode, tf: S.tf,
+      tr_id: S.trId || null, revision: review && S.revision !== "origin" ? S.revision : null })}`);
+    $("fullLink").href = `${BOOT.base}/full?${fullQuery()}`;
+  }
+
+  // ---------------------------------------------------------------- banner, tu lam moi
+
+  // TM - #DASH-LAYOUT - Loi ket noi uu tien hon canh bao du lieu tre; loi thi giu du lieu cu tren chart
+  const bannerText = { stale: "", error: "" };
+  let retryAt = 0;
+  let retryTick = null;
+  const pollSeconds = () => Math.max(5, Number(BOOT.poll_seconds) || 60);
+
+  function paintBanner() {
     const box = $("banner");
-    box.textContent = text || "";
+    const text = bannerText.error || bannerText.stale;
+    box.textContent = text;
     box.hidden = !text;
+  }
+
+  function connectionLost(err) {
+    if (err && err.status === 401) return;
+    S.failed = true;
+    retryAt = Date.now() + pollSeconds() * 1000;
+    clearInterval(retryTick);
+    const paint = () => {
+      const left = Math.max(0, Math.ceil((retryAt - Date.now()) / 1000));
+      bannerText.error = err && err.status >= 400 && err.status < 500
+        ? `Không tải được dữ liệu: ${err.message} – thử lại sau ${left}s`
+        : `Mất kết nối – thử lại sau ${left}s`;
+      paintBanner();
+    };
+    paint();
+    retryTick = setInterval(paint, 1000);
+  }
+
+  function connectionOk() {
+    S.failed = false;
+    clearInterval(retryTick);
+    retryTick = null;
+    bannerText.error = "";
+    paintBanner();
+  }
+
+  // Chi hen lan sau khi tab dang hien; Live lam moi theo chu ky, Review chi thu lai khi vua loi
+  function schedule() {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+    if (document.hidden || (S.mode !== "live" && !S.failed)) return;
+    pollTimer = setTimeout(() => { pollTimer = null; refresh(false); }, pollSeconds() * 1000);
+  }
+
+  function track(promises) {
+    return Promise.allSettled([].concat(promises)).then((results) => {
+      const bad = results.find((r) => r.status === "rejected");
+      if (bad) connectionLost(bad.reason); else connectionOk();
+      schedule();
+    });
   }
 
   // ---------------------------------------------------------------- bieu do
@@ -183,8 +330,10 @@
   }
   let C = palette();
 
+  // TM - #DASH-LAYOUT - Kich thuoc lay tu container (ResizeObserver ben duoi), khong co dinh bang px
   const chart = LW.createChart(chartBox, {
-    autoSize: true,
+    width: Math.max(1, Math.floor(chartBox.clientWidth)),
+    height: Math.max(1, Math.floor(chartBox.clientHeight)),
     layout: { background: { type: "solid", color: "transparent" }, textColor: C.muted, fontSize: 11 },
     grid: { vertLines: { color: C.grid }, horzLines: { color: C.grid } },
     crosshair: { mode: LW.CrosshairMode.Normal },
@@ -219,6 +368,25 @@
   });
   const volumeSeries = chart.addHistogramSeries({ priceFormat: { type: "volume" }, priceScaleId: "vol", lastValueVisible: false, priceLineVisible: false });
   chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.84, bottom: 0 } });
+
+  // TM - #DASH-LAYOUT - Resize debounce 100ms. Giu nguyen doan nen dang xem khi doi kich thuoc cua so, thu /
+  // mo sidebar hay xoay man hinh: cung cac nen do, chi rong / hep hon.
+  let resizeTimer = null;
+  function fitChartBox() {
+    resizeTimer = null;
+    const width = Math.floor(chartBox.clientWidth);
+    const height = Math.floor(chartBox.clientHeight);
+    if (!width || !height) return;
+    const scale = chart.timeScale();
+    const range = scale.getVisibleLogicalRange();
+    chart.resize(width, height);
+    if (range) scale.setVisibleLogicalRange(range);
+    if (S.popover) placePopover();
+  }
+  new ResizeObserver(() => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(fitChartBox, 100);
+  }).observe(chartBox);
 
   // Vung, TR, kich ban ve bang primitive de nam trong chu ky ve cua chart: keo, zoom hay doi
   // thang gia deu khop, khong lech nhu lop canvas dat de len tren.
@@ -261,7 +429,7 @@
   // Dai pha: tu mep trai nen mo pha toi mep trai nen mo pha sau; pha dang chay keo toi het nen cuoi.
   function phaseSpans(size) {
     const d = overlay.data;
-    if (!d || !S.layers.phases || !d.tr || !(d.tr.phases || []).length || d.lastTime === null) return [];
+    if (!d || !S.layers.phase || !d.tr || !(d.tr.phases || []).length || d.lastTime === null) return [];
     const half = (chart.timeScale().options().barSpacing || 6) / 2;
     const lastX = xOf(d.lastTime);
     return d.tr.phases.map((phase, index) => {
@@ -283,7 +451,7 @@
       ctx.fillStyle = alpha(C.neutral, span.shade ? 0.12 : 0.05);
       ctx.fillRect(span.x1, 0, span.x2 - span.x1, size.height);
     });
-    if (d.tr) {
+    if (d.tr && S.layers.tr) {  // TM - #DASH-LAYOUT - lop Bien TR
       const top = yOf(d.tr.tr_high);
       const bottom = yOf(d.tr.tr_low);
       if (top !== null && bottom !== null) {
@@ -292,6 +460,7 @@
         ctx.fillRect(start, top, size.width - start, bottom - top);
       }
     }
+    if (!S.layers.zone) return;  // TM - #DASH-LAYOUT - lop Vung setup
     d.zones.forEach((zone) => {
       const top = yOf(zone.high);
       const bottom = yOf(zone.low);
@@ -334,23 +503,25 @@
     ctx.save();
     if (d.tr) {
       const start = d.tr.since ? Math.max(0, xOf(d.tr.since) ?? 0) : 0;
-      ctx.strokeStyle = alpha(C.tr, 0.85);
-      ctx.lineWidth = 1;
-      ctx.setLineDash([6, 4]);
-      [d.tr.tr_high, d.tr.tr_low].forEach((price) => {
-        const y = yOf(price);
-        if (y === null) return;
-        ctx.beginPath();
-        ctx.moveTo(start, y);
-        ctx.lineTo(size.width, y);
-        ctx.stroke();
-      });
-      ctx.setLineDash([]);
-      const y = yOf(d.tr.tr_high);
-      // TM - #WYCKOFF-TR: dinh TR ngoai khung nhin thi khong ghim nhan len mep tren (de len nhan pha)
-      if (y !== null && y >= 0 && y <= size.height) textBox(ctx, "TR khoá", start + 4, y + 10, C.tr, size);
+      if (S.layers.tr) {  // TM - #DASH-LAYOUT - lop Bien TR
+        ctx.strokeStyle = alpha(C.tr, 0.85);
+        ctx.lineWidth = 1;
+        ctx.setLineDash([6, 4]);
+        [d.tr.tr_high, d.tr.tr_low].forEach((price) => {
+          const y = yOf(price);
+          if (y === null) return;
+          ctx.beginPath();
+          ctx.moveTo(start, y);
+          ctx.lineTo(size.width, y);
+          ctx.stroke();
+        });
+        ctx.setLineDash([]);
+        const y = yOf(d.tr.tr_high);
+        // TM - #WYCKOFF-TR: dinh TR ngoai khung nhin thi khong ghim nhan len mep tren (de len nhan pha)
+        if (y !== null && y >= 0 && y <= size.height) textBox(ctx, "TR khoá", start + 4, y + 10, C.tr, size);
+      }
       // TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: creek / ice net dut co nhan, tu since
-      if (S.layers.levels) {
+      if (S.layers.creek) {
         [["creek", "Creek"], ["ice", "Ice"]].forEach(([key, name]) => {
           const price = (d.tr.levels || {})[key];
           const ly = price === null || price === undefined ? null : yOf(Number(price));
@@ -370,11 +541,13 @@
     phaseSpans(size).forEach((span) => {
       if (span.x2 - span.x1 >= 14) textBox(ctx, span.phase, span.x1 + 3, 11, C.muted, size);
     });
-    d.zones.forEach((zone) => {
-      const y = yOf(zone.high);
-      if (y === null || (S.selected && S.selected !== zone.code) || zone.dim) return;
-      textBox(ctx, letter(zone.code), Math.max(4, (xOf(zone.start) ?? 0) + 4), y + 9, zone.color, size);
-    });
+    if (S.layers.zone) {
+      d.zones.forEach((zone) => {
+        const y = yOf(zone.high);
+        if (y === null || (S.selected && S.selected !== zone.code) || zone.dim) return;
+        textBox(ctx, letter(zone.code), Math.max(4, (xOf(zone.start) ?? 0) + 4), y + 9, zone.color, size);
+      });
+    }
     ctx.font = "10px system-ui, sans-serif";
     ctx.fillStyle = C.muted;
     ctx.textBaseline = "bottom";
@@ -404,6 +577,18 @@
       drawArrow(ctx, points[points.length - 2], last, scenario.color);
       textBox(ctx, scenario.label, last.x - 8 - Math.min(180, scenario.label.length * 6), last.y - 13, scenario.color, size);
     });
+    // TM - #DASH-LAYOUT - Vien dam 2 giay quanh vung setup vua chon (ke ca khi lop Vung setup dang tat)
+    const flash = S.flash && d.zones.find((z) => z.code === S.flash);
+    if (flash) {
+      const top = yOf(flash.high);
+      const bottom = yOf(flash.low);
+      if (top !== null && bottom !== null) {
+        const start = Math.max(0, xOf(flash.start) ?? 0);
+        ctx.strokeStyle = flash.color;
+        ctx.lineWidth = 3;
+        ctx.strokeRect(start + 1.5, top, Math.max(4, size.width - start - 3), Math.max(3, bottom - top));
+      }
+    }
     ctx.restore();
   }
 
@@ -413,16 +598,16 @@
     const d = overlay.data;
     if (!d) return [];
     const out = [];
-    if (d.tr) out.push({ price: d.tr.tr_high }, { price: d.tr.tr_low });
+    if (d.tr && S.layers.tr) out.push({ price: d.tr.tr_high }, { price: d.tr.tr_low });
     // TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
-    if (d.tr && S.layers.levels) {
+    if (d.tr && S.layers.creek) {
       ["creek", "ice"].forEach((key) => { if ((d.tr.levels || {})[key]) out.push({ price: Number(d.tr.levels[key]) }); });
     }
     d.zones.forEach((zone) => {
       const force = zone.code === S.selected;
-      if (zone.dim && !force) return;
+      if (!force && (zone.dim || !S.layers.zone)) return;
       out.push({ price: zone.low, force }, { price: zone.high, force });
-      if (force) zone.extra.forEach((price) => out.push({ price, force }));
+      if (force && S.layers.levels) zone.extra.forEach((price) => { if (price !== null && price !== undefined) out.push({ price, force }); });
     });
     d.scenarios.forEach((s) => s.points.forEach((p) => out.push({ price: p.price })));
     return out;
@@ -443,7 +628,8 @@
     const Solid = LW.LineStyle.Solid;
     const Dashed = LW.LineStyle.Dashed;
     const Dotted = LW.LineStyle.Dotted;
-    shownSetups(d.setups).forEach((setup) => {  // TM - #TR-BRANCH - PRUNED an mac dinh
+    // TM - #DASH-LAYOUT - lop Entry/SL/TP; PRUNED theo lop "Setup đã PRUNED"
+    (S.layers.levels ? shownSetups(d.setups) : []).forEach((setup) => {
       if (setup.status === "CANCELLED") return;
       const on = S.selected === setup.code;
       const faded = (S.selected && !on) || TERMINAL.includes(setup.status);
@@ -455,11 +641,12 @@
       addLine(setup.target, { color: tint(C.long), lineStyle: Solid, title: tag + " TP", axisLabelVisible: shown, lineWidth: on ? 2 : 1 });
       addLine(setup.invalidate_level, { color: tint(C.invalidate), lineStyle: Dashed, title: tag + " huỷ", axisLabelVisible: shown });
     });
-    if (S.showLevels) {
+    if (S.layers.keylv) {
       overlay.data.levels.forEach((level) => addLine(level.price, { color: alpha(C.neutral, 0.45), lineStyle: Dotted, axisLabelVisible: false }));
     }
     // Review la ngay da qua: vi the dang mo hom nay khong lien quan, ve len de hieu nham
-    (S.mode === "live" ? (d.positions || {}).positions || [] : []).forEach((pos) => {
+    // TM - #DASH-LAYOUT - vi the thuoc lop Marker lenh
+    (S.mode === "live" && S.layers.trades ? (d.positions || {}).positions || [] : []).forEach((pos) => {
       addLine(pos.entry_price, { color: pos.side === "long" ? C.long : C.short, lineStyle: Dashed, lineWidth: 2,
                                  title: `Vị thế ${pos.side} ${num(pos.size, 4)}` });
     });
@@ -474,6 +661,7 @@
     (d.markers || []).forEach((m) => {
       // TM - #OFF-PLAN - Diem vao lenh ngoai ke hoach: marker cam, chi chu tai khoan nhan duoc
       if (m.kind === "off_plan") {
+        if (!S.layers.trades) return;  // TM - #DASH-LAYOUT - lop Marker lenh gom off-plan
         const at = snap(m.t);
         if (!times.has(at)) return;
         const up = m.side === "long";
@@ -481,7 +669,7 @@
                    color: C.offplan, text: `${String(m.code).replace(/^OP-\d{8}-/, "OP ")} ${m.classification}` });
         return;
       }
-      if (m.kind === "wyckoff" || hidden.has(m.code)) return;
+      if (m.kind === "wyckoff" || hidden.has(m.code) || !S.layers.trades) return;
       const time = snap(m.t);
       if (!times.has(time)) return;
       const up = m.direction === "long";
@@ -510,11 +698,11 @@
 
   function wyckoffMarkers(d, times) {
     S.markerIndex = {};
-    if (!S.layers.events) return [];
+    if (!S.layers.event) return [];
     const events = new Map(((d.tr || {}).events || []).map((e) => [e.id, e]));
     const out = [];
     (d.markers || []).forEach((m) => {
-      if (m.kind !== "wyckoff" || (m.status === "failed" && !S.showFailed)) return;
+      if (m.kind !== "wyckoff" || (m.status === "failed" && !S.layers.failed)) return;
       const time = m.t_bar / 1000;
       if (!times.has(time)) return;
       const id = "w:" + m.event_id;
@@ -569,11 +757,12 @@
       e.phase ? ["Pha", e.phase] : null,
       confirmed ? ["Xác nhận bởi", confirmed] : null,
     ].filter(Boolean);
-    pop.replaceChildren(
+    // TM - #DASH-LAYOUT - loc null: event khong co note thi replaceChildren(null) in ra chu "null"
+    pop.replaceChildren(...[
       el("div", { class: "pop-head" }, el("strong", {}, e.label || e.type),
         el("button", { type: "button", class: "pop-close", "aria-label": "Đóng", on: { click: hidePopover } }, "×")),
       el("dl", { class: "pop-facts" }, rows.map(([k, v]) => el("div", {}, el("dt", {}, k), el("dd", {}, v)))),
-      e.note ? el("p", { class: "pop-note" }, e.note) : null);
+      e.note ? el("p", { class: "pop-note" }, e.note) : null].filter(Boolean));
     S.popover = id;
     placePopover();
   }
@@ -584,7 +773,6 @@
     else hidePopover();
   });
   chart.timeScale().subscribeVisibleLogicalRangeChange(() => { if (S.popover) placePopover(); });
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") hidePopover(); });
 
   function scenarioColor(scenario, setups) {
     const linked = setups.find((s) => scenario.setup_codes.includes(s.code));
@@ -598,7 +786,7 @@
     const span = SPAN[d.timeframe];
     const candles = d.candles;
     const levels = [];
-    if (S.showLevels) {
+    if (S.layers.keylv) {
       Object.entries((d.bias || {}).key_levels || {}).forEach(([name, price]) => levels.push({ price: Number(price), label: name }));
       (d.htf_levels || []).forEach((level) => levels.push({
         price: level.price, label: `${level.tf === "1w" ? "W" : "D"} swing ${level.kind === "high" ? "đỉnh" : "đáy"}`,
@@ -617,16 +805,23 @@
       })),
       levels,
       // TM - #SCN-TOGGLE - Bat tat duong kich ban
-      scenarios: !S.layers.scenarios ? [] : d.scenarios.filter((s) => s.points && s.points.length >= 2 && !S.hiddenScn.has(s.code)).map((s) => ({
+      scenarios: !S.layers.scn ? [] : d.scenarios.filter((s) => s.points && s.points.length >= 2 && !S.hiddenScn.has(s.code)).map((s) => ({
         kind: s.kind, label: s.label, points: s.points, color: scenarioColor(s, d.setups),
       })),
     };
   }
 
   // TM - #SCN-TOGGLE - Bat tat duong kich ban
+  function toggleScenario(code) {
+    if (S.hiddenScn.has(code)) S.hiddenScn.delete(code); else S.hiddenScn.add(code);
+    saveHiddenScn();
+    if (S.chart) renderChart(S.chart.data, false);
+    if (!FULL && S.tab === "plan") renderPlanPane();
+  }
+
   function renderScnChips(d) {
     const box = $("scnChips");
-    const list = S.layers.scenarios ? d.scenarios.filter((s) => s.points && s.points.length >= 2) : [];
+    const list = S.layers.scn ? d.scenarios.filter((s) => s.points && s.points.length >= 2) : [];
     box.hidden = !list.length;
     box.replaceChildren(...list.map((s) => {
       const on = !S.hiddenScn.has(s.code);
@@ -635,11 +830,7 @@
         type: "button", class: "toggle scn-chip", title: s.label || s.code,
         "aria-pressed": on ? "true" : "false",
         style: on ? `color:${color};border-color:${color}` : "",
-        on: { click: () => {
-          if (S.hiddenScn.has(s.code)) S.hiddenScn.delete(s.code); else S.hiddenScn.add(s.code);
-          saveHiddenScn();
-          if (S.chart) renderChart(S.chart.data, false);
-        } },
+        on: { click: () => toggleScenario(s.code) },
       }, String(s.label || s.code).split(" · ")[0]);
     }));
   }
@@ -648,6 +839,30 @@
     const price = candles.length ? candles[candles.length - 1][4] : 1000;
     const precision = price >= 1000 ? 1 : price >= 10 ? 2 : price >= 1 ? 3 : 5;
     return { type: "price", precision, minMove: Math.pow(10, -precision) };
+  }
+
+  // TM - #DASH-LAYOUT - Khung nhin mac dinh: dung cho lan ve dau va nut Reset zoom
+  function defaultRange() {
+    const st = S.chart;
+    if (!st) return null;
+    const d = st.data;
+    const candles = d.candles;
+    const shown = Math.min(Number(BOOT.default_bars) || 96, candles.length || 1);
+    const edge = st.barCount - 1 + 4;
+    if (S.mode === "review" && candles.length) {
+      const first = candles.findIndex((c) => c[0] >= d.day_start_ms);
+      const from = Math.max(0, (first < 0 ? 0 : first) - Math.round(shown / 4));
+      return { from, to: Math.max(from + 20, st.barCount + 2) };
+    }
+    return { from: Math.max(0, edge - shown - st.whitespace), to: edge };
+  }
+
+  function resetZoom() {
+    const range = defaultRange();
+    if (!range) return;
+    chart.timeScale().setVisibleLogicalRange(range);
+    candleSeries.priceScale().applyOptions({ autoScale: true });
+    overlay.refresh();
   }
 
   function renderChart(d, fit) {
@@ -694,18 +909,11 @@
     volumeSeries.setData(volumes);
     candleSeries.setMarkers(buildMarkers(d, times, formingTime));
     drawPriceLines(d);
-    S.chart = { data: d, barCount: rows.length };
+    S.chart = { data: d, barCount: rows.length, whitespace };
 
-    const shown = Math.min(Number(BOOT.default_bars) || 96, candles.length || 1);
     const edge = rows.length - 1 + 4;
     if (fit) {
-      if (S.mode === "review" && candles.length) {
-        const first = candles.findIndex((c) => c[0] >= d.day_start_ms);
-        const from = Math.max(0, (first < 0 ? 0 : first) - Math.round(shown / 4));
-        scale.setVisibleLogicalRange({ from, to: Math.max(from + 20, rows.length + 2) });
-      } else {
-        scale.setVisibleLogicalRange({ from: Math.max(0, edge - shown - whitespace), to: edge });
-      }
+      scale.setVisibleLogicalRange(defaultRange());
     } else if (wasAtEdge) {
       const width = before.to - before.from;
       scale.setVisibleLogicalRange({ from: edge - width, to: edge });
@@ -726,29 +934,70 @@
     if (d.plan.source === "origin") notes.push(`Kế hoạch gốc, ghép từ R${d.plan.revisions_used.join(", R")}.`);
     if (d.plan.source === "revision") notes.push(`Đang xem kế hoạch revision ${d.plan.revision}.`);
     if (S.mode === "review" && d.plan.source === "live") notes.push("Ngày này chưa có snapshot, đang vẽ kế hoạch hiện tại.");
-    $("chartNote").textContent = notes.join(" ");
+    setChartNote(notes.join(" "));
+  }
+
+  function setChartNote(text) {
+    const box = $("chartNote");
+    box.textContent = text;
+    box.title = text;
+  }
+
+  // TM - #DASH-LAYOUT - Click setup (sidebar, bang, panel): zoom toi vung setup, vien dam 2 giay
+  let flashTimer = null;
+  function flashZone(code) {
+    S.flash = code;
+    clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => { S.flash = null; overlay.refresh(); }, 2000);
+  }
+
+  function zoomToSetup(code) {
+    const st = S.chart;
+    const candles = st ? st.data.candles : [];
+    if (!candles.length) return;
+    const rows = S.setupRows ? S.setupRows.rows : [];
+    const setup = st.data.setups.find((s) => s.code === code) || rows.find((s) => s.code === code);
+    if (!setup) return;
+    const indexAt = (ms) => {
+      const i = candles.findIndex((c) => c[0] >= ms);
+      return i < 0 ? candles.length - 1 : i;
+    };
+    const marks = (st.data.markers || []).filter((m) => m.code === code);
+    let from = indexAt(setup.created_ms ?? candles[0][0]);
+    let to = TERMINAL.includes(setup.status) && marks.length
+      ? Math.max(from, indexAt(marks[marks.length - 1].t)) : candles.length - 1;
+    if (to - from < 30) {
+      const mid = (from + to) / 2;
+      from = mid - 15;
+      to = mid + 15;
+    }
+    const pad = Math.max(4, Math.round((to - from) * 0.15));
+    chart.timeScale().setVisibleLogicalRange({ from: from - pad, to: Math.min(st.barCount + 3, to + pad) });
+    candleSeries.priceScale().applyOptions({ autoScale: true });
+  }
+
+  // Chart dang khuat (cuon xuong bang duoi, hay panel full page che tren dien thoai) thi dua chart ra
+  function revealChart() {
+    if (FULL) {
+      if (window.innerWidth < 768) setPanel(false);
+      return;
+    }
+    const box = $("chartPanel").getBoundingClientRect();
+    const top = $("bar").getBoundingClientRect().bottom;
+    if (box.top < top - 1 || box.bottom > window.innerHeight + 1) {
+      $("chartPanel").scrollIntoView({ behavior: "smooth", block: "start" });
+    }
   }
 
   function focusSetup(setup) {
     S.selected = S.selected === setup.code ? null : setup.code;
-    document.querySelectorAll(".setup").forEach((card) => card.classList.toggle("on", card.dataset.code === S.selected));
+    document.querySelectorAll("[data-code]").forEach((card) => card.classList.toggle("on", card.dataset.code === S.selected));
     if (!S.chart) return;
     drawPriceLines(S.chart.data);
     if (S.selected) {
-      const candles = S.chart.data.candles;
-      const marks = (S.chart.data.markers || []).filter((m) => m.code === setup.code);
-      const at = marks.length ? marks[marks.length - 1].t : setup.created_ms;
-      let index = candles.findIndex((c) => c[0] >= at);
-      if (index < 0) index = candles.length - 1;
-      const scale = chart.timeScale();
-      const range = scale.getVisibleLogicalRange();
-      if (range && index >= 0) {
-        const width = range.to - range.from;
-        const right = Math.min(S.chart.barCount + 3, index + width * 0.6);
-        scale.setVisibleLogicalRange({ from: right - width, to: right });
-      }
-      candleSeries.priceScale().applyOptions({ autoScale: true });
-      if (window.innerWidth < 1024) $("chartPanel").scrollIntoView({ behavior: "smooth", block: "start" });
+      zoomToSetup(setup.code);
+      flashZone(setup.code);
+      revealChart();
     }
     overlay.refresh();
   }
@@ -762,15 +1011,17 @@
       sub ? el("span", { class: "s", title: sub }, sub) : null);
   }
 
+  const biasTone = (bias) => (bias ? { long: "long", short: "short" }[bias.direction] || "neutral" : "neutral");
+  const biasWord = (bias) => (bias ? { long: "LONG", short: "SHORT", neutral: "ĐỨNG NGOÀI" }[bias.direction] || bias.direction : "Chưa có bias");
+
   function renderSummary(d) {
     const box = $("summary");
+    if (!box) return;
     const bias = d.bias;
-    const tone = bias ? { long: "long", short: "short" }[bias.direction] || "neutral" : "neutral";
-    const word = bias ? { long: "LONG", short: "SHORT", neutral: "ĐỨNG NGOÀI" }[bias.direction] || bias.direction : "Chưa có bias";
+    const word = biasWord(bias);
     const tiles = [
-      tile("Bias", bias && bias.phase ? `${word} · Pha ${bias.phase}` : word, bias ? bias.summary : null, { tone, clamp: true }),
+      tile("Bias", bias && bias.phase ? `${word} · Pha ${bias.phase}` : word, bias ? bias.summary : null, { tone: biasTone(bias), clamp: true }),
       tile("Giá M5 đã đóng", d.last_m5 ? num(d.last_m5.c) : "—", d.last_m5 ? `Nến ${hm(d.last_m5.t)}` : "Chưa có nến M5"),
-      tile("TR khoá", d.tr ? `${num(d.tr.tr_low)} – ${num(d.tr.tr_high)}` : "—", d.tr && d.tr.since ? `Từ ${full(d.tr.since)}` : null),
     ];
     if (OWNER && S.mode === "live") tiles.push(positionTile(d.positions));
     box.replaceChildren(...tiles);
@@ -808,14 +1059,14 @@
     const target = marker ? marker.t_bar : Math.floor(event.t / span) * span;
     const index = d.candles.findIndex((c) => c[0] === target);
     if (index < 0) {
-      $("chartNote").textContent = `Nến của ${event.label} (${full(event.t)}) nằm ngoài cửa sổ đang tải — đổi sang khung lớn hơn.`;
+      setChartNote(`Nến của ${event.label} (${full(event.t)}) nằm ngoài cửa sổ đang tải — đổi sang khung lớn hơn.`);
       return;
     }
     const scale = chart.timeScale();
     const range = scale.getVisibleLogicalRange();
     const width = range ? range.to - range.from : 80;
     scale.setVisibleLogicalRange({ from: index - width / 2, to: index + width / 2 });
-    if (window.innerWidth < 1024) $("chartPanel").scrollIntoView({ behavior: "smooth", block: "start" });
+    revealChart();  // TM - #DASH-LAYOUT
     requestAnimationFrame(() => { if (S.markerIndex["w:" + event.id]) openPopover("w:" + event.id); });
   }
 
@@ -836,26 +1087,31 @@
       EVENT_STATUS_LABEL[event.status] || event.status || "—"));
   }
 
-  function eventList(tr) {
-    const shown = (tr.events || []).filter((e) => S.showFailed || e.status !== "failed");
+  // TM - #DASH-LAYOUT - Danh sach event theo pha, chia trang khi > 100 event
+  function eventList(tr, key, rerender) {
+    const shown = (tr.events || []).filter((e) => S.layers.failed || e.status !== "failed");
     const hidden = (tr.events || []).length - shown.length;
-    const items = [];
-    let group;
-    shown.forEach((event) => {
-      const key = event.phase || "";
-      if (key !== group) {
-        group = key;
-        items.push(el("li", { class: "tr-group" }, key ? `Pha ${key}` : "Ngoài pha"));
-      }
-      items.push(eventRow(event));
-    });
-    if (!items.length) items.push(el("li", { class: "empty" }, "Chưa có event."));
-    if (hidden) items.push(el("li", { class: "empty" }, `Ẩn ${hidden} event hỏng — bật "Hiện event hỏng" để xem.`));
-    return el("ol", { class: "tr-events" }, items);
+    const tail = [];
+    if (!shown.length) tail.push(el("li", { class: "empty" }, "Chưa có event."));
+    if (hidden) tail.push(el("li", { class: "empty" }, `Ẩn ${hidden} event hỏng — bật "Hiện event hỏng" để xem.`));
+    if (!shown.length) return el("ol", { class: "tr-events" }, tail);
+    return el("div", {}, paged(key, shown, (rows) => {
+      const items = [];
+      let group;
+      rows.forEach((event) => {
+        const phase = event.phase || "";
+        if (phase !== group) {
+          group = phase;
+          items.push(el("li", { class: "tr-group" }, phase ? `Pha ${phase}` : "Ngoài pha"));
+        }
+        items.push(eventRow(event));
+      });
+      return el("ol", { class: "tr-events" }, items, tail);
+    }, rerender));
   }
 
   function changeList(changes) {
-    if (!changes) return el("p", { class: "empty" }, "Đang tải thay đổi…");
+    if (!changes) return empty("Đang tải thay đổi…");
     const rows = [];
     if (changes.redrawn) rows.push(el("li", { class: "tr-group" }, "TR đã vẽ lại trong ngày"));
     if (changes.added.length) rows.push(el("li", { class: "tr-group" }, "Event thêm"), ...changes.added.map(eventRow));
@@ -866,7 +1122,7 @@
     if (changes.removed.length) rows.push(el("li", { class: "tr-group" }, "Không còn"), ...changes.removed.map(eventRow));
     if (!rows.length) rows.push(el("li", { class: "empty" }, "Không có event thêm hay đổi trạng thái trong ngày."));
     const span = changes.from_revision ? `R${changes.from_revision} → R${changes.to_revision}` : "chưa có snapshot";
-    return el("div", {}, el("p", { class: "empty" }, `So sánh ${span}.`), el("ol", { class: "tr-events" }, rows));
+    return el("div", {}, empty(`So sánh ${span}.`), el("ol", { class: "tr-events" }, rows));
   }
 
   async function loadTrChanges(key) {
@@ -880,7 +1136,7 @@
     if (S.trLoading === key) S.trLoading = null;
     if (`${S.symbol}|${S.date}` !== key) return;
     S.trChanges = { key, data };
-    if (S.chart) renderTr(S.chart.data);
+    if (S.tab === "events") renderEventsPane();
   }
 
   // TM - #TR-BRANCH - Banner nhanh: "Pha C: UTAD#1 → Nhánh giảm (phân phối)"
@@ -894,20 +1150,28 @@
     return el("p", { class: "branch " + (tr.branch === "accumulation" ? "long" : "short") }, `${source} → Nhánh ${word} (${family})`);
   }
 
-  // TM - #TR-BRANCH - Thanh % tich luy / phan phoi kem danh sach bang chung va dien bien trong ngay
-  function probBlock(tr, history) {
-    const evidence = tr.prob_evidence || [];
+  // TM - #TR-BRANCH - Thanh % tich luy / phan phoi
+  const hasProb = (tr) => tr && tr.prob_accumulation !== null && tr.prob_accumulation !== undefined
+    && tr.prob_distribution !== null && tr.prob_distribution !== undefined;
+
+  function probBar(tr) {
     const acc = tr.prob_accumulation;
     const dist = tr.prob_distribution;
-    if (acc === null || acc === undefined || dist === null || dist === undefined) {
-      return el("p", { class: "empty prob" }, "Chưa có điểm bằng chứng tích luỹ / phân phối.");
-    }
     const part = (cls, pct) => {
       const node = el("span", { class: cls });
       node.style.width = `${pct}%`;
       return node;
     };
-    const items = evidence.map((e) => el("li", {},
+    return [
+      el("div", { class: "prob-legend" }, el("span", { class: "long" }, `Tích luỹ ${acc}%`), el("span", { class: "short" }, `Phân phối ${dist}%`)),
+      el("div", { class: "prob-bar", role: "img", "aria-label": `Tích luỹ ${acc}%, phân phối ${dist}%` }, part("acc", acc), part("dist", dist)),
+    ];
+  }
+
+  // Danh sach bang chung va dien bien trong ngay (tab Su kien Wyckoff)
+  function probBlock(tr, history) {
+    if (!hasProb(tr)) return el("p", { class: "empty prob" }, "Chưa có điểm bằng chứng tích luỹ / phân phối.");
+    const items = (tr.prob_evidence || []).map((e) => el("li", {},
       el("span", {}, (BOOT.prob_factors || {})[e.factor] || e.factor),
       el("span", { class: "pill " + (e.side === "acc" ? "long" : "short") }, e.side === "acc" ? "tích luỹ" : "phân phối"),
       el("span", { class: "w" }, `+${num(e.weight, 2)}`),
@@ -915,58 +1179,59 @@
     const moves = history.filter((h) => h.prob_accumulation !== null && h.prob_accumulation !== undefined);
     const trail = moves.length > 1 ? el("p", { class: "prob-caption" }, "Trong ngày: " + moves.map((h) =>
       `${hm(h.at)} TL ${h.prob_accumulation}% / PP ${h.prob_distribution}%${h.plan_revision ? ` (R${h.plan_revision})` : ""}`).join(" → ")) : null;
-    return el("div", { class: "prob" },
-      el("div", { class: "prob-legend" }, el("span", { class: "long" }, `Tích luỹ ${acc}%`), el("span", { class: "short" }, `Phân phối ${dist}%`)),
-      el("div", { class: "prob-bar", role: "img", "aria-label": `Tích luỹ ${acc}%, phân phối ${dist}%` }, part("acc", acc), part("dist", dist)),
+    return el("div", { class: "prob" }, probBar(tr),
       items.length ? el("ul", { class: "prob-list" }, items) : null,
       el("p", { class: "prob-caption" }, "Điểm bằng chứng, chưa hiệu chỉnh thống kê."),
       trail);
   }
 
+  // TM - #DASH-LAYOUT - Tom tat TR o sidebar: so do, pha, nhanh, xac suat TL/PP, bien TR
   function renderTr(d) {
+    renderFullBar(d);
     const box = $("trCard");
+    if (!box) return;
     const tr = d.tr;
     if (!tr) {
-      box.replaceChildren(el("p", { class: "empty" }, `Chưa có TR khoá cho ${S.symbol}.`));
+      box.replaceChildren(empty(`Chưa có TR khoá cho ${S.symbol}.`));
       return;
     }
     const family = FAMILY[tr.schematic];
     const current = (tr.phases || []).find((p) => p.phase === tr.current_phase && (p.end_t === null || p.end_t === undefined));
     const until = S.mode === "live" ? Date.now() : Math.min(Date.now(), d.day_start_ms + 86400000);
-    const filter = S.mode === "review" ? el("button", {
-      type: "button", class: "tr-filter" + (S.trFilter ? " on" : ""), "aria-pressed": S.trFilter ? "true" : "false",
-      on: {
-        click: () => {
-          S.trFilter = !S.trFilter;
-          if (S.trFilter) S.trChanges = null;  // bat lai la lay so moi
-          renderTr(d);
-        },
-      },
-    }, "Thay đổi TR trong ngày") : null;
-    const key = `${S.symbol}|${S.date}`;
-    if (S.mode === "review" && S.trFilter && (!S.trChanges || S.trChanges.key !== key) && S.trLoading !== key) {
-      loadTrChanges(key);
-    }
     const head = el("div", { class: "tr-head" },
       el("span", { class: "pill " + (family === "acc" ? "long" : family === "dist" ? "short" : "") },
         `${SCHEMATIC_LABEL[tr.schematic] || tr.schematic} · ${TR_STATUS_LABEL[tr.status] || tr.status}`),
       tr.current_phase ? el("span", { class: "pill run" },
         `Pha ${tr.current_phase}${current ? ` · ${duration(until - current.start_t)}` : ""}`) : null,
-      tr.source === "setup" ? el("span", { class: "pill warn" }, "Khai trong setup") : null,
-      filter);
+      tr.source === "setup" ? el("span", { class: "pill warn" }, "Khai trong setup") : null);
     const levels = tr.levels || {};
     const facts = el("dl", { class: "facts" },
       fact("TR high", num(tr.tr_high)), fact("TR low", num(tr.tr_low)),
       levels.creek ? fact("Creek", num(levels.creek)) : null, levels.ice ? fact("Ice", num(levels.ice)) : null,
       fact("Từ", tr.since ? full(tr.since) : "—", true));
-    const changes = S.trChanges && S.trChanges.key === key ? S.trChanges.data : null;
-    const body = S.mode === "review" && S.trFilter
-      ? (changes && changes.error ? el("p", { class: "empty" }, changes.error) : changeList(changes))
-      : eventList(tr);
-    // TM - #TR-BRANCH - loc null: replaceChildren(null) in ra chu "null" khi TR khong co note
-    box.replaceChildren(...[head, branchBanner(tr), probBlock(tr, d.prob_history || []), facts, body,
-      tr.redraw_rule ? el("p", { class: "tr-text" }, el("b", {}, "Vẽ lại khi: "), tr.redraw_rule) : null,
-      tr.note ? el("p", { class: "tr-text" }, el("b", {}, "Nhận định: "), tr.note) : null].filter(Boolean));
+    // TM - #TR-BRANCH - loc null: replaceChildren(null) in ra chu "null"
+    box.replaceChildren(...[head, branchBanner(tr),
+      hasProb(tr) ? el("div", { class: "prob" }, probBar(tr)) : empty("Chưa có xác suất tích luỹ / phân phối."),
+      facts].filter(Boolean));
+  }
+
+  // TM - #DASH-LAYOUT - Thanh manh full page: pha, xac suat TL/PP, ngay dang xem
+  function renderFullBar(d) {
+    if (!FULL) return;
+    const tr = d.tr;
+    const phase = $("fPhase");
+    const branch = tr && tr.branch && BRANCH_WORDS[tr.branch] ? ` · nhánh ${BRANCH_WORDS[tr.branch][0]}` : "";
+    phase.hidden = !(tr && tr.current_phase);
+    phase.textContent = tr && tr.current_phase ? `Pha ${tr.current_phase}${branch}` : "";
+    const prob = $("fProb");
+    prob.hidden = !hasProb(tr);
+    prob.replaceChildren(...(hasProb(tr) ? [el("span", { class: "long" }, `TL ${tr.prob_accumulation}%`), " / ",
+      el("span", { class: "short" }, `PP ${tr.prob_distribution}%`)] : []));
+    const day = $("fDate");
+    const past = S.date !== BOOT.today || S.mode === "review";
+    day.hidden = !past;
+    day.textContent = past ? `${S.date.split("-").reverse().join("/")}${S.mode === "review" ? " · Review" : ""}` : "";
+    document.title = `${S.symbol} ${TF_LABEL[S.tf] || S.tf} · BAMCP Chart`;
   }
 
   // ---------------------------------------------------------------- the setup
@@ -982,23 +1247,61 @@
     return el("div", { class: wide ? "wide" : null }, el("dt", {}, key), el("dd", {}, value));
   }
 
+  // TM - #DASH-LAYOUT - The gon o sidebar / panel full page: click -> zoom chart toi vung setup
+  function setupMini(setup, price) {
+    const dir = setup.direction === "long" ? "long" : "short";
+    const done = TERMINAL.includes(setup.status);
+    const go = () => focusSetup(setup);
+    return el("article", {
+      class: `setup mini${S.selected === setup.code ? " on" : ""}${done ? " done" : ""}${setup.status === "PRUNED" ? " pruned" : ""}`,
+      "data-code": setup.code, tabIndex: 0, role: "button",
+      "aria-label": `${setup.label || setup.code} — xem trên biểu đồ`,
+      on: { click: go, keydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } } },
+    },
+    el("div", { class: "setup-head" },
+      el("span", { class: "mini-name" }, setup.label || letter(setup.code)),
+      el("span", { class: "pill " + dir }, String(setup.direction).toUpperCase()),
+      el("span", { class: "pill " + (STATUS_CLASS[setup.status] || "") }, setup.status)),
+    el("div", { class: "mini-line" },
+      `Vùng ${num(setup.zone_low)}–${num(setup.zone_high)} · E ${num(setup.entry)} · SL ${num(setup.stop)} · TP ${num(setup.target)}`),
+    price !== undefined && S.mode === "live" && !done ? el("div", { class: "mini-sub" }, `Cách vùng: ${distanceText(setup, price)}`) : null);
+  }
+
+  function renderSideSetups(rows, price) {
+    const box = $("sideSetups");
+    if (!box) return;
+    const shown = shownSetups(rows);
+    const active = shown.filter((s) => !TERMINAL.includes(s.status));
+    const done = shown.filter((s) => TERMINAL.includes(s.status));
+    const pruned = rows.length - shown.length;
+    const items = [];
+    if (!active.length) items.push(empty(rows.length ? "Không có setup đang chạy." : `Không có setup cho ${S.symbol} ngày ${S.date}.`));
+    items.push(...active.map((s) => setupMini(s, price)));
+    if (done.length) {
+      items.push(el("details", { class: "mini-done", open: S.doneOpen, on: { toggle: (e) => { S.doneOpen = e.target.open; } } },
+        el("summary", {}, `Đã kết thúc (${done.length})`), done.map((s) => setupMini(s, price))));
+    }
+    if (pruned) items.push(el("p", { class: "mini-sub" }, `Ẩn ${pruned} setup đã loại — bật lớp "Setup đã PRUNED" để xem.`));
+    box.replaceChildren(...items);
+  }
+
   function renderSetups(rows, price) {
     const box = $("setups");
-    S.setupRows = { rows, price };
     // TM - #TR-BRANCH - Setup PRUNED an mac dinh, nut "Hien setup da loai (n)"
     const pruned = rows.filter((s) => s.status === "PRUNED").length;
     const toggle = $("showPruned");
     toggle.hidden = !pruned;
-    toggle.textContent = `${S.showPruned ? "Ẩn" : "Hiện"} setup đã loại (${pruned})`;
-    toggle.setAttribute("aria-pressed", S.showPruned ? "true" : "false");
+    toggle.textContent = `${S.layers.pruned ? "Ẩn" : "Hiện"} setup đã loại (${pruned})`;
+    toggle.setAttribute("aria-pressed", S.layers.pruned ? "true" : "false");
     const shown = shownSetups(rows);
     if (!shown.length) {
-      box.replaceChildren(el("p", { class: "empty" }, pruned
+      box.replaceChildren(empty(pruned
         ? `Không còn setup theo dõi cho ${S.symbol} ngày ${S.date} — ${pruned} setup đã loại vì ngược nhánh TR.`
         : `Không có setup cho ${S.symbol} ngày ${S.date}.`));
       return;
     }
-    box.replaceChildren(...shown.map((setup) => setupCard(setup, price)));
+    box.replaceChildren(...paged("setups", shown, (slice) => el("div", { class: "setup-grid" }, slice.map((setup) => setupCard(setup, price))),
+      () => renderSetups(rows, price)));
   }
 
   function setupCard(setup, price) {
@@ -1110,13 +1413,14 @@
     rows.sort((a, b) => b.at - a.at);
     const box = $("timeline");
     if (!rows.length) {
-      box.replaceChildren(el("li", { class: "empty", style: "display:block" }, "Chưa có sự kiện nào trong ngày."));
+      box.replaceChildren(empty("Chưa có sự kiện nào trong ngày."));
       return;
     }
-    box.replaceChildren(...rows.map((row) => el("li", {},
+    box.replaceChildren(...paged("timeline", rows, (slice) => el("ol", { class: "timeline" }, slice.map((row) => el("li", {},
       el("time", {}, hm(row.at)),
       el("div", {}, el("div", {}, row.main),
-        row.sub ? el("div", { class: "sub" + (row.fail ? " fail" : "") }, row.sub) : null))));
+        row.sub ? el("div", { class: "sub" + (row.fail ? " fail" : "") }, row.sub) : null)))),
+    () => renderTimeline(events, snapshots)));
   }
 
   function renderFills(block) {
@@ -1124,50 +1428,50 @@
     panel.hidden = !(OWNER && S.mode === "review");
     if (panel.hidden) return;
     const box = $("fills");
-    if (!block || !block.enabled) { box.replaceChildren(el("p", { class: "empty" }, "Chưa bật đọc tài khoản sàn.")); return; }
-    if (block.error) { box.replaceChildren(el("p", { class: "empty" }, "Không đọc được lệnh từ sàn.")); return; }
-    if (!block.positions.length) { box.replaceChildren(el("p", { class: "empty" }, "Không có lệnh nào trong ngày.")); return; }
+    if (!block || !block.enabled) { box.replaceChildren(empty("Chưa bật đọc tài khoản sàn.")); return; }
+    if (block.error) { box.replaceChildren(empty("Không đọc được lệnh từ sàn.")); return; }
+    if (!block.positions.length) { box.replaceChildren(empty("Không có lệnh nào trong ngày.")); return; }
     const hide = !("realized_pnl" in block.positions[0]);
-    box.replaceChildren(el("div", { class: "table-wrap" }, el("table", {},
+    box.replaceChildren(...paged("fills", block.positions, (rows) => el("div", { class: "table-wrap" }, el("table", {},
       el("thead", {}, el("tr", {}, ["Mở lúc", "Hướng", "Giá vào", "KL", hide ? null : "PnL", "Setup"].filter(Boolean).map((h) => el("th", {}, h)))),
-      el("tbody", {}, block.positions.map((p) => el("tr", {},
+      el("tbody", {}, rows.map((p) => el("tr", {},
         el("td", {}, p.carried_in ? "Từ hôm trước" : String(p.opened_at || "").slice(11, 16)),
         el("td", { class: p.side === "long" ? "long" : "short" }, p.side),
         el("td", {}, num(p.entry_price)),
         el("td", {}, num(p.qty, 4)),
         hide ? null : el("td", {}, num(p.realized_pnl, 2)),
-        el("td", {}, p.setup_code ? letter(p.setup_code) : el("span", { class: "pill warn" }, "Không gắn setup"))))))));
+        el("td", {}, p.setup_code ? letter(p.setup_code) : el("span", { class: "pill warn" }, "Không gắn setup"))))))),
+    () => renderFills(block)));
   }
 
   // TM - #OFF-PLAN - Bang lenh ngoai ke hoach trong ngay (moi cap)
   const REVIEW_LABEL = { PENDING: "chưa đánh giá", REVIEWED: "đã đánh giá" };
 
   function renderOffPlan(block) {
-    const panel = $("offPlanPanel");
-    panel.hidden = !OWNER || !block;
-    if (panel.hidden) return;
     const box = $("offPlan");
+    if (!block) { box.replaceChildren(empty("Không đọc được lệnh ngoài kế hoạch.")); return; }
     if (!block.trades.length) {
-      box.replaceChildren(el("p", { class: "empty" }, block.enabled ? "Không có lệnh ngoài kế hoạch trong ngày." : "position_watcher đang tắt."));
+      box.replaceChildren(empty(block.enabled ? "Không có lệnh ngoài kế hoạch trong ngày." : "position_watcher đang tắt."));
       return;
     }
     const hide = !("realized_pnl" in block.trades[0]);
-    box.replaceChildren(el("div", { class: "table-wrap" }, el("table", {},
+    box.replaceChildren(...paged("offplan", block.trades, (rows) => el("div", { class: "table-wrap" }, el("table", {},
       el("thead", {}, el("tr", {}, ["Mã", "Cặp", "Hướng", "Phân loại", "Cờ", hide ? null : "PnL", "Review"].filter(Boolean).map((h) => el("th", {}, h)))),
-      el("tbody", {}, block.trades.map((t) => el("tr", { title: t.reason || "" },
+      el("tbody", {}, rows.map((t) => el("tr", { title: t.reason || "" },
         el("td", {}, el("div", {}, String(t.code).replace(/^OP-\d{8}-/, "")), el("div", { class: "sub" }, hm(t.opened_ms))),
         el("td", {}, t.symbol),
         el("td", { class: t.side === "long" ? "long" : "short" }, t.side),
         el("td", {}, el("span", { class: "pill " + (t.classification === "IN_PLAN" ? "warn" : "offplan") }, t.classification)),
         el("td", { class: "flags" }, (t.flags || []).join(" · ") || "—"),
         hide ? null : el("td", {}, t.closed ? num(t.realized_pnl, 2) : "đang mở"),
-        el("td", {}, t.verdict || REVIEW_LABEL[t.review_status] || t.review_status)))))));
+        el("td", {}, t.verdict || REVIEW_LABEL[t.review_status] || t.review_status)))))),
+    () => renderOffPlan(block)));
   }
 
   function renderStats(data) {
     const box = $("stats");
     if (!data.total.setups) {
-      box.replaceChildren(el("p", { class: "empty" }, `Không có setup nào từ ${data.from} đến ${data.to}.`));
+      box.replaceChildren(empty(`Không có setup nào từ ${data.from} đến ${data.to}.`));
       return;
     }
     const pct = (value) => (value === null || value === undefined ? "—" : `${num(value, 1)}%`);
@@ -1177,7 +1481,7 @@
       el("td", {}, String(row.closed)), el("td", {}, pct(row.win_rate)),
       el("td", {}, row.avg_r === null || row.avg_r === undefined ? "—" : num(row.avg_r, 2)));
     box.replaceChildren(
-      el("p", { class: "empty" }, `${data.symbol || "Mọi cặp"} · ${data.from} đến ${data.to}. Win rate tính trên lệnh đã đóng.`),
+      empty(`${data.symbol || "Mọi cặp"} · ${data.from} đến ${data.to}. Win rate tính trên lệnh đã đóng.`),
       el("div", { class: "table-wrap" }, el("table", {},
         el("thead", {}, el("tr", {}, ["Nhóm", "Setup", "Tỉ lệ trigger", "Đã đóng", "Win rate", "R TB"].map((h) => el("th", {}, h)))),
         el("tbody", {}, data.groups.map((row) => line(row)), line(data.total, "total")))));
@@ -1192,19 +1496,278 @@
         from: start.toISOString().slice(0, 10), to: BOOT.today, group_by: S.groupBy,
       }));
     } catch (err) {
-      $("stats").replaceChildren(el("p", { class: "empty" }, err.message));
+      $("stats").replaceChildren(empty(err.message));
+      throw err;
     }
+  }
+
+  // ---------------------------------------------------------------- tab duoi chart (trang chinh)
+  // TM - #DASH-LAYOUT - Chi ve tab dang mo. Tab can API rieng (timeline, lenh ngoai ke hoach, thong ke) chi goi
+  // khi tab do mo; moi lan lam moi xoa du lieu cu cua tab, mo lai tab thi tai lai.
+
+  const tabVisible = (tab) => (tab === "offplan" ? OWNER : tab === "stats" ? S.mode === "review" : true);
+  const loadingText = () => empty("Đang tải…");
+
+  function renderSetupsPane() {
+    if (S.setupRows) renderSetups(S.setupRows.rows, S.setupRows.price);
+    else if (!$("setups").childElementCount) $("setups").replaceChildren(loadingText());
+    const timeline = S.lists.timeline;
+    if (timeline && timeline.error) $("timeline").replaceChildren(empty(timeline.error));
+    else if (timeline) renderTimeline(timeline.events, timeline.snapshots);
+    else if (!$("timeline").childElementCount) $("timeline").replaceChildren(loadingText());
+  }
+
+  function renderEventsPane() {
+    const d = S.chart && S.chart.data;
+    if (!d) { $("eventList").replaceChildren(loadingText()); return; }
+    const tr = d.tr;
+    const review = S.mode === "review";
+    // replaceChildren(null) in ra chu "null": loc truoc
+    $("eventTools").replaceChildren(...[
+      el("label", { class: "check" }, el("input", {
+        type: "checkbox", checked: S.layers.failed, on: { change: (e) => setLayer("failed", e.target.checked) },
+      }), " Hiện event hỏng"),
+      review && tr ? el("button", {
+        type: "button", class: "toggle", "aria-pressed": S.trFilter ? "true" : "false",
+        on: { click: () => { S.trFilter = !S.trFilter; if (S.trFilter) S.trChanges = null; renderEventsPane(); } },
+      }, "Thay đổi TR trong ngày") : null].filter(Boolean));
+    if (!tr) {
+      $("eventList").replaceChildren(empty(`Chưa có TR khoá cho ${S.symbol}.`));
+      $("evidence").replaceChildren(empty("Chưa có TR."));
+      return;
+    }
+    const key = `${S.symbol}|${S.date}`;
+    if (review && S.trFilter && (!S.trChanges || S.trChanges.key !== key) && S.trLoading !== key) loadTrChanges(key);
+    const changes = S.trChanges && S.trChanges.key === key ? S.trChanges.data : null;
+    $("eventList").replaceChildren(review && S.trFilter
+      ? (changes && changes.error ? empty(changes.error) : changeList(changes))
+      : eventList(tr, "events", renderEventsPane));
+    $("evidence").replaceChildren(...[probBlock(tr, d.prob_history || []),
+      tr.redraw_rule ? el("p", { class: "tr-text" }, el("b", {}, "Vẽ lại khi: "), tr.redraw_rule) : null,
+      tr.note ? el("p", { class: "tr-text" }, el("b", {}, "Nhận định: "), tr.note) : null].filter(Boolean));
+  }
+
+  function renderPlanPane() {
+    const d = S.chart && S.chart.data;
+    if (!d) { $("biasBox").replaceChildren(loadingText()); return; }
+    const bias = d.bias;
+    if (!bias) {
+      $("biasBox").replaceChildren(empty(`Chưa có bias cho ${S.symbol} ngày ${S.date}.`));
+    } else {
+      const levels = Object.entries(bias.key_levels || {});
+      const updated = typeof bias.updated_at === "number" ? full(bias.updated_at)
+        : String(bias.updated_at || "").replace("T", " ").slice(0, 16);
+      $("biasBox").replaceChildren(...[
+        el("p", { class: "bias-dir " + biasTone(bias) }, biasWord(bias) + (bias.phase ? ` · Pha ${bias.phase}` : "")),
+        bias.summary ? el("p", { class: "tr-text" }, bias.summary) : null,
+        el("dl", { class: "facts" },
+          bias.action_zone ? fact("Vùng hành động", bias.action_zone, true) : null,
+          updated ? fact("Cập nhật", updated, true) : null,
+          levels.map(([name, price]) => fact(name, num(price)))),
+      ].filter(Boolean));
+    }
+    const list = d.scenarios || [];
+    if (!list.length) { $("scenarioBox").replaceChildren(empty("Không có kịch bản đang hiệu lực.")); return; }
+    $("scenarioBox").replaceChildren(el("ul", { class: "scn-list" }, list.map((s) => {
+      const drawable = s.points && s.points.length >= 2;
+      const on = drawable && !S.hiddenScn.has(s.code);
+      const color = drawable ? scenarioColor(s, d.setups) : C.neutral;
+      const dot = el("span", { class: "scn-dot" });
+      dot.style.background = color;
+      return el("li", {},
+        dot,
+        el("div", {},
+          el("div", { class: "scn-label" }, s.label || s.code),
+          el("div", { class: "sub" }, [s.kind === "main" ? "Kịch bản chính" : "Kịch bản phụ", s.status,
+            (s.setup_codes || []).map(letter).join(", ") || null, `${(s.points || []).length} điểm`].filter(Boolean).join(" · ")),
+          s.condition ? el("div", { class: "sub" }, s.condition) : null),
+        drawable ? el("button", {
+          type: "button", class: "toggle", "aria-pressed": on ? "true" : "false", disabled: !S.layers.scn,
+          title: S.layers.scn ? "" : "Lớp Kịch bản đang tắt",
+          on: { click: () => toggleScenario(s.code) },
+        }, on ? "Ẩn" : "Hiện") : null);
+    })));
+  }
+
+  function renderOffPlanPane() {
+    const data = S.lists.offplan;
+    if (!data) {
+      if (!$("offPlan").childElementCount) $("offPlan").replaceChildren(loadingText());
+      return;
+    }
+    if (data.error) { $("offPlan").replaceChildren(empty(data.error)); return; }
+    renderOffPlan(data.offPlan);
+    renderFills(data.fills);
+  }
+
+  function renderTab() {
+    if (FULL) return;
+    if (S.tab === "setups") renderSetupsPane();
+    else if (S.tab === "events") renderEventsPane();
+    else if (S.tab === "plan") renderPlanPane();
+    else if (S.tab === "offplan") renderOffPlanPane();
+  }
+
+  function applyTab() {
+    if (FULL) return;
+    if (!tabVisible(S.tab)) S.tab = "setups";
+    document.querySelectorAll("#tabbar [data-tab]").forEach((b) => {
+      const on = b.dataset.tab === S.tab;
+      b.hidden = !tabVisible(b.dataset.tab);
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-selected", on ? "true" : "false");
+      b.tabIndex = on ? 0 : -1;
+    });
+    TABS.forEach((tab) => { $("pane-" + tab).hidden = tab !== S.tab; });
+    renderTab();
+  }
+
+  // Du lieu rieng cua tab: undefined = chua tai, null = dang tai
+  async function loadTabData(tab) {
+    if (FULL) return;
+    const gen = listGen;
+    const base = { symbol: S.symbol, date: S.date };
+    if (tab === "setups" && S.lists.timeline === undefined) {
+      S.lists.timeline = null;
+      try {
+        const [events, snapshots] = await Promise.all([api("/events", base), api("/snapshots", base)]);
+        if (gen !== listGen) return;
+        S.lists.timeline = { events: events.events, snapshots: snapshots.snapshots };
+      } catch (err) {
+        if (gen !== listGen) return;
+        S.lists.timeline = { error: `Không tải được timeline: ${err.message}` };
+        throw err;
+      } finally {
+        if (gen === listGen && S.tab === "setups") renderSetupsPane();
+      }
+    } else if (tab === "offplan" && OWNER && S.lists.offplan === undefined) {
+      S.lists.offplan = null;
+      try {
+        const [offPlan, fills] = await Promise.all([
+          // TM - #OFF-PLAN - Lenh ngoai ke hoach: ca live lan review, chi chu tai khoan
+          api("/off-plan", { date: S.date }).catch((err) => { if (err.status === 0) throw err; return null; }),
+          S.mode === "review" ? api("/fills", base) : Promise.resolve(null),
+        ]);
+        if (gen !== listGen) return;
+        S.lists.offplan = { offPlan, fills };
+      } catch (err) {
+        if (gen !== listGen) return;
+        S.lists.offplan = { error: `Không tải được lệnh: ${err.message}` };
+        throw err;
+      } finally {
+        if (gen === listGen && S.tab === "offplan") renderOffPlanPane();
+      }
+    } else if (tab === "stats" && S.mode === "review") {
+      await loadStats();
+    }
+  }
+
+  function selectTab(tab) {
+    if (!tabVisible(tab)) return;
+    S.tab = tab;
+    saveTab();
+    applyTab();
+    loadTabData(tab).catch(() => { /* loi da ghi vao tab */ });
+  }
+
+  // ---------------------------------------------------------------- full page: panel noi
+
+  function setPanel(open) {
+    if (!FULL) return;
+    $("fPanel").hidden = !open;
+    $("panelBtn").setAttribute("aria-expanded", open ? "true" : "false");
+    $("panelBtn").classList.toggle("on", open);
+    if (open) renderPanel();
+  }
+
+  function renderPanel() {
+    if (!FULL || $("fPanel").hidden) return;
+    const d = S.chart && S.chart.data;
+    if (!d) { $("sideSetups").replaceChildren(loadingText()); return; }
+    renderSideSetups(d.setups);
+    $("eventList").replaceChildren(d.tr ? eventList(d.tr, "panel-events", renderPanel) : empty(`Chưa có TR khoá cho ${S.symbol}.`));
+  }
+
+  function toggleFullscreen() {
+    if (!document.fullscreenEnabled) return;
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    else document.documentElement.requestFullscreen().catch(() => {});
+  }
+
+  // ---------------------------------------------------------------- lop, TR, sidebar
+
+  function setLayerMenu(open) {
+    $("layerMenu").hidden = !open;
+    $("layerBtn").setAttribute("aria-expanded", open ? "true" : "false");
+  }
+
+  function renderLayerMenu() {
+    $("layerList").replaceChildren(...LAYERS.map(([key, label]) => el("label", { class: "check" },
+      el("input", { type: "checkbox", id: "layer-" + key, checked: S.layers[key], on: { change: (e) => setLayer(key, e.target.checked) } }),
+      " " + label)));
+  }
+
+  // Doi lop: ve lai chart (giu khung nhin), danh sach phu thuoc lop, va URL / link full page
+  function setLayer(key, on) {
+    S.layers[key] = on;
+    saveLayers();
+    const box = $("layer-" + key);
+    if (box) box.checked = on;
+    if (S.chart) renderChart(S.chart.data, false);
+    renderSetupViews();
+    if (!FULL && (S.tab === "events" || S.tab === "plan")) renderTab();
+    syncUrl();
+  }
+
+  function renderSetupViews() {
+    if (FULL) { renderPanel(); return; }
+    if (!S.setupRows) return;
+    renderSideSetups(S.setupRows.rows, S.setupRows.price);
+    if (S.tab === "setups") renderSetups(S.setupRows.rows, S.setupRows.price);
+  }
+
+  // TM - #DASH-LAYOUT - O chon TR: chi hien khi cap co hon mot TR (hoac URL dang ghim mot TR)
+  let trsReq = null;
+  function loadTrs(force) {
+    if (trsReq && trsReq.symbol === S.symbol) return trsReq.promise;
+    if (!force && S.trs && S.trs.symbol === S.symbol) return Promise.resolve();
+    const symbol = S.symbol;
+    const promise = api("/trs", { symbol })
+      .then((out) => { if (symbol === S.symbol) { S.trs = out; renderTrSelect(); } })
+      .catch(() => { /* o chon TR la phu: loi thi giu nguyen */ })
+      .finally(() => { if (trsReq && trsReq.promise === promise) trsReq = null; });
+    trsReq = { symbol, promise };
+    return promise;
+  }
+
+  function renderTrSelect() {
+    const box = $("trSel");
+    const ready = S.trs && S.trs.symbol === S.symbol;
+    const list = ready ? S.trs.trs : [];
+    box.hidden = list.length < 2 && !S.trId;
+    const option = (t) => el("option", { value: t.id, selected: t.id === S.trId },
+      `${num(t.tr_low)}–${num(t.tr_high)} · từ ${F_DM.format(t.since)} · ${t.id === S.trs.active_id ? "đang khoá" : TR_STATUS_LABEL[t.status] || t.status}`);
+    box.replaceChildren(el("option", { value: "", selected: !S.trId }, "TR khoá (mặc định)"), ...list.map(option));
+  }
+
+  function applySide() {
+    if (FULL) return;
+    $("planView").classList.toggle("side-collapsed", S.sideCollapsed);
+    $("sideToggle").setAttribute("aria-pressed", S.sideCollapsed ? "true" : "false");
+    $("sideToggle").title = S.sideCollapsed ? "Mở sidebar" : "Thu sidebar";
+  }
+
+  function setMenu(open) {
+    if (FULL) return;
+    $("bar").classList.toggle("open", open);
+    $("menuBtn").setAttribute("aria-expanded", open ? "true" : "false");
   }
 
   // ---------------------------------------------------------------- tai du lieu
 
-  function syncUrl() {
-    const search = new URLSearchParams({ symbol: S.symbol, date: S.date, mode: S.mode, tf: S.tf });
-    history.replaceState(null, "", BOOT.base + "?" + search);
-  }
-
   function renderRevisions(plan) {
     const box = $("revision");
+    if (!box) return;
     box.hidden = S.mode !== "review";
     if (box.hidden) return;
     const options = [el("option", { value: "origin", selected: S.revision === "origin" }, "Kế hoạch gốc")];
@@ -1217,158 +1780,228 @@
   async function loadChart(fit) {
     const ticket = ++chartTicket;
     const review = S.mode === "review";
+    let data;
     try {
-      const data = await api("/chart", {
+      data = await api("/chart", {
         symbol: S.symbol, date: S.date, tf: S.tf, bars: MAX_BARS,
         revision: review ? S.revision : "", include_forming: review ? "" : "1",
+        tr_id: S.trId,  // TM - #DASH-LAYOUT
       });
-      if (ticket !== chartTicket) return;
-      renderChart(data, fit);
-      renderSummary(data);
-      renderTr(data);  // TM - #WYCKOFF-TR - the TR theo dung revision dang xem
-      renderRevisions(data.plan);
-      $("updated").textContent = `Cập nhật lúc ${hm(Date.now())}`;
-      const fresh = data.freshness || {};
-      setBanner(fresh.stale ? `Dữ liệu đang trễ: nến M5 cuối cách đây ${num(fresh.m5_age_minutes, 0)} phút, nến ${TF_LABEL[S.tf]} cách đây ${num(fresh.last_closed_bar_age_minutes, 0)} phút.` : "");
     } catch (err) {
-      if (ticket === chartTicket) setBanner(`Không tải được dữ liệu: ${err.message}`);
+      if (ticket !== chartTicket) return;
+      // TM - #DASH-LAYOUT - URL bookmark tro toi TR / revision khong con hop le: quay ve mac dinh, khong lap loi
+      if (err.status === 400 && (S.trId || (review && S.revision !== "origin"))) {
+        S.trId = "";
+        S.revision = "origin";
+        syncUrl();
+        if (S.trs) renderTrSelect();
+        return loadChart(fit);
+      }
+      throw err;
     }
+    if (ticket !== chartTicket) return;
+    renderChart(data, fit);
+    renderSummary(data);
+    renderTr(data);  // TM - #WYCKOFF-TR - the TR theo dung revision dang xem
+    renderRevisions(data.plan);
+    if (FULL) renderPanel();
+    else if (S.tab === "events" || S.tab === "plan") renderTab();
+    $("updated").textContent = `Cập nhật ${hm(Date.now())}`;
+    const fresh = data.freshness || {};
+    bannerText.stale = fresh.stale ? `Dữ liệu đang trễ: nến M5 cuối cách đây ${num(fresh.m5_age_minutes, 0)} phút, nến ${TF_LABEL[S.tf]} cách đây ${num(fresh.last_closed_bar_age_minutes, 0)} phút.` : "";
+    paintBanner();
+    // TR moi ve trong ngay chua co trong o chon thi lay lai danh sach
+    const id = data.tr && data.tr.id;
+    if (id && S.trs && S.trs.symbol === S.symbol && !S.trs.trs.some((t) => t.id === id)) loadTrs(true);
   }
 
   async function loadLists() {
+    if (FULL) return;
     const ticket = ++listTicket;
-    const base = { symbol: S.symbol, date: S.date };
     try {
-      const [setups, events, snapshots, fills, offPlan] = await Promise.all([
-        api("/setups", base),
-        api("/events", base),
-        api("/snapshots", base),
-        S.mode === "review" && OWNER ? api("/fills", base) : Promise.resolve(null),
-        // TM - #OFF-PLAN - Lenh ngoai ke hoach: ca live lan review, chi chu tai khoan
-        OWNER ? api("/off-plan", { date: S.date }).catch(() => null) : Promise.resolve(null),
-      ]);
+      const setups = await api("/setups", { symbol: S.symbol, date: S.date });
       if (ticket !== listTicket) return;
-      renderSetups(setups.setups, setups.price);
-      renderTimeline(events.events, snapshots.snapshots);
-      renderFills(fills);
-      renderOffPlan(offPlan);
+      S.setupRows = { rows: setups.setups, price: setups.price };
+      renderSetupViews();
     } catch (err) {
-      if (ticket === listTicket) setBanner(`Không tải được dữ liệu: ${err.message}`);
+      if (ticket === listTicket) throw err;
     }
   }
 
-  function load(fit) { return Promise.all([loadChart(fit), loadLists()]); }
+  // Mot lan lam moi: moi API goi dung mot lan (chart, setup, va du lieu cua tab dang mo)
+  function load(fit) {
+    listGen += 1;
+    S.lists = {};
+    return [loadChart(fit), loadLists(), loadTabData(S.tab)];
+  }
 
-  function schedule() {
+  function refresh(fit) {
     clearTimeout(pollTimer);
-    const seconds = Math.max(5, Number(BOOT.poll_seconds) || 60);
-    pollTimer = setTimeout(async () => {
-      if (!document.hidden && S.mode === "live") await load(false);
-      schedule();
-    }, seconds * 1000);
+    pollTimer = null;
+    return track(load(fit));
   }
 
   function markButtons(root, attr, value) {
     root.querySelectorAll(`button[${attr}]`).forEach((b) => b.classList.toggle("on", b.getAttribute(attr) === String(value)));
   }
 
-  function applyTab() {
-    markButtons($("tabs"), "data-tab", S.tab);
-    $("tabs").hidden = S.mode !== "review";
-    const stats = S.mode === "review" && S.tab === "stats";
-    $("planView").hidden = stats;
-    $("statsView").hidden = !stats;
-    if (stats) loadStats();
-    else window.dispatchEvent(new Event("resize"));
+  function resetView() {
+    S.selected = null;
+    S.pages = {};
+    S.setupRows = null;
+    hidePopover();
   }
 
   function setMode(mode) {
     S.mode = mode;
-    S.tab = "plan";
     S.revision = "origin";
     S.trFilter = false;  // TM - #WYCKOFF-TR - bo loc thay doi TR chi co o review
+    S.doneOpen = mode === "review";
     markButtons(document, "data-mode", S.mode);
     applyTab();
     syncUrl();
-    load(true);
+    refresh(true);
+  }
+
+  function setTf(tf) {
+    S.tf = tf;
+    if ($("tfs")) markButtons($("tfs"), "data-tf", S.tf);
+    if ($("tfSel")) $("tfSel").value = S.tf;
+    syncUrl();
+    track(loadChart(true));
+  }
+
+  function setSymbol(symbol) {
+    S.symbol = symbol;
+    S.revision = "origin";
+    S.trId = "";
+    resetView();
+    renderTrSelect();
+    loadTrs();
+    syncUrl();
+    refresh(true);
+  }
+
+  function escape() {
+    if (!$("layerMenu").hidden) { setLayerMenu(false); return; }
+    if (S.popover) { hidePopover(); return; }
+    if (FULL && !$("fPanel").hidden) { setPanel(false); return; }
+    if (FULL && document.fullscreenElement) { document.exitFullscreen().catch(() => {}); return; }
+    if (!FULL) setMenu(false);
+  }
+
+  // TM - #DASH-LAYOUT - Chieu cao that cua top bar va thanh tab: chart lay phan con lai cua man hinh
+  function measure() {
+    const root = document.documentElement.style;
+    root.setProperty("--bar-h", `${$("bar").offsetHeight}px`);
+    if ($("tabbar")) root.setProperty("--tabs-h", `${$("tabbar").offsetHeight}px`);
   }
 
   function setup() {
     const symbols = BOOT.symbols.includes(S.symbol) ? BOOT.symbols : [S.symbol, ...BOOT.symbols];
     $("symbol").replaceChildren(...symbols.map((s) => el("option", { value: s, selected: s === S.symbol }, s)));
-    $("date").value = S.date;
-    $("date").max = BOOT.today;
-    $("tfs").replaceChildren(...BOOT.timeframes.map((tf) => el("button", { type: "button", "data-tf": tf }, TF_LABEL[tf] || tf)));
-    $("groupBy").replaceChildren(...BOOT.group_by.map((g) => el("option", { value: g }, `Nhóm theo ${g}`)));
-    $("levels").checked = S.showLevels;
-    markButtons(document, "data-mode", S.mode);
-    markButtons($("tfs"), "data-tf", S.tf);
-    markButtons($("ranges"), "data-range", S.range);
+    $("symbol").addEventListener("change", (e) => setSymbol(e.target.value));
+    renderLayerMenu();
+    renderTrSelect();
 
-    $("symbol").addEventListener("change", (e) => { S.symbol = e.target.value; S.selected = null; S.revision = "origin"; hidePopover(); syncUrl(); load(true); });
-    $("date").addEventListener("change", (e) => {
-      if (!e.target.value) { e.target.value = S.date; return; }
-      S.date = e.target.value;
-      S.selected = null;
-      S.revision = "origin";
-      if (S.date < BOOT.today && S.mode === "live") setMode("review");
-      else { syncUrl(); load(true); }
-    });
-    document.querySelectorAll("button[data-mode]").forEach((b) => b.addEventListener("click", () => setMode(b.dataset.mode)));
-    $("tfs").addEventListener("click", (e) => {
-      const b = e.target.closest("button[data-tf]");
-      if (!b) return;
-      S.tf = b.dataset.tf;
-      markButtons($("tfs"), "data-tf", S.tf);
+    // Dung chung hai trang: lop, reset zoom, chon TR, lam moi, Esc
+    $("layerBtn").addEventListener("click", () => setLayerMenu($("layerMenu").hidden));
+    // Chip kich ban ve lai ngay trong menu: chan click o day de menu khong tu dong
+    $("layerBtn").parentElement.addEventListener("click", (e) => e.stopPropagation());
+    document.addEventListener("click", () => { if (!$("layerMenu").hidden) setLayerMenu(false); });
+    $("resetZoom").addEventListener("click", resetZoom);
+    $("trSel").addEventListener("change", (e) => {
+      S.trId = e.target.value;
+      hidePopover();
       syncUrl();
-      loadChart(true);
+      track(loadChart(true));
     });
-    $("revision").addEventListener("change", (e) => { S.revision = e.target.value; loadChart(true); });
-    $("levels").addEventListener("change", (e) => {
-      S.showLevels = e.target.checked;
-      savePref("levels", S.showLevels);
-      if (!S.chart) return;
-      buildOverlay(S.chart.data);
-      drawPriceLines(S.chart.data);
-      overlay.refresh();
+    $("refresh").addEventListener("click", () => refresh(false));
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { escape(); return; }
+      // TM - #DASH-LAYOUT - Phim tat full page: F toan man hinh, R lam moi, S panel setup, 0 reset zoom
+      if (!FULL || e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
+      if (e.target.closest && e.target.closest("input, select, textarea")) return;
+      const key = e.key.toLowerCase();
+      if (key === "f") toggleFullscreen();
+      else if (key === "r") refresh(false);
+      else if (key === "s") setPanel($("fPanel").hidden);
+      else if (key === "0") resetZoom();
+      else return;
+      e.preventDefault();
     });
-    // TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR: bat / tat lop, nho theo trinh duyet
-    [["layerPhases", "phases", "phases"], ["layerEvents", "events", "events"], ["layerLevels", "levels", "creek"],
-      ["layerScenarios", "scenarios", "scenarios"]]  // TM - #SCN-TOGGLE - Bat tat duong kich ban
-      .forEach(([id, key, pref]) => {
-        $(id).checked = S.layers[key];
-        $(id).addEventListener("change", (e) => {
-          S.layers[key] = e.target.checked;
-          savePref(pref, S.layers[key]);
-          if (S.chart) renderChart(S.chart.data, false);
-        });
-      });
-    // TM - #TR-BRANCH - Hien / an setup PRUNED ca o danh sach lan tren bieu do
-    $("showPruned").addEventListener("click", () => {
-      S.showPruned = !S.showPruned;
-      if (S.setupRows) renderSetups(S.setupRows.rows, S.setupRows.price);
-      if (S.chart) renderChart(S.chart.data, false);
+    // Tab an: khong goi API. Hien lai: lam moi ngay (Live, hoac dang loi ket noi)
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        clearTimeout(pollTimer);
+        pollTimer = null;
+        return;
+      }
+      if (S.mode === "live" || S.failed) refresh(false);
     });
-    $("showFailed").checked = S.showFailed;
-    $("showFailed").addEventListener("change", (e) => {
-      S.showFailed = e.target.checked;
-      if (!S.chart) return;
-      renderChart(S.chart.data, false);
-      renderTr(S.chart.data);
-    });
-    $("tabs").addEventListener("click", (e) => {
-      const b = e.target.closest("button[data-tab]");
-      if (b) { S.tab = b.dataset.tab; applyTab(); }
-    });
-    $("ranges").addEventListener("click", (e) => {
-      const b = e.target.closest("button[data-range]");
-      if (!b) return;
-      S.range = Number(b.dataset.range);
+    new ResizeObserver(measure).observe($("bar"));
+
+    if (FULL) {
+      $("tfSel").replaceChildren(...BOOT.timeframes.map((tf) => el("option", { value: tf, selected: tf === S.tf }, TF_LABEL[tf] || tf)));
+      $("tfSel").addEventListener("change", (e) => setTf(e.target.value));
+      $("panelBtn").addEventListener("click", () => setPanel($("fPanel").hidden));
+      $("panelClose").addEventListener("click", () => setPanel(false));
+      $("fsBtn").hidden = !document.fullscreenEnabled;
+      $("fsBtn").addEventListener("click", toggleFullscreen);
+      document.addEventListener("fullscreenchange", () => $("fsBtn").classList.toggle("on", !!document.fullscreenElement));
+    } else {
+      $("date").value = S.date;
+      $("date").max = BOOT.today;
+      $("tfs").replaceChildren(...BOOT.timeframes.map((tf) => el("button", { type: "button", "data-tf": tf }, TF_LABEL[tf] || tf)));
+      $("groupBy").replaceChildren(...BOOT.group_by.map((g) => el("option", { value: g }, `Nhóm theo ${g}`)));
+      markButtons(document, "data-mode", S.mode);
+      markButtons($("tfs"), "data-tf", S.tf);
       markButtons($("ranges"), "data-range", S.range);
-      loadStats();
-    });
-    $("groupBy").addEventListener("change", (e) => { S.groupBy = e.target.value; loadStats(); });
-    document.addEventListener("visibilitychange", () => { if (!document.hidden && S.mode === "live") load(false); });
+      new ResizeObserver(measure).observe($("tabbar"));
+
+      $("date").addEventListener("change", (e) => {
+        if (!e.target.value) { e.target.value = S.date; return; }
+        S.date = e.target.value;
+        S.revision = "origin";
+        resetView();
+        if (S.date < BOOT.today && S.mode === "live") setMode("review");
+        else { syncUrl(); refresh(true); }
+      });
+      document.querySelectorAll("button[data-mode]").forEach((b) => b.addEventListener("click", () => setMode(b.dataset.mode)));
+      $("tfs").addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-tf]");
+        if (b) setTf(b.dataset.tf);
+      });
+      $("revision").addEventListener("change", (e) => { S.revision = e.target.value; syncUrl(); track(loadChart(true)); });
+      // TM - #TR-BRANCH - Hien / an setup PRUNED ca o danh sach lan tren bieu do (chung lop "Setup đã PRUNED")
+      $("showPruned").addEventListener("click", () => setLayer("pruned", !S.layers.pruned));
+      $("tabbar").addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-tab]");
+        if (b) selectTab(b.dataset.tab);
+      });
+      $("tabbar").addEventListener("keydown", (e) => {
+        if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+        const tabs = TABS.filter(tabVisible);
+        const next = tabs[(tabs.indexOf(S.tab) + (e.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length];
+        selectTab(next);
+        document.querySelector(`#tabbar [data-tab="${next}"]`).focus();
+      });
+      $("ranges").addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-range]");
+        if (!b) return;
+        S.range = Number(b.dataset.range);
+        markButtons($("ranges"), "data-range", S.range);
+        loadStats().catch(() => {});
+      });
+      $("groupBy").addEventListener("change", (e) => { S.groupBy = e.target.value; loadStats().catch(() => {}); });
+      $("sideToggle").addEventListener("click", () => {
+        S.sideCollapsed = !S.sideCollapsed;
+        savePref("sideCollapsed", S.sideCollapsed);
+        applySide();
+      });
+      $("menuBtn").addEventListener("click", () => setMenu(!$("bar").classList.contains("open")));
+      applySide();
+    }
 
     // Doi sang/toi khi dang mo trang
     window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
@@ -1382,10 +2015,11 @@
       if (S.chart) renderChart(S.chart.data, false);
     });
 
-    applyTab();
+    measure();
     syncUrl();
-    load(true);
-    schedule();
+    applyTab();  // truoc refresh: tab khong hop le (vd Thong ke o Live) ve "setups" roi moi tai du lieu tab
+    loadTrs();
+    refresh(true);
   }
 
   setup();
