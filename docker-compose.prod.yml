@@ -63,6 +63,33 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # TM - #BOOKMAP - Order flow Bookmap: collector order flow, process RIENG cung image va volume.
+  # Khong can noi vao mang Traefik (khong mo cong nao), chi can ra internet toi Binance.
+  bamcp-orderflow:
+    image: ghcr.io/tan-mai/bamcp:latest
+    container_name: bamcp-orderflow
+    restart: unless-stopped
+    pull_policy: always
+    command: ["python", "orderflow_collector.py"]
+    environment:
+      BAMCP_DATA_ROOT: /data
+      TZ: Asia/Ho_Chi_Minh
+    volumes:
+      - bamcp_data:/data
+    # HEALTHCHECK cua image goi cong 8848 cua server MCP; collector kiem heartbeat trong orderflow.db
+    healthcheck:
+      test: ["CMD", "python", "orderflow_collector.py", "--health"]
+      interval: 60s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   bamcp_data:
 

@@ -111,6 +111,7 @@ python probe.py get_positions
 3. Ở `/admin/alerts`: [cấu hình thông báo](setups.md#thiết-lập-sau-khi-deploy).
 4. Ở `/admin/dashboard-accounts`: [tạo tài khoản dashboard](dashboard.md#bắt-đầu).
 5. [Backfill 5m](data.md#lịch-kéo-nến) và [chuyển sang SQLite](data.md#lưu-nến-trong-sqlite) nếu muốn giữ lịch sử dài.
+6. Order flow: chạy thêm container / service `bamcp-orderflow` (đã có trong compose, [chi tiết](orderflow.md#cài-và-chạy)), rồi [backfill lệnh khớp](orderflow.md#backfill-lệnh-khớp) ở `/admin/orderflow`.
 
 ## 8. Cập nhật về sau
 

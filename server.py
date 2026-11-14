@@ -61,6 +61,11 @@ import notifier  # TM - #ENTRY-ALERT - Entry setups & alerts
 import off_plan_logic  # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
 import off_plan_store  # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
 import off_plan_watcher  # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
+# TM - #BOOKMAP - Order flow Bookmap: server chi doc orderflow.db, collector la process rieng
+import admin_orderflow
+import orderflow_config
+import orderflow_logic
+import orderflow_store
 import settings    # module cuc bo: luu credential xuong volume
 import tr_logic  # TM - #WYCKOFF-TR - Wyckoff phases and events on locked TR
 # TM - #ORB - ORB Enhancement
@@ -6286,6 +6291,8 @@ def _admin_nav() -> list[tuple[str, str, str]]:
     items.append(("alerts", "Vào lệnh", ADMIN_ALERTS_PATH))
     # TM - #DASHBOARD - Setup dashboard
     items.append(("dashboard", "Dashboard accounts", ADMIN_DASH_PATH))
+    # TM - #BOOKMAP - Order flow Bookmap
+    items.append(("orderflow", "Order Flow", ADMIN_OF_PATH))
     # TM - #ADMIN-LOGIN - Form dang nhap admin
     if AUTH_ENABLED and STORE.has_auth():
         items.append(("logout", "Đăng xuất", ADMIN_LOGOUT_PATH))
@@ -7525,6 +7532,71 @@ async def http_admin_dashboard_action(request):
     return JSONResponse(body, status_code=status, headers={"Cache-Control": "no-store"})
 
 
+# TM - #BOOKMAP - Order flow Bookmap: section admin "Order Flow" (qua phien admin nhu moi trang admin)
+ADMIN_OF_PATH = ADMIN_PATH.rstrip("/") + "/orderflow"
+ADMIN_OF_ACTION_PATH = ADMIN_OF_PATH + "/action"
+
+
+def _of_status_view() -> dict[str, Any]:
+    cfg = _of_cfg()
+    store = _of_store()
+    jobs = [{k: v for k, v in _of_job_state(j).items() if k not in ("result", "pid")} for j in store.jobs(10)]
+    return {"rows": [_of_info(s["symbol"]) for s in cfg["symbols"]], "stale_sec": int(cfg["tech"]["stale_sec"]),
+            "db_size_mb": round(store.size_bytes() / 1e6, 1) if store.exists() else None, "jobs": jobs}
+
+
+def _of_admin_view() -> dict[str, Any]:
+    cfg = _of_cfg()
+    fields = [{"key": key, "min": low, "max": high, "default": default, "int": kind is int}
+              for key, (kind, low, high, default) in orderflow_config.SYMBOL_FIELDS.items()]
+    return {"config": {"enabled": cfg["enabled"], "retention": cfg["retention"], "symbols": cfg["symbols"]},
+            "source": "config.yaml" if cfg["source"] == "config.yaml" else "admin", "db_path": str(cfg["paths"]["db"]),
+            "config_file": str(cfg["paths"]["override"]), "config_error": OF_CONFIG.last_error or None,
+            "fields": fields, "status": _of_status_view(), "max_days": cfg["tech"]["backfill_max_days"],
+            "today_utc": datetime.now(cron_utc.UTC).strftime("%Y-%m-%d"), "tz": str(TZ)}
+
+
+def _of_admin_action(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    action = str(payload.get("action") or "").strip().lower()
+    try:
+        if action == "save":
+            clean = OF_CONFIG.save_editable(payload.get("config"))
+            return 200, {"ok": True, "config": clean}
+        if action == "status":
+            return 200, _of_status_view()
+        if action == "backfill":
+            job = _of_start_backfill(str(payload.get("symbol") or ""), str(payload.get("from_date") or ""),
+                                     str(payload.get("to_date") or ""))
+            return 200, {"ok": True, "job_id": job["id"], "symbol": job["symbol"], "from_date": job["from_date"],
+                         "to_date": job["to_date"], "note": job.get("note")}
+        return 400, {"error": f"action khong ho tro: {action!r}"}
+    except ValueError as exc:
+        return 400, {"error": str(exc)}
+
+
+@mcp.custom_route(ADMIN_OF_PATH, methods=["GET"])
+async def http_admin_orderflow(request):
+    from starlette.responses import HTMLResponse
+    view = await asyncio.to_thread(_of_admin_view)
+    page = admin_orderflow.render(view, action_path=ADMIN_OF_ACTION_PATH, admin_path=ADMIN_PATH,
+                                  setup_required=not STORE.has_auth(), nav=_admin_nav())
+    return HTMLResponse(page, headers={"Cache-Control": "no-store"})
+
+
+@mcp.custom_route(ADMIN_OF_ACTION_PATH, methods=["POST"])
+async def http_admin_orderflow_action(request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "body khong phai JSON"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "body phai la object"}, status_code=400)
+    if not _setup_ok(payload):
+        return JSONResponse({"error": "Setup token sai"}, status_code=403)
+    status, body = await asyncio.to_thread(_of_admin_action, payload)
+    return JSONResponse(body, status_code=status, headers={"Cache-Control": "no-store"})
+
+
 # ---------------------------------------------------------------- setup dashboard: HTTP
 # TM - #DASHBOARD - Setup dashboard
 # Duong nay khong qua Basic auth (xem public_prefixes o build_app): dashboard co dang nhap rieng,
@@ -7534,6 +7606,8 @@ DASH_STATIC = Path(__file__).parent / "static"
 DASH_ASSETS = {
     "dashboard.js": ("dashboard/dashboard.js", "text/javascript; charset=utf-8"),
     "dashboard.css": ("dashboard/dashboard.css", "text/css; charset=utf-8"),
+    # TM - #BOOKMAP - Order flow Bookmap: lop heatmap / bong bong / CVD / VP / COB, nap truoc dashboard.js
+    "orderflow.js": ("dashboard/orderflow.js", "text/javascript; charset=utf-8"),
     "lightweight-charts.js": ("vendor/lightweight-charts/lightweight-charts.standalone.production.js",
                               "text/javascript; charset=utf-8"),
 }
@@ -7841,6 +7915,748 @@ async def http_dash_tr_changes(request, session):
     return _dash_json(_tr_changes(symbol, day))
 
 
+# ---------------------------------------------------------------- order flow (Bookmap)
+# TM - #BOOKMAP - Order flow Bookmap
+# Collector (orderflow_collector.py) la process rieng ghi orderflow.db; server chi doc. Collector dung thi API van
+# tra du lieu cu, kem data_coverage / stale de nguoi xem biet. Moi doc nang chay trong thread, khong chan event loop.
+
+OF_CONFIG = orderflow_config.OrderflowConfig(CONFIG_PATH, DATA_ROOT)
+OF_DAY_MS = 86_400_000
+OF_MAX_RANGE_DAYS = 31            # bubbles / cvd / volume profile tren dashboard
+OF_MAX_POINTS = 5000              # so diem CVD toi da moi lan goi
+OF_BACKFILL_SCRIPT = Path(__file__).parent / "orderflow_backfill.py"
+OF_LAYERS_LIVE = ("heatmap", "bubbles", "cvd", "cob")
+_OF_PROCS: dict[str, Any] = {}
+
+
+def _of_cfg() -> dict[str, Any]:
+    return OF_CONFIG.get()
+
+
+def _of_store() -> orderflow_store.OrderflowStore:
+    return orderflow_store.OrderflowStore(_of_cfg()["paths"]["db"])
+
+
+def _of_now() -> int:
+    return int(time.time() * 1000)
+
+
+def _of_iso(ms: Any) -> str | None:
+    return iso_utc(int(ms)) if ms is not None else None
+
+
+def _of_symbol(symbol: str) -> dict[str, Any]:
+    """Cau hinh order flow cua mot cap. Bo trong = cap mac dinh. Chua khai thi bao noi bat o dau."""
+    name = str(symbol or "").strip().upper() or _resolve_symbol("")
+    sym = OF_CONFIG.symbol(name)
+    if sym is None:
+        raise ValueError(f"Order Flow chua bat cho {name}. Them cap nay o trang {ADMIN_OF_PATH} "
+                         f"(dang co: {[s['symbol'] for s in _of_cfg()['symbols']] or 'chua co cap nao'}).")
+    return sym
+
+
+def _of_info(symbol: str) -> dict[str, Any]:
+    """Trang thai mot cap cho dashboard / tool: da bat chua, co lenh khop / so lenh chua, collector con song khong."""
+    cfg = _of_cfg()
+    sym = OF_CONFIG.symbol(symbol)
+    if sym is None:
+        return {"symbol": symbol, "configured": False, "enabled": False, "has_trades": False, "has_book": False}
+    store = _of_store()
+    status = (store.status(symbol) or [None])[0] or {}
+    cov = store.coverage(symbol)
+    now = _of_now()
+    stale_ms = int(cfg["tech"]["stale_sec"]) * 1000
+    live = bool(status.get("connected")) and (status.get("updated_at") or 0) >= now - stale_ms
+    last_event = status.get("last_event_ts")
+    return {"symbol": symbol, "configured": True, "enabled": bool(cfg["enabled"] and sym["enabled"]),
+            "market": sym["market"], "bucket_size": sym["bucket_size"], "big_trade_min_qty": sym["big_trade_min_qty"],
+            "snapshot_interval_sec": sym["snapshot_interval_sec"], "footprint_res_sec": sym["footprint_res_sec"],
+            "depth_range_pct": sym["depth_range_pct"],
+            "has_trades": cov["trades_from"] is not None, "has_book": cov["book_from"] is not None,
+            "trades_from": cov["trades_from"], "trades_to": cov["trades_to"], "book_from": cov["book_from"],
+            "book_to": cov["book_to"], "collector_live": live, "book_synced": bool(status.get("book_synced")) and live,
+            "last_event_ts": last_event, "last_snapshot_ts": status.get("last_snapshot_ts"),
+            "no_event_sec": round((now - last_event) / 1000) if last_event else None,
+            "stale": not live or not last_event or now - last_event > stale_ms,
+            "book_levels": status.get("book_levels") or 0, "resyncs_today": status.get("resyncs_today") or 0,
+            "last_agg_id": status.get("last_agg_id"), "trades_since_ts": status.get("trades_since_ts"),
+            "updated_at": status.get("updated_at"), "last_error": status.get("last_error")}
+
+
+def _of_coverage(symbol: str, start: int, end: int, kind: str = "trades") -> dict[str, Any]:
+    """data_coverage cua mot khoang: gap ghi nhan (mat ket noi, resync, thieu lenh) va phan dau / cuoi chua co du lieu."""
+    store = _of_store()
+    cov = store.coverage(symbol)
+    first, last = (cov["trades_from"], cov["trades_to"]) if kind == "trades" else (cov["book_from"], cov["book_to"])
+    gaps = store.gaps(symbol, start, end, kind="trades" if kind == "trades" else "depth")
+    notes = []
+    if first is None:
+        notes.append("chua co du lieu " + ("lenh khop" if kind == "trades" else "so lenh"))
+    else:
+        if first > start:
+            notes.append(f"du lieu bat dau tu {_of_iso(first)}")
+        if last is not None and last < min(end, _of_now()) - 90_000:
+            notes.append(f"du lieu dung o {_of_iso(last)} (collector dung hoac chua backfill)")
+    return {"has_gap": bool(gaps or notes), "data_from": _of_iso(first), "data_to": _of_iso(last),
+            "gap_count": len(gaps),
+            "gaps": [[_of_iso(g["start_ts"]), _of_iso(g["end_ts"]) if not g["open"] else None, g["reason"]]
+                     for g in gaps[:10]],
+            "note": "; ".join(notes) or ("co gap trong khoang" if gaps else "day du")}
+
+
+def _of_head(symbol: str, start: int, end: int, kind: str = "trades") -> dict[str, Any]:
+    return {"symbol": symbol, "from": _of_iso(start), "to": _of_iso(end), "data_coverage": _of_coverage(symbol, start, end, kind)}
+
+
+def _of_time_range(from_time: str, to_time: str, default_minutes: int, max_days: float) -> tuple[int, int]:
+    """from/to cua tool: 'YYYY-MM-DD HH:MM' (gio VN, nhu moi tool khac), ISO hoac epoch ms. to bo trong = bay gio."""
+    end = _parse_moment(to_time, end=True) if to_time else _of_now()
+    start = _parse_moment(from_time) if from_time else end - default_minutes * 60_000
+    if start is None or end is None:
+        raise ValueError("khong doc duoc from_time / to_time")
+    if end <= start:
+        raise ValueError("to_time phai sau from_time")
+    if end - start > max_days * OF_DAY_MS:
+        raise ValueError(f"khoang toi da {max_days:g} ngay")
+    return int(start), int(end)
+
+
+def _of_query_range(query, max_days: float = OF_MAX_RANGE_DAYS) -> tuple[int, int]:
+    try:
+        end = int(query.get("to") or _of_now())
+        start = int(query.get("from") or end - OF_DAY_MS)
+    except ValueError:
+        raise ValueError("from / to phai la epoch ms") from None
+    if end <= start:
+        raise ValueError("to phai lon hon from")
+    if end - start > max_days * OF_DAY_MS:
+        raise ValueError(f"khoang toi da {max_days:g} ngay")
+    return start, end
+
+
+def _of_float(value: Any, name: str, default: float | None = None) -> float | None:
+    if value is None or value == "":
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} phai la so") from None
+    if number != number:
+        raise ValueError(f"{name} phai la so")
+    return number
+
+
+def _of_response(request, body: Any):
+    """JSON gon, nen gzip khi trinh duyet nhan (heatmap 24h ~ vai MB truoc nen)."""
+    from starlette.responses import Response
+    raw = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    headers = {"Cache-Control": "no-store", "Vary": "Accept-Encoding"}
+    if len(raw) > 4096 and "gzip" in (request.headers.get("accept-encoding") or ""):
+        raw = gzip.compress(raw, 5)
+        headers["Content-Encoding"] = "gzip"
+    return Response(raw, media_type="application/json", headers=headers)
+
+
+# ---------------------------------------------------------------- order flow: tinh toan dung chung API + tool
+
+def _of_bubbles(symbol: str, start: int, end: int, min_qty: float | None, limit: int = 5000) -> list[dict[str, Any]]:
+    sym = _of_symbol(symbol)
+    rows = _of_store().big_trades(sym["symbol"], start, end, min_qty if min_qty is not None else sym["big_trade_min_qty"],
+                                  limit)
+    return [{"ts": r["ts"], "price": orderflow_logic.round_price(r["price"], sym["bucket_size"] / 100),
+             "qty": round(r["qty"], 6), "side": r["side"]} for r in rows]
+
+
+def _of_cvd(symbol: str, start: int, end: int, res_sec: int, anchor: str = "from") -> dict[str, Any]:
+    sym = _of_symbol(symbol)
+    res_sec = int(res_sec)
+    if res_sec < sym["footprint_res_sec"] or res_sec > 86_400:
+        raise ValueError(f"res phai trong [{sym['footprint_res_sec']}, 86400] giay")
+    res_ms = res_sec * 1000
+    if (end - start) / res_ms > OF_MAX_POINTS:
+        raise ValueError(f"qua {OF_MAX_POINTS} diem: tang res hoac thu hep khoang")
+    if anchor not in ("from", "day_utc"):
+        raise ValueError("anchor phai la from hoac day_utc")
+    store = _of_store()
+    rows = store.cvd_rows(sym["symbol"], start, end, res_ms)
+    day_base = None
+    if anchor == "day_utc":
+        day0 = start - start % OF_DAY_MS
+        buy, sell = store.delta_sum(sym["symbol"], day0, start - start % res_ms)
+        day_base = {day0: buy - sell}
+    points = orderflow_logic.cvd_points(rows, day_anchor=anchor == "day_utc", day_base=day_base)
+    return {"points": points, "rows": rows, "bucket_size": sym["bucket_size"]}
+
+
+def _of_profile(symbol: str, start: int, end: int, bucket: float | None) -> dict[str, Any]:
+    sym = _of_symbol(symbol)
+    size = sym["bucket_size"]
+    bucket = bucket or size
+    if bucket < size * 0.999:
+        raise ValueError(f"bucket phai >= bucket_size cua cap ({size:g})")
+    raw = _of_store().profile_rows(sym["symbol"], start, end)
+    if raw and (raw[-1][0] - raw[0][0]) / bucket > 2000:
+        bucket = size * math.ceil((raw[-1][0] - raw[0][0]) / 2000 / size)
+    rows = orderflow_logic.rebucket_profile(raw, bucket)
+    va = orderflow_logic.value_area(rows, bucket)
+    total_buy = sum(r["buy"] for r in rows)
+    total_sell = sum(r["sell"] for r in rows)
+    return {"rows": rows, **va, "bucket": bucket, "buy": total_buy, "sell": total_sell, "total": total_buy + total_sell}
+
+
+def _of_snap_dict(row) -> dict[str, Any]:
+    return {"ts": row["ts"], "mid": row["mid"], "best_bid": row["best_bid"], "best_ask": row["best_ask"],
+            "bucket_size": row["bucket_size"], "base_price": row["base_price"], "n_buckets": row["n_buckets"],
+            "bids": orderflow_store.unpack(row["bids"]), "asks": orderflow_store.unpack(row["asks"])}
+
+
+def _of_book_rows(snap: dict[str, Any], range_pct: float, limit: int) -> dict[str, Any]:
+    mid, size, base = snap["mid"], snap["bucket_size"], snap["base_price"]
+    low, high = mid * (1 - range_pct), mid * (1 + range_pct)
+    bids, asks = [], []
+    for i, (b, a) in enumerate(zip(snap["bids"], snap["asks"])):
+        price = round(base + i * size, 10)
+        if price + size <= low or price > high:
+            continue
+        if b > 0:
+            bids.append([price, round(b, 6)])
+        if a > 0:
+            asks.append([price, round(a, 6)])
+    bids.sort(key=lambda r: -r[0])
+    asks.sort(key=lambda r: r[0])
+    return {"bids": bids[:limit], "asks": asks[:limit]}
+
+
+def _of_snapshots(symbol: str, start: int, end: int) -> list[dict[str, Any]]:
+    return [_of_snap_dict(r) for r in _of_store().snapshots(symbol, start, end)]
+
+
+def _of_fine_rows(symbol: str, start: int, end: int) -> list[tuple[int, float, float, float]]:
+    return [(r["ts"], r["price_bucket"], r["buy_vol"], r["sell_vol"])
+            for r in _of_store().footprint(symbol, start, end) if r["res_sec"] < 60]
+
+
+def _of_walls(symbol: str, range_pct: float, min_persist_min: float, include_inactive: bool,
+              lookback_min: float | None = None) -> dict[str, Any]:
+    sym = _of_symbol(symbol)
+    if not 0 < range_pct <= sym["depth_range_pct"] + 1e-9:
+        raise ValueError(f"range_pct phai trong (0, {sym['depth_range_pct']:g}] (depth_range_pct cua cap)")
+    if not 0 < min_persist_min <= 720:
+        raise ValueError("min_persist_min phai trong (0, 720]")
+    end = _of_now()
+    lookback = lookback_min or max(60.0, 3 * min_persist_min)
+    start = end - int(lookback * 60_000)
+    snaps = _of_snapshots(sym["symbol"], start, end)
+    if not snaps:
+        raise ValueError(f"chua co du lieu so lenh cua {sym['symbol']} trong {lookback:g} phut gan nhat "
+                         "(heatmap chi co tu luc collector chay)")
+    walls = orderflow_logic.detect_walls(
+        snaps, _of_fine_rows(sym["symbol"], start - 10_000, end), bucket_size=sym["bucket_size"],
+        wall_k=sym["wall_k"], min_persist_min=min_persist_min, range_pct=range_pct,
+        include_inactive=include_inactive, res_ms=sym["footprint_res_sec"] * 1000)
+    return {"sym": sym, "start": start, "end": end, "walls": walls, "mid": snaps[-1]["mid"], "snap_ts": snaps[-1]["ts"]}
+
+
+def _of_wall_view(wall: dict[str, Any], size: float) -> dict[str, Any]:
+    out = {**wall, "price": orderflow_logic.round_price(wall["price"], size), "first_seen": _of_iso(wall["first_seen"])}
+    if "ended_at" in out:
+        out["ended_at"] = _of_iso(out["ended_at"])
+    return out
+
+
+# ---------------------------------------------------------------- order flow: API dashboard (chung auth /setup-dashboard)
+
+@_dash_route("/api/orderflow/status")
+async def http_of_status(request, session):
+    """Trang thai order flow. symbol= thi tra them khoi 'symbol' cho cap do. Viewer goi duoc."""
+    cfg = _of_cfg()
+    symbol = str(request.query_params.get("symbol") or "").strip().upper()
+    names = [s["symbol"] for s in cfg["symbols"]]
+    body: dict[str, Any] = {"enabled": cfg["enabled"],
+                            "symbols": await asyncio.to_thread(lambda: {n: _of_info(n) for n in names})}
+    if symbol:
+        body["symbol"] = body["symbols"].get(symbol) or await asyncio.to_thread(_of_info, _dash_symbol(request))
+    return _dash_json(body)
+
+
+@_dash_route("/api/orderflow/bubbles")
+async def http_of_bubbles(request, session):
+    query = request.query_params
+    symbol = _dash_symbol(request)
+    start, end = _of_query_range(query)
+    rows = await asyncio.to_thread(_of_bubbles, symbol, start, end, _of_float(query.get("min_qty"), "min_qty"))
+    return _of_response(request, rows)
+
+
+@_dash_route("/api/orderflow/cvd")
+async def http_of_cvd(request, session):
+    query = request.query_params
+    symbol = _dash_symbol(request)
+    start, end = _of_query_range(query)
+    out = await asyncio.to_thread(_of_cvd, symbol, start, end, int(_of_float(query.get("res"), "res", 60)),
+                                  str(query.get("anchor") or "from"))
+    return _of_response(request, [{k: (round(v, 6) if isinstance(v, float) else v) for k, v in p.items()}
+                                  for p in out["points"]])
+
+
+@_dash_route("/api/orderflow/volume-profile")
+async def http_of_volume_profile(request, session):
+    query = request.query_params
+    symbol = _dash_symbol(request)
+    start, end = _of_query_range(query)
+    out = await asyncio.to_thread(_of_profile, symbol, start, end, _of_float(query.get("bucket"), "bucket"))
+    rows = [{k: round(v, 6) if k != "price" else v for k, v in r.items()} for r in out["rows"]]
+    return _of_response(request, {"rows": rows, "poc": out["poc"], "vah": out["vah"], "val": out["val"],
+                                  "bucket": out["bucket"]})
+
+
+@_dash_route("/api/orderflow/orderbook")
+async def http_of_orderbook(request, session):
+    symbol = _dash_symbol(request)
+    sym = _of_symbol(symbol)
+    range_pct = _of_float(request.query_params.get("range_pct"), "range_pct", 0.03)
+    if not 0 < range_pct <= 0.2:
+        raise ValueError("range_pct phai trong (0, 0.2]")
+
+    def load() -> dict[str, Any]:
+        row = _of_store().snapshot_at(sym["symbol"])
+        if row is None:
+            return {"symbol": symbol, "ts": None, "bids": [], "asks": []}
+        snap = _of_snap_dict(row)
+        age = (_of_now() - snap["ts"]) / 1000
+        return {"symbol": symbol, "ts": snap["ts"], "mid": snap["mid"], "best_bid": snap["best_bid"],
+                "best_ask": snap["best_ask"], "bucket_size": snap["bucket_size"], "age_sec": round(age, 1),
+                "stale": age > int(_of_cfg()["tech"]["stale_sec"]), **_of_book_rows(snap, range_pct, 2000)}
+
+    return _of_response(request, await asyncio.to_thread(load))
+
+
+def _of_heatmap(symbol: str, start: int, end: int, price_min: float | None, price_max: float | None,
+                max_cols: int, max_rows: int) -> dict[str, Any]:
+    sym = _of_symbol(symbol)
+    store = _of_store()
+    if price_min is None or price_max is None:
+        last = store.snapshot_at(sym["symbol"])
+        if last is None:
+            return {"symbol": symbol, "t": [], "n_rows": 0, "bids": "", "asks": "", "gaps": [], "coverage_start": None}
+        price_min = last["mid"] * (1 - sym["depth_range_pct"])
+        price_max = last["mid"] * (1 + sym["depth_range_pct"])
+    if price_max <= price_min:
+        raise ValueError("price_max phai lon hon price_min")
+    step = max(sym["snapshot_interval_sec"] * 1000, math.ceil((end - start) / max_cols))
+    cols = "ts, base_price, bucket_size, n_buckets, bids, asks, best_bid, best_ask"
+    # Buoc cot >= 2 x cua so gop thi doc dong gop san (trung binh co trong so = trung binh cac snapshot), cua so nao
+    # chua co dong gop (vua chay, collector restart) thi lay snapshot tho cua cua so do
+    levels = sorted((int(r) for r in _of_cfg()["tech"]["heatmap_agg_levels"]), reverse=True)
+    res = next((r for r in levels if step >= 2 * r * 1000), None)
+    rows: list[tuple] = []
+    count = 0
+    if res:
+        res_ms = res * 1000
+        agg = store.agg_rows(sym["symbol"], res, start, end)
+        covered = {r["ts"] for r in agg}
+        rows = [tuple(r) for r in agg]
+        count = sum(r["n_snapshots"] for r in agg)
+        missing = [t for t in store.snapshot_times(sym["symbol"], start, end) if t - t % res_ms not in covered]
+        for lo, hi in _of_runs(missing, res_ms):
+            raw = store.snapshots(sym["symbol"], lo, hi + 1, cols)
+            rows += [tuple(r) for r in raw]
+            count += len(raw)
+    else:
+        rows = [tuple(r) for r in store.snapshots(sym["symbol"], start, end, cols)]
+        count = len(rows)
+    import zlib
+    grid = orderflow_logic.heatmap_grid(rows, start=start, end=end, step=step,
+                                        price_min=price_min, price_max=price_max, bucket_size=sym["bucket_size"],
+                                        max_rows=max_rows, unpack=zlib.decompress)
+    cov = store.coverage(sym["symbol"])
+    return {"symbol": symbol, "t": grid["t"], "step": grid["step"], "base_price": grid["base_price"],
+            "bucket_size": grid["bucket_size"], "n_rows": grid["n_rows"], "n_cols": grid["n_cols"],
+            "bids": base64.b64encode(grid["bids"].tobytes()).decode("ascii"),
+            "asks": base64.b64encode(grid["asks"].tobytes()).decode("ascii"),
+            "filled": [1 if x else 0 for x in grid["filled"]], "counts": grid["counts"], "bbo": grid["bbo"],
+            "gaps": [[g["start_ts"], g["end_ts"]] for g in store.gaps(sym["symbol"], start, end, kind="depth")],
+            "coverage_start": cov["book_from"], "snapshots": count, "agg_res_sec": res}
+
+
+def _of_runs(times: list[int], gap_ms: int) -> list[tuple[int, int]]:
+    """Gom cac moc thoi gian tang dan thanh doan [dau, cuoi], cach nhau qua gap_ms thi tach doan."""
+    out: list[tuple[int, int]] = []
+    for t in times:
+        if out and t - out[-1][1] <= gap_ms:
+            out[-1] = (out[-1][0], t)
+        else:
+            out.append((t, t))
+    return out
+
+
+@_dash_route("/api/orderflow/heatmap")
+async def http_of_heatmap(request, session):
+    query = request.query_params
+    symbol = _dash_symbol(request)
+    days = float(_of_cfg()["retention"]["heatmap_days"])
+    start, end = _of_query_range(query, max_days=days)
+    max_cols = int(_of_float(query.get("max_cols"), "max_cols", 1500))
+    max_rows = int(_of_float(query.get("max_rows"), "max_rows", 400))
+    if not (10 <= max_cols <= 4000 and 10 <= max_rows <= 1000):
+        raise ValueError("max_cols trong [10, 4000], max_rows trong [10, 1000]")
+    out = await asyncio.to_thread(_of_heatmap, symbol, start, end, _of_float(query.get("price_min"), "price_min"),
+                                  _of_float(query.get("price_max"), "price_max"), max_cols, max_rows)
+    return _of_response(request, out)
+
+
+def _of_stream_tick(symbol: str, layers: set[str], cur: dict[str, Any], res_ms: int, min_qty: float,
+                    cob_pct: float) -> dict[str, Any]:
+    store = _of_store()
+    out: dict[str, Any] = {}
+    if layers & {"heatmap", "cob"}:
+        rows = store.snapshots_after(symbol, cur["snap"], limit=30)
+        if rows:
+            cur["snap"] = rows[-1]["ts"]
+            if "heatmap" in layers:
+                import zlib
+                out["heatmap"] = [{"ts": r["ts"], "base_price": r["base_price"], "bucket_size": r["bucket_size"],
+                                   "n": r["n_buckets"], "best_bid": r["best_bid"], "best_ask": r["best_ask"],
+                                   "bids": base64.b64encode(zlib.decompress(r["bids"])).decode("ascii"),
+                                   "asks": base64.b64encode(zlib.decompress(r["asks"])).decode("ascii")} for r in rows]
+            if "cob" in layers:
+                snap = _of_snap_dict(rows[-1])
+                book = _of_book_rows(snap, cob_pct, 20)
+                out["cob"] = {"ts": snap["ts"], "mid": snap["mid"], "best_bid": snap["best_bid"],
+                              "best_ask": snap["best_ask"], "bucket_size": snap["bucket_size"], **book}
+    if "bubbles" in layers:
+        rows = store.big_trades_after(symbol, cur["agg"], min_qty)
+        if rows:
+            cur["agg"] = max(r["first_agg_id"] for r in rows)
+            out["bubbles"] = [{"ts": r["ts"], "price": r["price"], "qty": round(r["qty"], 6), "side": r["side"]}
+                              for r in rows]
+    if "cvd" in layers:
+        now = _of_now()
+        bucket = now - now % res_ms
+        rows = store.cvd_rows(symbol, bucket - res_ms, bucket + res_ms, res_ms)
+        if rows:
+            out["cvd"] = [{"t": t, "buy": round(b, 6), "sell": round(s, 6), "delta": round(b - s, 6)}
+                          for t, b, s, *_ in rows]
+    return out
+
+
+@_dash_route("/api/orderflow/stream")
+async def http_of_stream(request, session):
+    """SSE: moi snapshot_interval_sec chi day phan cua cac lop trong layers. once=1 tra mot tick roi dong (test)."""
+    from starlette.responses import StreamingResponse
+    query = request.query_params
+    symbol = _dash_symbol(request)
+    sym = _of_symbol(symbol)
+    layers = {x.strip() for x in str(query.get("layers") or "").split(",") if x.strip()} & set(OF_LAYERS_LIVE)
+    if not layers:
+        raise ValueError(f"layers phai gom it nhat mot trong {list(OF_LAYERS_LIVE)}")
+    res_ms = int(_of_float(query.get("res"), "res", 60)) * 1000
+    if res_ms < sym["footprint_res_sec"] * 1000:
+        raise ValueError("res qua nho")
+    min_qty = _of_float(query.get("min_qty"), "min_qty", sym["big_trade_min_qty"])
+    cob_pct = _of_float(query.get("range_pct"), "range_pct", sym["depth_range_pct"])
+    once = query.get("once") in ("1", "true")
+    token = request.cookies.get(DASH_COOKIE) or ""
+    store = _of_store()
+
+    def start_cursor() -> dict[str, Any]:
+        last = store.snapshot_at(sym["symbol"])
+        return {"snap": int(query.get("after_snap") or (last["ts"] if last else 0)),
+                "agg": int(query.get("after_agg") or store.max_first_agg_id(sym["symbol"]))}
+
+    cur = await asyncio.to_thread(start_cursor)
+    interval = float(sym["snapshot_interval_sec"])
+
+    async def events():
+        yield "retry: 5000\n\n"
+        checked, idle = time.monotonic(), 0.0
+        while True:
+            if await request.is_disconnected():
+                return
+            if time.monotonic() - checked > 60:
+                checked = time.monotonic()
+                if DASH_AUTH.session(token) is None:
+                    yield "event: end\ndata: {\"reason\":\"session\"}\n\n"
+                    return
+            try:
+                tick = await asyncio.to_thread(_of_stream_tick, sym["symbol"], layers, cur, res_ms, min_qty, cob_pct)
+            except Exception as exc:  # noqa: BLE001 - loi doc DB: bao trinh duyet chuyen sang polling
+                yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
+                return
+            if tick:
+                tick.update(t=_of_now(), cursor=cur)
+                yield f"event: tick\ndata: {json.dumps(tick, separators=(',', ':'))}\n\n"
+                idle = 0.0
+            else:
+                idle += interval
+                if idle >= 15:
+                    yield ": ping\n\n"
+                    idle = 0.0
+            if once:
+                return
+            await asyncio.sleep(interval)
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+# ---------------------------------------------------------------- order flow: MCP tools
+
+@_tool_with_reasons()
+def get_orderflow_status() -> dict[str, Any]:
+    """Trang thai collector order flow (process bamcp-orderflow) cho tung cap.
+
+    connected / collector_live: collector con ghi heartbeat. stale = khong co event qua 60 giay: so lieu
+    order flow dang cu, noi ra truoc khi dung. has_book = da co heatmap (chi co tu luc collector chay, khong
+    backfill duoc). Cac tool order flow khac deu tra data_coverage cho khoang duoc hoi.
+    """
+    cfg = _of_cfg()
+    store = _of_store()
+    rows = []
+    for sym in cfg["symbols"]:
+        info = _of_info(sym["symbol"])
+        rows.append({k: (_of_iso(v) if k.endswith(("_ts", "_from", "_to", "_at")) and isinstance(v, int) else v)
+                     for k, v in info.items() if k not in ("configured",)})
+    jobs = [{"id": j["id"], "symbol": j["symbol"], "from_date": j["from_date"], "to_date": j["to_date"],
+             "status": _of_job_state(j)["status"], "progress": j["progress"], "message": j["message"]}
+            for j in store.jobs(5)]
+    return {"enabled": cfg["enabled"], "symbols": rows, "db_size_mb": round(store.size_bytes() / 1e6, 1),
+            "config_source": cfg["source"], "config_error": OF_CONFIG.last_error or None, "backfill_jobs": jobs,
+            "note": ("Order flow dang tat (orderflow.enabled = false)." if not cfg["enabled"]
+                     else "Collector chay process rieng; so lieu chi moi khi collector_live = true.")}
+
+
+@_tool_with_reasons()
+def get_orderflow_summary(symbol: str = "", lookback_min: int = 60) -> dict[str, Any]:
+    """Tom tat order flow N phut gan nhat cua mot cap: buy/sell vol chu dong, delta, CVD dau va cuoi ky (neo
+    dau ngay UTC), so luong va tong khoi luong bong bong (lenh lon) moi phia, imbalance so lenh trong +-0.5% va
+    +-1% quanh mid, top 3 tuong thanh khoan moi phia.
+
+    Lenh khop co ca lich su (backfill); so lenh (imbalance, tuong) chi co tu luc collector chay - thieu thi
+    khoi 'book' bao ro. Doc data_coverage truoc khi ket luan. Order flow la BANG CHUNG BO TRO, khong phai tin
+    hieu vao lenh: van theo quy trinh get_context / check_trade nhu cu.
+    """
+    sym = _of_symbol(symbol)
+    lookback_min = int(lookback_min)
+    if not 1 <= lookback_min <= 1440:
+        raise ValueError("lookback_min phai trong [1, 1440]")
+    name, size = sym["symbol"], sym["bucket_size"]
+    end = _of_now()
+    start = end - lookback_min * 60_000
+    store = _of_store()
+    buy, sell = store.delta_sum(name, start, end)
+    day0 = start - start % OF_DAY_MS
+    pre_b, pre_s = store.delta_sum(name, day0, start)
+    cvd_start = pre_b - pre_s
+    rows = store.cvd_rows(name, start, end, lookback_min * 60_000)
+    big = store.big_trades(name, start, end, sym["big_trade_min_qty"], 100_000)
+    sides = {}
+    for side in ("BUY", "SELL"):
+        items = [b for b in big if b["side"] == side]
+        sides[side.lower()] = {"count": len(items), "qty": round(sum(b["qty"] for b in items), 6),
+                               "largest": [{"ts": _of_iso(b["ts"]), "price": orderflow_logic.round_price(b["price"], size),
+                                            "qty": round(b["qty"], 6)}
+                                           for b in sorted(items, key=lambda b: -b["qty"])[:3]]}
+    out = {**_of_head(name, start, end),
+           "trades": {"buy_vol": round(buy, 6), "sell_vol": round(sell, 6), "delta": round(buy - sell, 6),
+                      "buy_pct": round(buy / (buy + sell) * 100, 1) if buy + sell else None,
+                      "high": orderflow_logic.round_price(max((r[3] for r in rows), default=0) + size, size) if rows else None,
+                      "low": orderflow_logic.round_price(min((r[4] for r in rows), default=0), size) if rows else None},
+           "cvd": {"anchor": "dau ngay UTC", "start": round(cvd_start, 6), "end": round(cvd_start + buy - sell, 6)},
+           "bubbles": {"min_qty": sym["big_trade_min_qty"], **sides}}
+    snap_row = store.snapshot_at(name)
+    stale_ms = int(_of_cfg()["tech"]["stale_sec"]) * 1000
+    if snap_row is None or end - snap_row["ts"] > stale_ms:
+        out["book"] = {"available": False,
+                       "note": "chua co du lieu so lenh" if snap_row is None
+                       else f"snapshot so lenh cuoi luc {_of_iso(snap_row['ts'])}, da cu (collector dung?)"}
+        return out
+    snap = _of_snap_dict(snap_row)
+    book: dict[str, Any] = {"available": True, "snapshot_at": _of_iso(snap["ts"]),
+                            "mid": orderflow_logic.round_price(snap["mid"], size / 100),
+                            "imbalance_0_5pct": orderflow_logic.imbalance(snap, 0.005),
+                            "imbalance_1pct": orderflow_logic.imbalance(snap, 0.01),
+                            "imbalance_note": "(bid - ask) / (bid + ask): duong = ben mua day hon"}
+    persist = min(15.0, max(1.0, lookback_min / 2))
+    try:
+        walls = _of_walls(name, sym["depth_range_pct"], persist, False, lookback_min=max(lookback_min, 2 * persist))
+        book["walls_min_persist_min"] = persist
+        for side in ("BID", "ASK"):
+            book[f"walls_{side.lower()}"] = [_of_wall_view(w, size) for w in walls["walls"] if w["side"] == side][:3]
+    except ValueError as exc:
+        book["walls_note"] = str(exc)
+    out["book"] = book
+    out["book_coverage"] = _of_coverage(name, start, end, "book")
+    return out
+
+
+@_tool_with_reasons()
+def get_liquidity_walls(symbol: str = "", range_pct: float = 0.03, min_persist_min: float = 15,
+                        include_inactive: bool = False) -> dict[str, Any]:
+    """Tuong thanh khoan trong so lenh: bucket co qty >= wall_k x median qty cac bucket cung phia trong range,
+    ton tai lien tuc >= min_persist_min phut (cho phep dut 2 snapshot). Xet trong max(60, 3 x min_persist_min) phut gan nhat.
+
+    status: ACTIVE (con), PULLED (giam >= 70% trong <= 30 giay khi gia cach <= 0.3% ma khop tai muc < 30% luong
+    giam - dau hieu spoof), CONSUMED (khop tai muc >= 50% luong giam - bi an that), FADED (giam dan khi gia o xa).
+    include_inactive=false chi tra tuong ACTIVE. Chi co khi collector da chay du lau (khong backfill so lenh).
+    """
+    sym = _of_symbol(symbol)
+    out = _of_walls(sym["symbol"], float(range_pct), float(min_persist_min), bool(include_inactive))
+    size = sym["bucket_size"]
+    walls = [_of_wall_view(w, size) for w in out["walls"]]
+    return {**_of_head(sym["symbol"], out["start"], out["end"], "book"),
+            "mid": orderflow_logic.round_price(out["mid"], size / 100), "snapshot_at": _of_iso(out["snap_ts"]),
+            "wall_k": sym["wall_k"], "bucket_size": size, "count": len(walls), "walls": walls[:40],
+            "truncated": len(walls) > 40}
+
+
+@_tool_with_reasons()
+def get_cvd(symbol: str = "", from_time: str = "", to_time: str = "", res_sec: int = 900) -> dict[str, Any]:
+    """Chuoi CVD (delta tich luy = mua chu dong - ban chu dong, neo 0 tai from_time) kem nhan xet phan ky don
+    gian: gia tao dinh / day moi trong 1/4 cuoi chuoi nhung CVD khong xac nhan.
+
+    from_time / to_time: 'YYYY-MM-DD HH:MM' gio VN, ISO hoac epoch ms; bo trong = 24 gio gan nhat. res_sec: buoc
+    (mac dinh 900 = M15), toi da 500 diem tra ve. high/low moi diem la bien bucket gia co lenh khop.
+    """
+    sym = _of_symbol(symbol)
+    start, end = _of_time_range(from_time, to_time, 1440, 31)
+    res_sec = int(res_sec)
+    if (end - start) / (res_sec * 1000) > 500:
+        raise ValueError(f"qua 500 diem voi res_sec={res_sec}: tang res_sec hoac thu hep khoang")
+    out = _of_cvd(sym["symbol"], start, end, res_sec)
+    size = sym["bucket_size"]
+    points = out["points"]
+    highs = [r[3] + size for r in out["rows"]]
+    lows = [r[4] for r in out["rows"]]
+    series = [{"t": _of_iso(p["t"]), "buy": round(p["buy"], 4), "sell": round(p["sell"], 4),
+               "delta": round(p["delta"], 4), "cvd": round(p["cvd"], 4),
+               "high": orderflow_logic.round_price(h, size), "low": orderflow_logic.round_price(lo, size)}
+              for p, h, lo in zip(points, highs, lows)]
+    return {**_of_head(sym["symbol"], start, end), "res_sec": res_sec, "points": len(series),
+            "cvd_end": series[-1]["cvd"] if series else None,
+            "divergence": orderflow_logic.divergence(points, highs, lows), "series": series}
+
+
+@_tool_with_reasons()
+def get_volume_profile(symbol: str = "", from_time: str = "", to_time: str = "", bucket: float = 0) -> dict[str, Any]:
+    """Volume profile tu lenh khop: POC (giua bucket co khoi luong lon nhat), VAH / VAL (value area 70%, mo rong
+    tu POC sang phia bucket ke tiep lon hon), top 3 HVN va LVN.
+
+    from_time / to_time nhu get_cvd (bo trong = 24 gio gan nhat, toi da 31 ngay). bucket = 0 lay bucket_size cua cap.
+    """
+    sym = _of_symbol(symbol)
+    start, end = _of_time_range(from_time, to_time, 1440, 31)
+    out = _of_profile(sym["symbol"], start, end, float(bucket) or None)
+    nodes = orderflow_logic.volume_nodes(out["rows"])
+    size = out["bucket"]
+    return {**_of_head(sym["symbol"], start, end), "bucket": size,
+            "poc": out["poc"], "vah": out["vah"], "val": out["val"],
+            "total_volume": round(out["total"], 4), "buy_volume": round(out["buy"], 4),
+            "sell_volume": round(out["sell"], 4), "rows": len(out["rows"]), **nodes,
+            "note": "poc = giua bucket; vah = bien tren, val = bien duoi cua value area"}
+
+
+@_tool_with_reasons()
+def get_absorption_events(symbol: str = "", from_time: str = "", to_time: str = "") -> dict[str, Any]:
+    """Su kien hap thu (absorption), cua so truot 60 giay:
+    BULLISH_ABSORPTION: ban chu dong tai vung +-1 bucket >= absorption_min_qty ma gia khong xuong qua 2 bucket duoi
+    vung va bid tai vung con >= 50% (hoac duoc nap lai). BEARISH_ABSORPTION doi xung voi mua chu dong.
+    outcome_15m: bien do thuan loi / bat loi lon nhat 15 phut sau (chi co khi da du 15 phut).
+
+    Can du lieu so lenh (heatmap) nen chi xet duoc tu luc collector chay. from_time / to_time nhu get_cvd, bo trong =
+    2 gio gan nhat, toi da 24 gio.
+    """
+    sym = _of_symbol(symbol)
+    start, end = _of_time_range(from_time, to_time, 120, 1)
+    name, size = sym["symbol"], sym["bucket_size"]
+    snaps = _of_snapshots(name, start - 120_000, end + 60_000)
+    if not snaps:
+        raise ValueError(f"chua co du lieu so lenh cua {name} trong khoang nay - hap thu can heatmap "
+                         "(chi co tu luc collector chay, khong backfill duoc)")
+    fine = _of_fine_rows(name, start, end + 900_000)
+    data_end = max((r[0] for r in fine), default=start)
+    events = orderflow_logic.detect_absorption(fine, snaps, bucket_size=size, min_qty=sym["absorption_min_qty"],
+                                               start=start, end=end, data_end=data_end,
+                                               step_ms=sym["footprint_res_sec"] * 1000)
+    rows = [{**e, "ts": _of_iso(e["ts"]), "price": orderflow_logic.round_price(e["price"], size)} for e in events]
+    return {**_of_head(name, start, end, "book"), "absorption_min_qty": sym["absorption_min_qty"],
+            "bucket_size": size, "count": len(rows), "events": rows[:100], "truncated": len(rows) > 100}
+
+
+@_tool_with_reasons()
+def get_orderbook_snapshot(symbol: str = "", ts: str = "", range_pct: float = 0.01) -> dict[str, Any]:
+    """So lenh da gom bucket tai snapshot gan ts nhat (bo trong = moi nhat), trong mid +- range_pct.
+    ts: 'YYYY-MM-DD HH:MM' gio VN, ISO hoac epoch ms. Kem imbalance trong +-0.5% va +-1%."""
+    sym = _of_symbol(symbol)
+    range_pct = float(range_pct)
+    if not 0 < range_pct <= sym["depth_range_pct"] + 1e-9:
+        raise ValueError(f"range_pct phai trong (0, {sym['depth_range_pct']:g}]")
+    at = _parse_moment(ts) if ts else None
+    row = _of_store().snapshot_at(sym["symbol"], at)
+    if row is None:
+        raise ValueError(f"chua co snapshot so lenh nao cua {sym['symbol']}")
+    snap = _of_snap_dict(row)
+    size = sym["bucket_size"]
+    book = _of_book_rows(snap, range_pct, 60)
+    return {"symbol": sym["symbol"], "snapshot_at": _of_iso(snap["ts"]),
+            "requested": _of_iso(at) if at else "moi nhat",
+            "offset_sec": round((snap["ts"] - at) / 1000, 1) if at else None,
+            "mid": orderflow_logic.round_price(snap["mid"], size / 100), "best_bid": snap["best_bid"],
+            "best_ask": snap["best_ask"], "bucket_size": size, "range_pct": range_pct,
+            "imbalance_0_5pct": orderflow_logic.imbalance(snap, 0.005), "imbalance_1pct": orderflow_logic.imbalance(snap, 0.01),
+            **book, "data_coverage": _of_coverage(sym["symbol"], snap["ts"] - 60_000, snap["ts"] + 1, "book")}
+
+
+@_tool_with_reasons()
+def backfill_orderflow(symbol: str, from_date: str, to_date: str) -> dict[str, Any]:
+    """Backfill lenh khop (footprint + bong bong) tu aggTrades lich su cua Binance, chay nen.
+
+    from_date / to_date: YYYY-MM-DD theo ngay UTC, toi da 90 ngay, khong qua hom nay. Ngay cu dung file daily
+    data.binance.vision, hom nay dung REST. Chay lai khong nhan doi. Heatmap (so lenh) KHONG backfill duoc.
+    Tra job id; xem tien do bang get_orderflow_status.
+    """
+    job = _of_start_backfill(symbol, from_date, to_date)
+    return {"job_id": job["id"], "symbol": job["symbol"], "from_date": job["from_date"], "to_date": job["to_date"],
+            "status": job["status"], "message": job.get("message"), "note": job.get("note")}
+
+
+# ---------------------------------------------------------------- order flow: backfill nen
+
+def _of_job_state(job: dict[str, Any]) -> dict[str, Any]:
+    """Job dang chay ma process da chet (restart server, bi kill) thi doi sang failed de khong treo mai."""
+    if job["status"] not in ("queued", "running"):
+        return job
+    proc = _OF_PROCS.get(job["id"])
+    dead = proc is not None and proc.poll() is not None
+    if dead or (proc is None and _of_now() - int(job["updated_at"]) > 600_000):
+        _of_store().update_job(job["id"], status="failed", finished_at=_of_now(),
+                               message=(job.get("message") or "") + " | process backfill khong con chay")
+        return {**job, "status": "failed"}
+    return job
+
+
+def _of_start_backfill(symbol: str, from_date: str, to_date: str) -> dict[str, Any]:
+    import subprocess
+    import orderflow_backfill
+    sym = _of_symbol(symbol)
+    cfg = _of_cfg()
+    orderflow_backfill.validate_range(from_date, to_date, int(cfg["tech"]["backfill_max_days"]))
+    store = _of_store()
+    for job in store.jobs(50):
+        if job["symbol"] == sym["symbol"] and _of_job_state(job)["status"] in ("queued", "running"):
+            return {**job, "note": "dang co job backfill cua cap nay, tra lai job do"}
+    job = store.create_job("backfill", sym["symbol"], from_date.strip(), to_date.strip())
+    log_dir = cfg["paths"]["logs"]
+    log_dir.mkdir(parents=True, exist_ok=True)
+    with (log_dir / "backfill.log").open("ab") as log:
+        proc = subprocess.Popen([sys.executable, str(OF_BACKFILL_SCRIPT), "--config", str(CONFIG_PATH), "--job", job["id"]],
+                                stdout=log, stderr=log, cwd=str(OF_BACKFILL_SCRIPT.parent),
+                                env={**os.environ, "BAMCP_DATA_ROOT": str(DATA_ROOT)})
+    _OF_PROCS[job["id"]] = proc
+    store.update_job(job["id"], pid=proc.pid, message="da khoi chay")
+    return {**job, "pid": proc.pid, "message": "da khoi chay"}
+
+
 @mcp.custom_route(DASH_PATH + "/login", methods=["GET", "POST"])
 async def http_dash_login(request):
     from starlette.responses import HTMLResponse, RedirectResponse
@@ -8129,7 +8945,9 @@ def build_app():
                          # TM - #ENTRY-ALERT - Entry setups & alerts
                          ADMIN_ALERTS_PATH, ADMIN_ALERTS_ACTION_PATH,
                          # TM - #DASHBOARD - Setup dashboard
-                         ADMIN_DASH_PATH, ADMIN_DASH_ACTION_PATH),
+                         ADMIN_DASH_PATH, ADMIN_DASH_ACTION_PATH,
+                         # TM - #BOOKMAP - Order flow Bookmap
+                         ADMIN_OF_PATH, ADMIN_OF_ACTION_PATH),
             # TM - #DASHBOARD - Setup dashboard
             public_prefixes=(DASH_PATH,),
         )

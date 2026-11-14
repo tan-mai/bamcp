@@ -17,6 +17,8 @@ Sàn (tuỳ chọn, chỉ đọc) ─┤
                          ├── /admin ............ bạn cấu hình
                          ├── /setup-dashboard .. xem biểu đồ, review
                          └── Discord/Telegram .. báo khi giá chạm kế hoạch
+
+Binance (sổ lệnh, lệnh khớp) ─▶ bamcp-orderflow (process riêng) ─▶ orderflow.db ─▶ BAMCP đọc
 ```
 
 ## Có gì trong BAMCP
@@ -27,6 +29,7 @@ Sàn (tuỳ chọn, chỉ đọc) ─┤
 | Quy định | Chấm lệnh theo quota, SL/TP, R:R. Mỗi lần đổi quy định đều phải có lý do | [rules.md](docs/rules.md) |
 | Setup và cảnh báo | Lưu kế hoạch vào lệnh, server canh trên nến M5 đã đóng rồi báo tin | [setups.md](docs/setups.md) |
 | Dashboard | Vẽ bias, setup, kịch bản lên biểu đồ nến và review theo ngày | [dashboard.md](docs/dashboard.md) |
+| Order flow (Bookmap) | Heatmap thanh khoản, bong bóng lệnh lớn, CVD, volume profile, sổ lệnh trên chart. Collector chạy process riêng | [orderflow.md](docs/orderflow.md) |
 | Lệnh ngoài kế hoạch | Đối chiếu vị thế thật với setup trong ngày, báo lệnh lệch kế hoạch kèm mã OP để đánh giá cùng Claude | [off-plan.md](docs/off-plan.md) |
 | ORB | Tín hiệu và backtest Opening Range Breakout theo phiên | [orb.md](docs/orb.md) |
 | GANN | Pivot, cửa sổ thời gian, mốc giá Square of 9 | [gann.md](docs/gann.md) |
@@ -134,4 +137,5 @@ Test không gọi mạng và không đụng `data/` thật. Chúng dùng thư m�
 | `gann_*.py` | GANN |
 | `entry_*.py`, `notifier.py` | Setup, watcher, thông báo |
 | `dashboard_*.py`, `static/` | Setup dashboard |
+| `orderflow_*.py`, `admin_orderflow.py`, `static/dashboard/orderflow.js` | Order flow: collector, backfill, DB, logic, trang admin, lớp trên chart |
 | `probe.py`, `bamcp_cli.py` | Gọi thử tool và lệnh quản trị từ dòng lệnh |

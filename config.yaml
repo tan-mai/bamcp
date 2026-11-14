@@ -48,6 +48,8 @@ paths:
   alerts_config_file: "alerts/config.json"  # notify + watcher do trang /admin/alerts ghi, thang khoi duoi
   # TM - #DASHBOARD - Setup dashboard
   dashboard_config_file: "dashboard/config.json"  # khoi dashboard do trang /admin/dashboard-accounts ghi, thang khoi duoi
+  # TM - #BOOKMAP - Order flow Bookmap
+  orderflow_config_file: "orderflow/config.json"  # khoi orderflow do trang /admin/orderflow ghi, thang khoi duoi
 
 # TM - #KL-SQL - Kline storage SQLite
 storage:
@@ -356,6 +358,55 @@ dashboard:
     test_highs: 1            # hanh vi test dinh
     test_lows: 1             # hanh vi test day
     phase_cd_event: 3        # SPRING/SOS hoac UTAD/SOW da confirmed
+
+# TM - #BOOKMAP - Order flow Bookmap
+# Collector la process RIENG (orderflow_collector.py, systemd bamcp-orderflow.service / service
+# bamcp-orderflow trong docker compose), ghi vao db_path. Server MCP va dashboard chi doc.
+# enabled, retention, symbols la gia tri KHOI TAO: sua o trang /admin/orderflow thi ban moi ghi vao
+# paths.orderflow_config_file va thang khoi nay. Collector so mtime config moi 30 giay, doi la ap dung
+# khong can restart (bat/tat cap = subscribe/unsubscribe, doi tham so = tu snapshot ke tiep).
+# Duong dan tuong doi tinh tu data_root.
+orderflow:
+  enabled: true
+  db_path: "orderflow.db"            # file SQLite rieng, khong tranh khoa voi DB kline
+  tmp_dir: "orderflow/tmp"           # zip aggTrades cua backfill, xu ly xong thi xoa
+  log_dir: "orderflow/logs"          # collector.log, rotate 10 MB x 3
+  retention: { heatmap_days: 14, footprint_5s_days: 30, footprint_60s_days: 365, big_trades_days: 180, gaps_days: 365 }
+  symbols:
+    - symbol: BTCUSDT
+      market: futures                # futures | spot
+      enabled: true
+      bucket_size: 10                # USD; gom gia snapshot va footprint
+      depth_range_pct: 0.03          # chi luu so lenh trong mid +- 3%
+      snapshot_interval_sec: 2
+      footprint_res_sec: 5           # phai chia het 60
+      big_trade_min_qty: 5           # don vi base asset (BTC). p99 mot aggTrade ~2 BTC
+      bubble_merge_ms: 200
+      wall_k: 5                      # tuong = qty >= k x median qty cac bucket trong range
+      absorption_min_qty: 50
+    - symbol: ETHUSDT
+      market: futures
+      enabled: true
+      bucket_size: 1                 # ETH ~1,900 USD: +-3% ~ 114 bucket
+      depth_range_pct: 0.03
+      snapshot_interval_sec: 2
+      footprint_res_sec: 5
+      big_trade_min_qty: 100         # p99 mot aggTrade ~56 ETH
+      bubble_merge_ms: 200
+      wall_k: 5
+      absorption_min_qty: 1000
+    # XAUUSDT perp: tick 0.01, gia ~3,900. Do 2026-11-12: 683k aggTrade/ngay, p99 mot lenh ~4.8 oz.
+    - symbol: XAUUSDT
+      market: futures
+      enabled: true
+      bucket_size: 0.5               # +-2% ~ 310 bucket
+      depth_range_pct: 0.02          # vang it bien dong hon crypto
+      snapshot_interval_sec: 2
+      footprint_res_sec: 5
+      big_trade_min_qty: 10
+      bubble_merge_ms: 200
+      wall_k: 5
+      absorption_min_qty: 100
 
 # Gia tri KHOI TAO. Lan dau update_rules duoc goi, ban sao ghi sang data/rules.json
 # va tu do file do la nguon su that. Sua o day chi anh huong khi rules.json chua co,

@@ -52,6 +52,8 @@ COPY admin_auth.py ./
 COPY tr_logic.py ./
 # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
 COPY off_plan_logic.py off_plan_store.py off_plan_watcher.py ./
+# TM - #BOOKMAP - Order flow Bookmap: collector chay container rieng cung image (service bamcp-orderflow)
+COPY orderflow_config.py orderflow_store.py orderflow_logic.py orderflow_collector.py orderflow_backfill.py admin_orderflow.py ./
 COPY static ./static
 # Lenh `bamcp dashboard create-owner <username>`. Sinh ngay trong image de khong phu thuoc
 # kieu xuong dong cua file tren may build.
@@ -61,6 +63,7 @@ RUN printf '#!/bin/sh\nexec python /app/bamcp_cli.py "$@"\n' > /usr/local/bin/ba
 RUN mkdir -p /data/klines /data/bias /data/journal /data/journal/orb_skips \
              /data/orb/state /data/orb/logs /data/orb/history /data/orb/backtests \
              /data/time_windows/pivots /data/time_windows/backtests \
+             /data/orderflow/logs /data/orderflow/tmp \
     && chown -R bamcp:bamcp /data /app
 
 USER bamcp

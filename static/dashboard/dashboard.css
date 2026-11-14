@@ -86,6 +86,32 @@ body.dash { overflow-x: clip; }
 .chart-note:empty { visibility: hidden; }
 .chart { position: relative; width: 100%; height: 60vh; height: 60dvh; min-height: 300px; }
 
+/* TM - #BOOKMAP - Order flow Bookmap: luoi chart nen + pane CVD + cot 120px (volume profile, COB) */
+.chart-grid { position: absolute; inset: 0; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
+.chart-grid.side-on { grid-template-columns: minmax(0, 1fr) 120px; }
+.chart-grid.cvd-on { grid-template-rows: minmax(0, 1fr) clamp(90px, 24%, 200px); }
+.chart-main { position: relative; grid-column: 1; grid-row: 1; min-width: 0; min-height: 0; }
+.of-side { grid-column: 2; grid-row: 1; width: 120px; height: 100%; border-left: 1px solid var(--line); }
+.cvd-pane { position: relative; grid-column: 1; grid-row: 2; min-width: 0; min-height: 0; border-top: 1px solid var(--line-strong); }
+.cvd-val { position: absolute; top: 4px; left: 8px; z-index: 3; padding: 1px 6px; font-size: 11.5px; font-weight: 650;
+  font-variant-numeric: tabular-nums; background: var(--surface); border-radius: 5px; pointer-events: none; }
+.of-tip { position: absolute; z-index: 6; max-width: 260px; padding: 5px 8px; font-size: 12px; line-height: 1.35; white-space: pre-line;
+  background: var(--surface); border: 1px solid var(--line-strong); border-radius: 7px; box-shadow: 0 4px 12px rgba(0,0,0,.18); pointer-events: none; }
+.of-group { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line); display: grid; gap: 6px; }
+.of-parent { font-weight: 650; }
+.of-kids { display: grid; gap: 6px; padding-left: 4px; }
+.of-item { display: grid; gap: 4px; }
+.of-sub { display: grid; gap: 4px; padding-left: 22px; }
+.of-sub:empty { display: none; }
+.of-group .check.dim { opacity: .45; cursor: default; }
+.of-group.off .of-kids { opacity: .55; }
+.of-ctl { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); }
+.of-ctl input[type=range] { flex: 1 1 auto; min-width: 0; accent-color: var(--accent); }
+.of-ctl input[type=number] { width: 84px; min-height: 28px; padding: 2px 6px; }
+.of-ctl select { min-height: 28px; padding: 2px 6px; font-size: 12.5px; }
+.of-note { margin: 0; color: var(--warn); font-size: 12px; }
+.of-note:empty { display: none; }
+
 /* TM - #DASH-LAYOUT - Menu lop o goc chart */
 .layer-wrap { position: relative; }
 .layer-menu { position: absolute; right: 0; top: calc(100% + 4px); z-index: 30; width: 250px; max-width: calc(100vw - 24px);

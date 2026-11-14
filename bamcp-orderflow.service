@@ -1,0 +1,25 @@
+# TM - #BOOKMAP - Order flow Bookmap
+# Collector order flow: process rieng, khong chay trong server MCP. Collector dung thi /mcp va dashboard
+# van chay, chi so lieu order flow cu di (data_coverage / stale bao ro).
+#   sudo cp bamcp-orderflow.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now bamcp-orderflow
+#   journalctl -u bamcp-orderflow -f      (them file log co rotate: <data_root>/orderflow/logs/collector.log)
+[Unit]
+Description=BAMCP order flow collector (Binance depth + aggTrade)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bamcp
+WorkingDirectory=/opt/bamcp
+Environment=BAMCP_CONFIG=/opt/bamcp/config.yaml
+ExecStart=/opt/bamcp/.venv/bin/python /opt/bamcp/orderflow_collector.py
+Restart=always
+RestartSec=5
+# SIGTERM: ghi not footprint / bong bong dang giu trong bo nho roi moi thoat
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

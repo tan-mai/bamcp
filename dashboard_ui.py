@@ -85,6 +85,7 @@ def _tail(boot: dict[str, Any], assets: dict[str, str]) -> str:
     data = json.dumps(boot, ensure_ascii=False).replace("<", "\\u003c")
     return f"""<script type="application/json" id="boot">{data}</script>
 <script src="{html.escape(assets['lightweight-charts.js'])}"></script>
+<script src="{html.escape(assets['orderflow.js'])}"></script>
 <script src="{html.escape(assets['dashboard.js'])}"></script>
 </body>
 </html>"""
@@ -101,8 +102,14 @@ _CHART_TOOLS = """<button type="button" class="btn sm" id="resetZoom" title="V�
     </div>
   </div>"""
 
-_CHART_BOX = ('<div class="chart" id="chart"><div class="popover" id="popover" role="dialog" '
-              'aria-label="Chi tiết event" hidden></div></div>')
+# TM - #BOOKMAP - Order flow Bookmap: chart nen o #chartMain; pane CVD phia duoi va cot 120px ben phai (volume
+# profile + COB) chi hien khi lop tuong ung bat, chart nen gian ra khi tat
+_CHART_BOX = ('<div class="chart" id="chart"><div class="chart-grid" id="chartGrid">'
+              '<div class="chart-main" id="chartMain"></div>'
+              '<canvas class="of-side" id="ofSide" aria-label="Volume profile và sổ lệnh" hidden></canvas>'
+              '<div class="cvd-pane" id="cvdPane" hidden><span class="cvd-val" id="cvdVal"></span></div>'
+              '</div><div class="popover" id="popover" role="dialog" aria-label="Chi tiết event" hidden></div>'
+              '<div class="of-tip" id="ofTip" role="tooltip" hidden></div></div>')
 
 
 def app_page(boot: dict[str, Any], assets: dict[str, str]) -> str:

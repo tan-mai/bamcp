@@ -32,6 +32,8 @@ Deep link, cũng là dạng `dashboard_url` mà tool và tin push trả về: `/
 | `keylv` | Mức giá của bias và swing W/D | bật |
 | `failed` | Event Wyckoff `failed` | tắt |
 
+Cũng trong menu **Lớp** có nhóm **Order Flow** (heatmap thanh khoản, bong bóng, CVD, volume profile, COB). Xem [orderflow.md](orderflow.md#trên-dashboard).
+
 **Full page ở tab riêng.** `/setup-dashboard/full?symbol=BTCUSDT&date=2026-11-13&tr_id=<id>&layers=tr,phase,event,zone,levels,trades`
 
 - Nút "⤢ Mở full page" là link `target="_blank"`, mang theo cặp, ngày, TR, lớp, khung, chế độ và revision đang xem. Chuột giữa hay Ctrl+click mở tab nền. Mở được nhiều tab cùng lúc, mỗi tab một cặp, tự làm mới độc lập.

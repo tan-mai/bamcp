@@ -27,6 +27,21 @@ Không có tool đặt lệnh. Plan của ORB và setup chỉ là con số đề
 | `get_bias` | Đọc bias đã lưu của một cặp |
 | `save_bias` | Lưu bias cho một cặp sau bước W/D/H4 |
 
+## Order flow
+
+Chi tiết ở [orderflow.md](orderflow.md#tool-mcp). Mọi tool trả `data_coverage`. Sổ lệnh (tường, hấp thụ, imbalance) chỉ có từ lúc collector chạy.
+
+| Tool | Việc |
+|---|---|
+| `get_orderflow_summary` | Tóm tắt N phút: delta, CVD, bong bóng mỗi phía, imbalance sổ lệnh, top 3 tường mỗi phía |
+| `get_liquidity_walls` | Tường thanh khoản và trạng thái `ACTIVE` / `PULLED` / `CONSUMED` / `FADED` |
+| `get_cvd` | Chuỗi CVD kèm nhận xét phân kỳ |
+| `get_volume_profile` | POC, VAH, VAL, HVN, LVN |
+| `get_absorption_events` | Sự kiện hấp thụ và kết quả 15 phút sau |
+| `get_orderbook_snapshot` | Sổ lệnh đã gom bucket tại một thời điểm |
+| `backfill_orderflow` | Backfill lệnh khớp từ aggTrades lịch sử, chạy nền |
+| `get_orderflow_status` | Trạng thái collector, dung lượng DB, job backfill |
+
 ## Quy định và nhật ký
 
 Chi tiết ở [rules.md](rules.md).

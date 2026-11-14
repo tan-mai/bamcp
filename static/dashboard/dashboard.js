@@ -239,7 +239,8 @@
   function fullQuery() {
     const review = S.mode === "review";
     return qs({ symbol: S.symbol, date: S.date, tr_id: S.trId || null, layers: layerQuery(), tf: S.tf,
-                mode: review ? "review" : null, revision: review && S.revision !== "origin" ? S.revision : null });
+                mode: review ? "review" : null, revision: review && S.revision !== "origin" ? S.revision : null,
+                of: OF ? OF.query() : null });  // TM - #BOOKMAP - trang thai checkbox Order Flow
   }
   function syncUrl() {
     if (FULL) {
@@ -310,7 +311,8 @@
   // ---------------------------------------------------------------- bieu do
 
   const LW = window.LightweightCharts;
-  const chartBox = $("chart");
+  // TM - #BOOKMAP - Order flow Bookmap: chart nen nam trong #chartMain (luoi #chartGrid co them pane CVD va cot phai)
+  const chartBox = $("chartMain");
   const token = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
   function alpha(color, a) {
@@ -774,6 +776,19 @@
   });
   chart.timeScale().subscribeVisibleLogicalRangeChange(() => { if (S.popover) placePopover(); });
 
+  // TM - #BOOKMAP - Order flow Bookmap: lop heatmap / bong bong / CVD / VP / COB nam trong orderflow.js
+  const OF = window.BamcpOrderflow ? window.BamcpOrderflow.create({
+    LW, chart, series: candleSeries, box: chartBox, root: $("chart"), full: FULL, params, el, alpha, num,
+    api, apiBase: API, fmtTime: full, span: SPAN,
+    colors: () => C,
+    state: () => ({ symbol: S.symbol, tf: S.tf, mode: S.mode, date: S.date }),
+    data: () => S.chart,
+    times: () => (S.chart ? S.chart.times : []),
+    tickFormatter: (time, type) => (type <= 2 ? F_DM.format(time * 1000) : hm(time * 1000)),
+    localization: { locale: "vi-VN", timeFormatter: (time) => full(time * 1000) },
+    onChange: () => syncUrl(),
+  }) : null;
+
   function scenarioColor(scenario, setups) {
     const linked = setups.find((s) => scenario.setup_codes.includes(s.code));
     const points = scenario.points;
@@ -909,7 +924,7 @@
     volumeSeries.setData(volumes);
     candleSeries.setMarkers(buildMarkers(d, times, formingTime));
     drawPriceLines(d);
-    S.chart = { data: d, barCount: rows.length, whitespace };
+    S.chart = { data: d, barCount: rows.length, whitespace, times: rows.map((r) => r.time) };  // TM - #BOOKMAP: times cho pane CVD
 
     const edge = rows.length - 1 + 4;
     if (fit) {
@@ -935,6 +950,7 @@
     if (d.plan.source === "revision") notes.push(`Đang xem kế hoạch revision ${d.plan.revision}.`);
     if (S.mode === "review" && d.plan.source === "live") notes.push("Ngày này chưa có snapshot, đang vẽ kế hoạch hiện tại.");
     setChartNote(notes.join(" "));
+    if (OF) OF.onChart();  // TM - #BOOKMAP - Order flow Bookmap: tai lai lop order flow cho vung dang xem
   }
 
   function setChartNote(text) {
@@ -1902,6 +1918,7 @@
     $("symbol").replaceChildren(...symbols.map((s) => el("option", { value: s, selected: s === S.symbol }, s)));
     $("symbol").addEventListener("change", (e) => setSymbol(e.target.value));
     renderLayerMenu();
+    if (OF) OF.mount($("layerMenu"));  // TM - #BOOKMAP - nhom checkbox Order Flow trong panel lop
     renderTrSelect();
 
     // Dung chung hai trang: lop, reset zoom, chon TR, lam moi, Esc
@@ -1927,11 +1944,13 @@
       else if (key === "r") refresh(false);
       else if (key === "s") setPanel($("fPanel").hidden);
       else if (key === "0") resetZoom();
+      else if (OF && OF.key(key)) { /* TM - #BOOKMAP - H heatmap, B bong bong, C CVD, V volume profile, O COB */ }
       else return;
       e.preventDefault();
     });
     // Tab an: khong goi API. Hien lai: lam moi ngay (Live, hoac dang loi ket noi)
     document.addEventListener("visibilitychange", () => {
+      if (OF) OF.visibility(document.hidden);  // TM - #BOOKMAP - tab an thi dong SSE / polling order flow
       if (document.hidden) {
         clearTimeout(pollTimer);
         pollTimer = null;
@@ -2012,6 +2031,7 @@
         rightPriceScale: { borderColor: C.line }, timeScale: { borderColor: C.line },
       });
       candleSeries.applyOptions({ upColor: C.long, downColor: C.short, wickUpColor: C.long, wickDownColor: C.short });
+      if (OF) OF.repaint();  // TM - #BOOKMAP
       if (S.chart) renderChart(S.chart.data, false);
     });
 

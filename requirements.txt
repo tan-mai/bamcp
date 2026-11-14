@@ -7,3 +7,6 @@ pyyaml>=6.0,<7
 python-dotenv>=1.0,<2     # nap .env khi chay local; Docker dung env cua compose
 tzdata>=2024.1            # zoneinfo can du lieu tz; image slim khong chac co san
 argon2-cffi>=25.1,<26     # TM - #DASHBOARD - hash mat khau tai khoan dashboard
+# TM - #BOOKMAP - Order flow Bookmap
+websockets>=13,<18        # collector bamcp-orderflow: combined stream Binance (uvicorn[standard] cung keo theo)
+numpy>=2.0,<3             # downsample heatmap, tuong thanh khoan, hap thu, gop snapshot

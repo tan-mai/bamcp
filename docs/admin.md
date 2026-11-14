@@ -38,6 +38,7 @@ Thanh trên cùng của mọi trang admin dẫn tới:
 | Kéo nến | `/admin/schedules` | [data.md](data.md#lịch-kéo-nến) |
 | Vào lệnh | `/admin/alerts` | [setups.md](setups.md) |
 | Dashboard accounts | `/admin/dashboard-accounts` | [dashboard.md](dashboard.md) |
+| Order Flow | `/admin/orderflow` | [orderflow.md](orderflow.md) |
 
 Phiên ORB và Gann chỉ hiện khi module tương ứng bật (`orb.enabled`, `time_windows.enabled`).
 
