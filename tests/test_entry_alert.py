@@ -358,7 +358,7 @@ class NotifierTest(unittest.TestCase):
 
     # TM - #NOTIFY-CHANNEL - kenh thieu gia tri bien thi bao loi cau hinh, khong gui
     def test_config_error_and_message(self):
-        with self.assertRaisesRegex(notifier.NotifyConfigError, "TG_BOT_X"):
+        with self.assertRaisesRegex(notifier.NotifyConfigError, "chua nhap bot token"):
             notifier.make_sender({"provider": "telegram", "telegram_bot_token_ref": "TG_BOT_X",
                                   "telegram_chat_id": "42"}, lambda ref: None)
         with self.assertRaisesRegex(notifier.NotifyConfigError, "khong phai webhook Discord"):

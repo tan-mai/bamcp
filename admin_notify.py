@@ -37,10 +37,9 @@ __WARNINGS__
 
   <div class="card">
     <h2>Kênh</h2>
-    <p class="hint">Token / webhook không lưu trong DB: chỉ lưu <b>tên biến</b> (Telegram <code>TG_...</code>,
-      Discord <code>DC_...</code>). Giá trị lấy từ biến môi trường (<code>.env</code>, vd
-      <code>__ENV_EXAMPLE__</code>); deploy không có <code>.env</code> thì nhập giá trị ở ô bên dưới — lưu trên volume
-      (<code>__ALERTS_FILE__</code>), biến môi trường cùng tên được ưu tiên.</p>
+    <p class="hint">Mọi cài đặt kênh nhập ở trang này, không cần <code>.env</code>. Bot token / webhook URL lưu trên volume
+      (<code>__ALERTS_FILE__</code>), không nằm trong DB và không hiện lại — chỉ 4 ký tự cuối. Kênh Telegram / Discord
+      đã nhập ở bản trước được chép sang đây khi khởi động.</p>
     <div class="scroll"><table>
       <thead><tr><th>Tên</th><th>Loại</th><th>Đích</th><th>Bí mật</th><th>Lần gửi cuối</th><th></th></tr></thead>
       <tbody>__CHANNEL_ROWS__</tbody>
@@ -54,22 +53,22 @@ __WARNINGS__
           <option value="telegram">Telegram</option><option value="discord">Discord</option></select></div>
         <div class="end pad"><label class="check"><input type="checkbox" id="c_enabled" checked> Bật</label></div>
       </div>
-      <div class="tg-only"><div class="row">
-        <div><label for="c_tg_ref">Tên biến bot token</label><input type="text" id="c_tg_ref" placeholder="TG_BOT_MAIN"></div>
+      <div class="tg-only">
+      <label for="c_tg_value">Bot token <span class="small" id="c_tg_hint">· kênh mới để trống = dùng chung bot của kênh Telegram đã có</span></label>
+      <input type="password" id="c_tg_value" autocomplete="off" placeholder="123456789:AA...">
+      <div class="row">
         <div><label for="c_tg_chat">chat_id</label><input type="text" id="c_tg_chat" placeholder="-100xxxxxxxxxx"></div>
         <div><label for="c_tg_thread">Topic id (message_thread_id) <span class="small">· trống = không dùng topic</span></label>
           <input type="number" id="c_tg_thread"></div>
-      </div>
-      <label for="c_tg_value">Giá trị bot token <span class="small">· tuỳ chọn, trống = giữ nguyên</span></label>
-      <input type="password" id="c_tg_value" autocomplete="off"></div>
-      <div class="dc-only"><div class="row">
-        <div><label for="c_dc_ref">Tên biến webhook</label><input type="text" id="c_dc_ref" placeholder="DC_WEBHOOK_BTC"></div>
+      </div></div>
+      <div class="dc-only">
+      <label for="c_dc_value">Webhook URL <span class="small" id="c_dc_hint">· bắt buộc với kênh mới</span></label>
+      <input type="password" id="c_dc_value" autocomplete="off" placeholder="https://discord.com/api/webhooks/...">
+      <div class="row">
         <div><label for="c_dc_user">username <span class="small">· trống = BAMCP · {cặp}</span></label>
           <input type="text" id="c_dc_user" placeholder="BAMCP · BTC"></div>
         <div><label for="c_dc_avatar">avatar_url</label><input type="text" id="c_dc_avatar" placeholder="https://..."></div>
-      </div>
-      <label for="c_dc_value">Webhook URL <span class="small">· tuỳ chọn, trống = giữ nguyên</span></label>
-      <input type="password" id="c_dc_value" autocomplete="off" placeholder="https://discord.com/api/webhooks/..."></div>
+      </div></div>
       <div class="actions">
         <button type="button" class="primary" id="b_channel">Lưu kênh</button>
         <button type="button" id="b_channel_new">Kênh mới</button>
@@ -175,13 +174,14 @@ function fillChannel(c) {
   $("c_name").value = c ? c.name : "";
   $("c_provider").value = c ? c.provider : "telegram";
   $("c_enabled").checked = c ? c.enabled : true;
-  $("c_tg_ref").value = c && c.telegram_bot_token_ref || "";
   $("c_tg_chat").value = c && c.telegram_chat_id || "";
   $("c_tg_thread").value = c && c.telegram_thread_id != null ? c.telegram_thread_id : "";
-  $("c_dc_ref").value = c && c.discord_webhook_ref || "";
   $("c_dc_user").value = c && c.discord_username || "";
   $("c_dc_avatar").value = c && c.discord_avatar_url || "";
   $("c_tg_value").value = ""; $("c_dc_value").value = "";
+  const kept = c && c.secret_set ? "· trống = giữ " + c.secret_mask : null;
+  $("c_tg_hint").textContent = kept || "· kênh mới để trống = dùng chung bot của kênh Telegram đã có";
+  $("c_dc_hint").textContent = kept || "· bắt buộc với kênh mới";
   showProvider();
 }
 $("b_channel_new").addEventListener("click", () => fillChannel(null));
@@ -189,11 +189,10 @@ $("b_channel_new").addEventListener("click", () => fillChannel(null));
 $("b_channel").addEventListener("click", async (e) => {
   const provider = $("c_provider").value;
   const body = {action: "channel_save", id: $("c_id").value, name: $("c_name").value.trim(), provider: provider,
-    enabled: $("c_enabled").checked, telegram_bot_token_ref: $("c_tg_ref").value.trim(),
+    enabled: $("c_enabled").checked, telegram_bot_token: $("c_tg_value").value.trim(),
     telegram_chat_id: $("c_tg_chat").value.trim(), telegram_thread_id: $("c_tg_thread").value.trim(),
-    discord_webhook_ref: $("c_dc_ref").value.trim(), discord_username: $("c_dc_user").value.trim(),
-    discord_avatar_url: $("c_dc_avatar").value.trim(),
-    secret_values: {telegram_bot_token_ref: $("c_tg_value").value.trim(), discord_webhook_ref: $("c_dc_value").value.trim()}};
+    discord_webhook_url: $("c_dc_value").value.trim(), discord_username: $("c_dc_user").value.trim(),
+    discord_avatar_url: $("c_dc_avatar").value.trim()};
   const data = await act(body, e.target);
   if (data) { say("Đã lưu kênh " + data.channel.name + " — bấm Gửi thử để kiểm tra", true); reload(1200); }
 });
@@ -293,17 +292,11 @@ def _options(values: list[str], selected: Any = None, labels: dict[str, str] | N
 
 
 def _secret_cell(ch: dict[str, Any]) -> str:
-    out = []
-    for field in notify_logic.REF_PREFIX:
-        ref = ch.get(field)
-        if not ref:
-            continue
-        source = ch.get(field.replace("_ref", "_source"))
-        mask = ch.get(field.replace("_ref", "_mask"))
-        pill = ('<span class="pill err">chưa có giá trị</span>' if source == "missing"
-                else f'<span class="pill ok">{_e("env" if source == "env" else "admin")} {_e(mask)}</span>')
-        out.append(f"<code>{_e(ref)}</code> {pill}")
-    return "<br>".join(out) or "—"
+    if not ch.get("secret_set"):
+        return f'<span class="pill err">chưa nhập {_e(ch.get("secret_label"))}</span>'
+    shared = ch.get("secret_shared_with") or []
+    return (f'{_e(ch.get("secret_label"))} <span class="pill ok">{_e(ch.get("secret_mask"))}</span>'
+            + (f'<div class="small">dùng chung với {_e(", ".join(shared))}</div>' if shared else ""))
 
 
 def _channel_rows(channels: list[dict[str, Any]], defaults: list[str]) -> str:
@@ -380,10 +373,9 @@ def _warnings(view: dict[str, Any]) -> str:
         out.append("Chưa có kênh nào — thêm kênh rồi đặt làm kênh mặc định.")
     elif not settings["default_channel_id"]:
         out.append("Chưa đặt kênh mặc định: tin không khớp route nào sẽ bị FAILED, và kênh lỗi không có nơi FALLBACK.")
-    missing = [c["name"] for c in view["channels"]
-               if any(c.get(f.replace("_ref", "_source")) == "missing" for f in notify_logic.REF_PREFIX if c.get(f))]
+    missing = [c["name"] for c in view["channels"] if not c.get("secret_set")]
     if missing:
-        out.append(f"Kênh chưa có giá trị token / webhook: {', '.join(missing)}.")
+        out.append(f"Kênh chưa nhập bot token / webhook URL (bấm Sửa để nhập): {', '.join(missing)}.")
     if not view.get("hub_running"):
         out.append("Bộ gửi tin chưa chạy (server chưa khởi động xong) — tin tóm tắt chưa được gửi.")
     html_out = "".join(f'<div class="warn">{_e(w)}</div>' for w in out)
@@ -425,7 +417,6 @@ def render(view: dict[str, Any], *, action_path: str, admin_path: str, setup_req
         "__SETUP_BANNER__": SETUP_BANNER if setup_required else "",
         "__SETUP_FIELD__": SETUP_FIELD if setup_required else "",
         "__WARNINGS__": _warnings(view),
-        "__ENV_EXAMPLE__": _e(view.get("env_example")),
         "__ALERTS_FILE__": _e(view.get("alerts_file")),
         "__CHANNEL_ROWS__": _channel_rows(channels, defaults),
         "__MATRIX_HEAD__": head,

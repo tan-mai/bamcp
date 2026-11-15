@@ -279,8 +279,9 @@ account:
 # (tren volume) va thang khoi nay - co hieu luc ngay, khong can restart.
 notify:
   # TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp
-  # Kenh va route nam trong SQLite (notify_channels / notify_routes), sua o trang /admin/notify.
-  # channel / discord / telegram duoi day chi con doc MOT LAN luc migration: kenh cu thanh kenh mac dinh.
+  # Kenh va route nam trong SQLite (notify_channels / notify_routes), bot token / webhook nhap o trang
+  # /admin/notify (luu tren volume, khong doc .env). channel / discord / telegram duoi day chi con doc luc
+  # khoi dong de chep kenh cu nhap o /admin/alerts ban truoc sang kenh moi.
   channel: "discord"                 # (cu) discord | telegram | both
   discord: { webhook_url: "" }       # (cu) khong de secret o day
   telegram: { bot_token: "", chat_id: "" }

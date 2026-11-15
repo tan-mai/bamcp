@@ -331,10 +331,16 @@ class ProviderTest(unittest.TestCase):
 
     def test_clean_channel_and_settings(self):
         with self.assertRaises(ValueError):
-            nl.clean_channel({"name": "x", "provider": "telegram", "telegram_bot_token_ref": "BAMCP_PASSWORD",
-                              "telegram_chat_id": "-1"})
-        ok = nl.clean_channel({"name": "x", "provider": "discord", "discord_webhook_ref": "dc_webhook_btc"})
-        self.assertEqual(ok["discord_webhook_ref"], "DC_WEBHOOK_BTC")
+            nl.clean_channel({"name": "x", "provider": "telegram"})              # thieu chat_id
+        ok = nl.clean_channel({"name": "x", "provider": "discord", "discord_webhook_ref": "BAMCP_PASSWORD"})
+        self.assertNotIn("BAMCP_PASSWORD", ok.values())                          # khoa secret khong nhan tu payload
+        self.assertIsNone(nl.clean_secret("telegram", " "))                      # trong = giu gia tri dang luu
+        self.assertEqual(nl.clean_secret("telegram", f" {TOKEN} "), TOKEN)
+        self.assertEqual(nl.clean_secret("discord", HOOK), HOOK)
+        for provider, bad in (("telegram", "abc"), ("telegram", HOOK), ("discord", "https://evil.example/x")):
+            with self.assertRaises(ValueError):
+                nl.clean_secret(provider, bad)
+        self.assertRegex(nl.new_ref("telegram_bot_token_ref"), r"^TG_[0-9A-F]{8}$")
         with self.assertRaises(ValueError):
             nl.clean_settings({"dedupe_window_seconds": 300, "digest_minutes": 15, "log_retention_days": 30,
                                "default_channel_id": ["nope"]}, set())
@@ -391,22 +397,25 @@ class ServerTest(unittest.TestCase):
     def act(self, **payload):
         return asyncio.run(server._notify_action(payload))
 
-    # 12.1 + muc 8 - migration: kenh cu thanh kenh mac dinh, off_plan.channel rieng -> route * + OFF_PLAN
+    # 12.1 + muc 8 - migration: chep moi kenh cu, kenh dang dung thanh mac dinh, off_plan.channel -> route
     def test_migration_keeps_old_channel(self):
-        server._alerts_save("notify", {"channel": "discord", "discord": {"webhook_url": HOOK},
-                                       "telegram": {"bot_token": TOKEN, "chat_id": "-1009"}})
+        legacy = {"channel": "discord", "discord": {"webhook_url": HOOK},
+                  "telegram": {"bot_token": TOKEN, "chat_id": "-1009"}}
+        server._alerts_save("notify", legacy)
         server._alerts_save("off_plan", {"channel": "telegram"})
         out = server._notify_migrate()
         self.assertEqual(out["channels"], ["Discord (kênh cũ)", "Telegram (kênh cũ)"])
         chans = {c["name"]: c for c in server.NOTIFY_STORE.channels()}
         self.assertEqual(server._alerts_cfg()["notify"]["default_channel_id"], [chans["Discord (kênh cũ)"]["id"]])
-        self.assertEqual(chans["Discord (kênh cũ)"]["discord_webhook_ref"], "DC_WEBHOOK_MAIN")
-        self.assertEqual({(r["symbol"], r["category"]) for r in server.NOTIFY_STORE.routes()},
-                         {("*", "OFF_PLAN"), ("*", "TRADE_RESULT")})
+        self.assertEqual(chans["Telegram (kênh cũ)"]["telegram_chat_id"], "-1009")
+        self.assertEqual({(r["symbol"], r["category"], r["channel_id"]) for r in server.NOTIFY_STORE.routes()},
+                         {("*", c, chans["Telegram (kênh cũ)"]["id"]) for c in ("OFF_PLAN", "TRADE_RESULT")})
         with sqlite_db.connect(server.SQLITE_PATH) as conn:
             dump = json.dumps([dict(r) for r in conn.execute("SELECT * FROM notify_channels")])
-        self.assertNotIn("SECRET", dump)                       # DB chi giu ten bien
-        self.assertFalse(server._notify_migrate()["migrated"])  # chi chay mot lan
+        self.assertNotIn("SECRET", dump)                       # DB chi giu khoa, gia tri tren volume
+        self.assertEqual(sorted(server._alerts_cfg()["notify_secrets"].values()), sorted([HOOK, TOKEN]))
+        self.assertEqual(server._alerts_cfg()["notify"]["discord"], legacy["discord"])   # giu de rollback
+        self.assertFalse(server._notify_migrate()["migrated"])  # co danh dau -> khong chay lai
         alert = notifier.Alert("than tin", symbol="BTCUSDT", category="ENTRY_TRIGGERED", label="ENTRY TRIGGERED",
                                icon="🎯")
         self.assertIsNone(asyncio.run(notifier.dispatch(alert)))
@@ -417,18 +426,44 @@ class ServerTest(unittest.TestCase):
     def test_migration_without_old_config(self):
         out = server._notify_migrate()
         self.assertEqual((out["channels"], out["default_channel_id"]), ([], []))
-        self.assertTrue(server._alerts_cfg()["notify"]["channels_migrated"])
+        self.assertTrue(server._alerts_cfg()["notify"][server.NOTIFY_IMPORT_FLAG])
+
+    def test_migration_copies_unused_telegram_too(self):
+        # notify.channel = discord nhung Telegram da nhap: van chep, bat san, khong lam mac dinh (tin khong doi cho)
+        server._alerts_save("notify", {"channel": "discord", "discord": {"webhook_url": HOOK},
+                                       "telegram": {"bot_token": TOKEN, "chat_id": "-1009"}})
+        out = server._notify_migrate()
+        chans = {c["name"]: c for c in server.NOTIFY_STORE.channels()}
+        self.assertEqual(set(chans), {"Discord (kênh cũ)", "Telegram (kênh cũ)"})
+        self.assertTrue(chans["Telegram (kênh cũ)"]["enabled"])
+        self.assertEqual(out["default_channel_id"], [chans["Discord (kênh cũ)"]["id"]])
+        self.assertEqual(server.NOTIFY_STORE.routes(), [])
+        view = {c["name"]: c for c in server.get_notify_config()["channels"]}
+        self.assertEqual((view["Telegram (kênh cũ)"]["secret_set"], view["Telegram (kênh cũ)"]["secret_mask"]),
+                         (True, "****OKEN"))
+
+    def test_migration_rerun_reuses_existing_channels(self):
+        # Ban migration truoc da tao kenh Discord (khoa DC_WEBHOOK_MAIN) -> lan nay dung lai, chi them Telegram
+        server._alerts_save("notify_secrets", {"DC_WEBHOOK_MAIN": HOOK})
+        old = server.NOTIFY_STORE.save_channel({"name": "Discord (kênh cũ)", "provider": "discord",
+                                                "discord_webhook_ref": "DC_WEBHOOK_MAIN"})
+        server._alerts_save("notify", {"channel": "both", "channels_migrated": True, "default_channel_id": [old["id"]],
+                                       "discord": {"webhook_url": HOOK},
+                                       "telegram": {"bot_token": TOKEN, "chat_id": "-1009"}})
+        out = server._notify_migrate()
+        self.assertEqual((out["channels"], out["reused"]), (["Telegram (kênh cũ)"], ["Discord (kênh cũ)"]))
+        self.assertEqual(len(server.NOTIFY_STORE.channels()), 2)
+        self.assertEqual(out["default_channel_id"], [old["id"]])       # mac dinh da dat thi giu nguyen
+        self.assertEqual(server._alerts_cfg()["notify_secrets"]["DC_WEBHOOK_MAIN"], HOOK)
 
     # 12.10 - Gui thu va test_notification bao dung kenh; token khong lo o admin, log, MCP
     def test_test_buttons_and_no_secret_leak(self):
         code, out = self.act(action="channel_save", name="TG BTC topic", provider="telegram",
-                             telegram_bot_token_ref="TG_BOT_MAIN", telegram_chat_id="-1001", telegram_thread_id="4",
-                             secret_values={"telegram_bot_token_ref": TOKEN})
+                             telegram_bot_token=TOKEN, telegram_chat_id="-1001", telegram_thread_id="4")
         self.assertEqual(code, 200, out)
         btc = out["channel"]
-        self.assertEqual((btc["telegram_bot_token_mask"], btc["telegram_bot_token_source"]), ("****OKEN", "admin"))
-        code, out = self.act(action="channel_save", name="System", provider="discord",
-                             discord_webhook_ref="DC_WEBHOOK_SYS", secret_values={"discord_webhook_ref": HOOK})
+        self.assertEqual((btc["secret_set"], btc["secret_mask"]), (True, "****OKEN"))
+        code, out = self.act(action="channel_save", name="System", provider="discord", discord_webhook_url=HOOK)
         system = out["channel"]
         self.act(action="route_save", symbol="BTCUSDT", category="*", channel_ids=[btc["id"]])
         self.act(action="route_save", symbol="*", category="*", channel_ids=[system["id"]])
@@ -458,12 +493,14 @@ class ServerTest(unittest.TestCase):
         self.assertGreaterEqual(status["totals"]["failed"], 1)
 
     def test_route_validation_and_delete(self):
-        code, out = self.act(action="channel_save", name="x", provider="discord", discord_webhook_ref="DC_X",
-                             secret_values={"discord_webhook_ref": "https://evil.example/x"})
+        code, out = self.act(action="channel_save", name="x", provider="discord",
+                             discord_webhook_url="https://evil.example/x")
         self.assertEqual(code, 400)
-        code, out = self.act(action="channel_save", name="x", provider="discord", discord_webhook_ref="DC_X")
+        code, out = self.act(action="channel_save", name="x", provider="discord")
+        self.assertEqual((code, out["error"]), (400, "can nhap webhook URL"))
+        code, out = self.act(action="channel_save", name="x", provider="discord", discord_webhook_url=HOOK)
         cid = out["channel"]["id"]
-        self.assertEqual(out["channel"]["discord_webhook_source"], "missing")
+        self.assertTrue(out["channel"]["secret_set"])
         self.assertEqual(self.act(action="route_save", symbol="BTCUSDT", category="NOPE", channel_ids=[cid])[0], 400)
         self.assertEqual(self.act(action="route_save", symbol="BTCUSDT", category="OFF_PLAN", channel_ids=["x"])[0], 400)
         self.act(action="route_save", symbol="BTCUSDT", category="OFF_PLAN", channel_ids=[cid], min_severity="high")
@@ -472,11 +509,34 @@ class ServerTest(unittest.TestCase):
         code, out = self.act(action="channel_delete", id=cid)
         self.assertEqual(out["routes_removed"], 1)
         self.assertEqual(server._alerts_cfg()["notify"]["default_channel_id"], [])
+        self.assertEqual(server._alerts_cfg()["notify_secrets"], {})          # webhook khong con kenh nao dung
+
+    def test_telegram_channels_share_bot_token(self):
+        code, first = self.act(action="channel_save", name="TG BTC", provider="telegram", telegram_bot_token=TOKEN,
+                               telegram_chat_id="-1001", telegram_thread_id="4")
+        code, second = self.act(action="channel_save", name="TG ETH", provider="telegram", telegram_chat_id="-1001",
+                                telegram_thread_id="5")
+        self.assertEqual(code, 200, second)
+        self.assertEqual((second["channel"]["secret_mask"], second["channel"]["secret_shared_with"]),
+                         ("****OKEN", ["TG BTC"]))
+        # Sua kenh ETH, de trong token -> giu nguyen; nhap token khac -> chi kenh ETH doi
+        edit = dict(action="channel_save", id=second["channel"]["id"], name="TG ETH", provider="telegram",
+                    telegram_chat_id="-1001", telegram_thread_id="5")
+        self.assertEqual(self.act(**edit)[1]["channel"]["secret_mask"], "****OKEN")
+        other = "654321:ANOTHER-TELEGRAM-TOKEN-XY"
+        self.assertEqual(self.act(**edit, telegram_bot_token=other)[1]["channel"]["secret_mask"], "****N-XY")
+        chans = {c["name"]: c for c in server.get_notify_config()["channels"]}
+        self.assertEqual((chans["TG BTC"]["secret_mask"], chans["TG BTC"]["secret_shared_with"]), ("****OKEN", []))
+        self.assertEqual(sorted(server._alerts_cfg()["notify_secrets"].values()), sorted([TOKEN, other]))
+        # Khong con kenh Telegram nao co token -> kenh moi phai nhap
+        server._alerts_save("notify_secrets", {})
+        code, out = self.act(action="channel_save", name="TG XAU", provider="telegram", telegram_chat_id="-1001")
+        self.assertEqual((code, out["error"]), (400, "can nhap bot token"))
 
     # 12.11 - watcher M5 van chay khi moi kenh thong bao loi
     def test_watcher_survives_when_all_channels_fail(self):
         code, out = self.act(action="channel_save", name="Dead", provider="telegram",
-                             telegram_bot_token_ref="TG_BOT_DEAD", telegram_chat_id="-1")
+                             telegram_bot_token=TOKEN, telegram_chat_id="-1")
         self.down.add("Dead")
         self.act(action="settings_save", default_channel_id=[out["channel"]["id"]], dedupe_window_seconds=300,
                  digest_minutes=15, log_retention_days=30, display_timezone="Asia/Ho_Chi_Minh")

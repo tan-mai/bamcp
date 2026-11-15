@@ -8,7 +8,7 @@ Mã setup: `{SYM}-{yyyymmdd}-{L|S}-{ACC|DIST|RNG}-{pha}-{entry_event}-{n}`, vd `
 
 ## Thiết lập sau khi deploy
 
-1. Ở `/admin/alerts`, điền kênh thông báo và bấm **Gửi thử**.
+1. Ở `/admin/notify`, thêm kênh Telegram / Discord (dán bot token hoặc webhook URL), đặt kênh mặc định và bấm **Gửi thử**.
 2. Phía Claude: dời task phân tích bias sang 00:05 UTC và kết thúc bằng `save_setups(..., replace=true)` cho từng cặp.
 3. Khi hỏi "vào được chưa", Claude đọc `get_setups` và `get_setup_events` trước, rồi mới đọc nến M5/M15 đã đóng.
 

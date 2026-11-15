@@ -97,14 +97,15 @@ Trạng thái chống trùng và tin tóm tắt đang chờ nằm trong bộ nh�
 
 ## Token và webhook
 
-DB không lưu token. Kênh chỉ giữ **tên biến**: bot token Telegram bắt đầu bằng `TG_` (ví dụ `TG_BOT_MAIN`), webhook Discord bắt đầu bằng `DC_` (ví dụ `DC_WEBHOOK_BTC`).
+Mọi cài đặt kênh, kể cả bot token và webhook URL, nhập ở `/admin/notify`. Server không đọc `.env` hay biến môi trường cho phần này, nên deploy bằng panel hay bằng compose đều như nhau.
 
-Giá trị được đọc theo thứ tự:
+- Bot token và webhook URL lưu trên volume, trong khối `notify_secrets` của `alerts/config.json`. DB không lưu giá trị: cột `telegram_bot_token_ref` / `discord_webhook_ref` chỉ giữ khoá do server tự sinh (ví dụ `TG_3F9A1C2B`).
+- Sửa kênh mà để trống ô token / webhook thì giữ giá trị đang lưu.
+- Kênh Telegram mới để trống bot token thì dùng chung bot của kênh Telegram đã có. Các kênh dùng chung bot hiện "dùng chung với ...". Nhập token khác cho một kênh thì chỉ kênh đó đổi, kênh kia giữ bot cũ.
+- Bot token phải dạng `123456789:AA...`. Webhook phải bắt đầu bằng `https://discord.com/api/webhooks/`.
+- Xoá kênh thì token / webhook không còn kênh nào dùng cũng bị xoá khỏi volume.
 
-1. Biến môi trường cùng tên, tức `.env` khi chạy bằng `docker-compose.yml` hoặc chạy local.
-2. Giá trị nhập ở trang admin, lưu trên volume (`alerts/config.json`, khối `notify_secrets`). Dùng cách này khi deploy bằng panel không có `.env`.
-
-Trang admin, `notify_log` và output tool MCP chỉ hiện tên biến, nguồn (`env` / `admin`) và 4 ký tự cuối (`****abcd`). Lỗi trả về từ Telegram hoặc Discord cũng được xoá token trước khi ghi. Webhook phải bắt đầu bằng `https://discord.com/api/webhooks/`.
+Trang admin, `notify_log` và output tool MCP chỉ hiện "đã nhập" kèm 4 ký tự cuối (`****abcd`). Lỗi trả về từ Telegram hoặc Discord cũng được xoá token trước khi ghi.
 
 ## Trang `/admin/notify`
 
@@ -137,12 +138,14 @@ Cài đặt chung nằm trong khối `notify` của `alerts/config.json` (giá t
 
 ## Chuyển từ cấu hình cũ
 
-Chạy một lần lúc khởi động (đánh dấu `notify.channels_migrated`):
+Chạy lúc khởi động, đánh dấu `notify.legacy_channels_imported` khi xong:
 
 1. Tạo 3 bảng mới.
-2. Kênh cũ thành dòng `notify_channels`: "Discord (kênh cũ)" với webhook chuyển sang `DC_WEBHOOK_MAIN`, "Telegram (kênh cũ)" với bot token chuyển sang `TG_BOT_MAIN`. `notify.channel = both` thì tạo cả hai. Các kênh này làm kênh mặc định.
-3. Không tạo route nào, nên mọi tin vẫn vào kênh cũ như trước.
-4. `off_plan.channel` cũ khác kênh chung thì tạo route `* + OFF_PLAN` và `* + TRADE_RESULT` trỏ tới kênh đó, giữ nguyên chỗ nhận tin off-plan.
+2. Chép **mọi** kênh đã nhập ở `/admin/alerts` bản trước, bất kể `notify.channel` đang chọn kênh nào: "Discord (kênh cũ)" với webhook cũ, "Telegram (kênh cũ)" với bot token và `chat_id` cũ. Telegram thiếu `chat_id` hoặc thiếu token thì bỏ qua và ghi lý do vào log khởi động.
+3. Chưa đặt kênh mặc định thì kênh mặc định là kênh cũ đang dùng (`notify.channel` = `discord`, `telegram` hoặc `both`), nên tin vẫn về đúng chỗ cũ. Kênh cũ còn lại vẫn được tạo và bật, nhưng chưa nhận tin cho tới khi tick làm mặc định hoặc gán route.
+4. Không tạo route nào ngoài off-plan: `off_plan.channel` cũ khác kênh chung thì tạo route `* + OFF_PLAN` và `* + TRADE_RESULT` trỏ tới kênh đó.
+5. Chạy lại an toàn: kênh cùng webhook, hoặc cùng bot token và `chat_id`, đã có thì dùng lại, không tạo thêm. Sau khi đánh dấu, kênh xoá tay không bị tạo lại.
+6. Khối `notify.discord` / `notify.telegram` cũ giữ nguyên, nên quay về image cũ vẫn gửi được tin.
 
 ## Tạo kênh
 
@@ -152,16 +155,16 @@ Chạy một lần lúc khởi động (đánh dấu `notify.channels_migrated`)
 2. Tạo các topic `🟠 BTC`, `🔷 ETH`, `🟡 XAU`, `⚙️ System`.
 3. Thêm bot hiện tại vào group và cấp quyền **Admin** để bot gửi được tin trong topic.
 4. Gửi một tin bất kỳ trong mỗi topic. Mở `https://api.telegram.org/bot<TOKEN>/getUpdates`, lấy `chat.id` (dạng `-100...`) và `message_thread_id` của từng topic.
-5. Ở `/admin/notify` tạo mỗi topic một kênh: cùng tên biến `TG_BOT_MAIN`, cùng `chat_id`, khác topic id. Bấm **Gửi thử** từng kênh.
+5. Ở `/admin/notify` tạo mỗi topic một kênh: cùng `chat_id`, khác topic id. Kênh đầu tiên nhập bot token, các kênh sau để trống ô token để dùng chung bot. Bấm **Gửi thử** từng kênh.
 6. Route: `BTCUSDT + *` → topic BTC, `ETHUSDT + *` → ETH, `XAUUSDT + *` → XAU, `* + *` → System.
 
-Mỗi cặp một group riêng (khác `chat_id`), hoặc mỗi cặp một bot riêng (khác tên biến token), cũng chạy được.
+Mỗi cặp một group riêng (khác `chat_id`), hoặc mỗi cặp một bot riêng (nhập token khác), cũng chạy được.
 
 ### Discord: mỗi cặp một channel
 
 1. Tạo các channel `#btc-alerts`, `#eth-alerts`, `#xau-alerts`, `#bamcp-system`.
 2. Với mỗi channel: Edit Channel → Integrations → Webhooks → New Webhook → Copy URL.
-3. Thêm URL vào `.env` (`DC_WEBHOOK_BTC=...`), hoặc dán vào ô "Webhook URL" trên trang admin nếu deploy không có `.env`.
-4. Ở `/admin/notify` tạo kênh với tên biến đó, bấm **Gửi thử**, rồi gán route như bước Telegram.
+3. Ở `/admin/notify` tạo kênh Discord, dán URL vào ô "Webhook URL", bấm **Gửi thử**.
+4. Gán route như bước Telegram.
 
 Một route chọn cả kênh Telegram lẫn Discord thì mỗi sự kiện ra đúng 2 tin, mỗi kênh 1 tin.

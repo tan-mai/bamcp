@@ -7,11 +7,6 @@ services:
     container_name: bamcp
     restart: unless-stopped
 
-    # TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp: bien TG_* / DC_* trong .env vao duoc container
-    # (trang /admin/notify chi luu ten bien). Cac bien khai o `environment` duoi day van thang.
-    env_file:
-      - .env
-
     environment:
       # Bat buoc - lay tu file .env, khong bao gio nam trong image
       BAMCP_USERNAME: ${BAMCP_USERNAME:?can dat trong .env}

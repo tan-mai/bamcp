@@ -30,8 +30,7 @@ DISCORD_LIMIT = 2000
 DISCORD_EMBED_LIMIT = 4096
 TELEGRAM_LIMIT = 4096
 TELEGRAM_BODY = 3600          # cat than tin TRUOC khi escape HTML de khong cat giua the / entity
-DISCORD_PREFIXES = ("https://discord.com/api/webhooks/", "https://discordapp.com/api/webhooks/",
-                    "https://ptb.discord.com/api/webhooks/", "https://canary.discord.com/api/webhooks/")
+DISCORD_PREFIXES = nl.DISCORD_PREFIXES
 CHANNEL_GAP_MS = 1_000        # toi da 1 tin/giay/kenh
 GROUP_LIMIT = 20              # toi da 20 tin/phut/nhom Telegram (cac topic chung mot chat_id)
 GROUP_WINDOW_MS = 60_000
@@ -176,13 +175,14 @@ class TelegramBotNotifier(INotifier):
 
 
 def make_sender(channel: dict[str, Any], secret: Callable[[str], str | None]) -> INotifier:
-    """Dung provider tu mot dong notify_channels. Token / webhook doc qua ten bien, khong nam trong DB."""
+    """Dung provider tu mot dong notify_channels. Token / webhook doc qua khoa secret (nhap o /admin/notify),
+    khong nam trong DB."""
     provider = channel.get("provider")
     if provider == "telegram":
         ref = channel.get("telegram_bot_token_ref")
         token = secret(ref) if ref else None
         if not token:
-            raise NotifyConfigError(f"telegram: bien {ref or '(trong)'} chua co gia tri")
+            raise NotifyConfigError("telegram: chua nhap bot token (trang /admin/notify, nut Sua kenh)")
         if not channel.get("telegram_chat_id"):
             raise NotifyConfigError("telegram: chua dat telegram_chat_id")
         return TelegramBotNotifier(token, str(channel["telegram_chat_id"]), thread_id=channel.get("telegram_thread_id"))
@@ -190,9 +190,9 @@ def make_sender(channel: dict[str, Any], secret: Callable[[str], str | None]) ->
         ref = channel.get("discord_webhook_ref")
         url = secret(ref) if ref else None
         if not url:
-            raise NotifyConfigError(f"discord: bien {ref or '(trong)'} chua co gia tri")
+            raise NotifyConfigError("discord: chua nhap webhook URL (trang /admin/notify, nut Sua kenh)")
         if not url.startswith(DISCORD_PREFIXES):
-            raise NotifyConfigError(f"discord: gia tri bien {ref} khong phai webhook Discord")
+            raise NotifyConfigError("discord: webhook URL da luu khong phai webhook Discord")
         return DiscordWebhookNotifier(url, username=channel.get("discord_username"),
                                       avatar_url=channel.get("discord_avatar_url"))
     raise NotifyConfigError(f"provider khong ho tro: {provider!r}")

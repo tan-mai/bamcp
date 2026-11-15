@@ -6,6 +6,7 @@ Khong goi mang, khong doc DB. notifier.Hub goi cac ham o day; test goi thang.
 from __future__ import annotations
 
 import re
+import secrets
 from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -58,8 +59,13 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     "display_timezone": "",          # trong = mui gio cua server, giong watcher
     "symbols": {},
 }
+# Cot *_ref trong notify_channels giu KHOA cua secret trong khoi notify_secrets (alerts/config.json tren volume),
+# khong giu gia tri. Khoa do server tu sinh, nguoi dung chi nhap token / webhook o trang admin.
 REF_PREFIX = {"telegram_bot_token_ref": "TG_", "discord_webhook_ref": "DC_"}
-_REF = re.compile(r"^[A-Z][A-Z0-9_]{2,63}$")
+SECRET_FIELDS = {"telegram_bot_token_ref": "telegram_bot_token", "discord_webhook_ref": "discord_webhook_url"}
+DISCORD_PREFIXES = ("https://discord.com/api/webhooks/", "https://discordapp.com/api/webhooks/",
+                    "https://canary.discord.com/api/webhooks/", "https://ptb.discord.com/api/webhooks/")
+_TG_TOKEN = re.compile(r"^\d{5,12}:[A-Za-z0-9_-]{20,}$")
 _COLOR = re.compile(r"^#[0-9A-Fa-f]{6}$")
 _QUIET = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})\s*$")
 
@@ -187,17 +193,31 @@ def clean_settings(payload: dict[str, Any], channel_ids: set[str]) -> dict[str, 
     }
 
 
-def clean_ref(field: str, value: Any) -> str | None:
-    text = str(value or "").strip().upper()
+def new_ref(field: str) -> str:
+    """Khoa moi cho mot secret trong notify_secrets (vd TG_3F9A1C2B). Khong lo gi ve gia tri."""
+    return f"{REF_PREFIX[field]}{secrets.token_hex(4).upper()}"
+
+
+def secret_field(provider: str) -> str:
+    """Cot *_ref ma provider dung."""
+    return "telegram_bot_token_ref" if provider == "telegram" else "discord_webhook_ref"
+
+
+def clean_secret(provider: str, value: Any) -> str | None:
+    """Kiem tra bot token / webhook URL nhap tu trang admin. Trong = giu gia tri dang luu."""
+    text = str(value or "").strip()
     if not text:
         return None
-    prefix = REF_PREFIX[field]
-    if not _REF.match(text) or not text.startswith(prefix):
-        raise ValueError(f"{field} phai la ten bien dang {prefix}TEN (chu hoa, so, _), nhan duoc {value!r}")
+    if provider == "telegram":
+        if not _TG_TOKEN.match(text):
+            raise ValueError("bot token Telegram phai dang 123456789:AA... (lay tu @BotFather)")
+    elif not text.startswith(DISCORD_PREFIXES):
+        raise ValueError("webhook phai bat dau bang https://discord.com/api/webhooks/")
     return text
 
 
 def clean_channel(payload: dict[str, Any]) -> dict[str, Any]:
+    """Cac cot sua duoc cua mot kenh. Token / webhook di rieng (clean_secret), khoa secret do server gan."""
     provider = str(payload.get("provider") or "").strip().lower()
     if provider not in PROVIDERS:
         raise ValueError(f"provider phai la mot trong {list(PROVIDERS)}")
@@ -207,10 +227,9 @@ def clean_channel(payload: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {"name": name[:80], "provider": provider,
                            "enabled": payload.get("enabled") not in (False, 0, "0", "false", "off")}
     if provider == "telegram":
-        out["telegram_bot_token_ref"] = clean_ref("telegram_bot_token_ref", payload.get("telegram_bot_token_ref"))
         chat = str(payload.get("telegram_chat_id") or "").strip()
-        if not out["telegram_bot_token_ref"] or not chat:
-            raise ValueError("telegram can telegram_bot_token_ref va telegram_chat_id")
+        if not chat:
+            raise ValueError("telegram can telegram_chat_id")
         if not re.match(r"^(-?\d{1,20}|@[A-Za-z0-9_]{4,64})$", chat):
             raise ValueError("telegram_chat_id phai la so (vd -100...) hoac @ten_kenh")
         thread = payload.get("telegram_thread_id")
@@ -224,9 +243,6 @@ def clean_channel(payload: dict[str, Any]) -> dict[str, Any]:
         out.update(telegram_chat_id=chat, telegram_thread_id=thread, discord_webhook_ref=None,
                    discord_username=None, discord_avatar_url=None)
     else:
-        out["discord_webhook_ref"] = clean_ref("discord_webhook_ref", payload.get("discord_webhook_ref"))
-        if not out["discord_webhook_ref"]:
-            raise ValueError("discord can discord_webhook_ref")
         avatar = str(payload.get("discord_avatar_url") or "").strip() or None
         if avatar and not avatar.startswith("https://"):
             raise ValueError("discord_avatar_url phai la https://...")

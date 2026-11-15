@@ -4419,87 +4419,116 @@ NOTIFY_STORE = notify_store.NotifyStore(SQLITE_PATH)
 
 
 def _notify_secret(ref: str | None) -> str | None:
-    """Gia tri cua mot ten bien: bien moi truong (.env) truoc, roi secret nhap tu trang admin (volume)."""
+    """Token / webhook cua mot kenh. Chi lay tu trang admin (khoi notify_secrets trong alerts/config.json tren
+    volume), KHONG doc bien moi truong / .env: moi cai dat kenh nam o /admin/notify."""
     name = str(ref or "").strip()
     if not name:
         return None
-    value = os.environ.get(name)
-    if value:
-        return value
-    return str((_alerts_cfg().get("notify_secrets") or {}).get(name) or "") or None
+    return str((_alerts_cfg().get("notify_secrets") or {}).get(name) or "").strip() or None
 
 
-def _notify_secret_source(ref: str | None) -> str:
-    name = str(ref or "").strip()
-    if not name:
-        return "missing"
-    if os.environ.get(name):
-        return "env"
-    return "admin" if (_alerts_cfg().get("notify_secrets") or {}).get(name) else "missing"
+def _notify_save_secrets(block: dict[str, str]) -> None:
+    """Ghi notify_secrets, bo khoa khong con kenh nao dung (kenh da xoa / da doi token rieng)."""
+    used = {c[f] for c in NOTIFY_STORE.channels() for f in notify_logic.REF_PREFIX if c.get(f)}
+    clean = {k: v for k, v in block.items() if k in used and v}
+    if clean != (_alerts_cfg().get("notify_secrets") or {}):
+        _alerts_save("notify_secrets", clean)
 
 
 NOTIFY_HUB = notifier.Hub(NOTIFY_STORE, settings=lambda: _alerts_cfg()["notify"], secret=_notify_secret, tz=TZ)
 notifier.configure(NOTIFY_HUB)
 
 
-def _notify_migrate() -> dict[str, Any]:
-    """Chuyen cau hinh kenh cu (notify.channel + webhook/token, off_plan.channel) sang notify_channels.
+NOTIFY_IMPORT_FLAG = "legacy_channels_imported"
 
-    Chay mot lan (co notify.channels_migrated). Kenh cu thanh kenh mac dinh nen chua tao route nao thi moi tin
-    van vao kenh cu nhu truoc, chi them dong dau co ten cap. Token / webhook cu chuyen sang notify_secrets
-    (TG_BOT_MAIN, DC_WEBHOOK_MAIN) - DB chi giu ten bien.
+
+def _notify_legacy(notify: dict[str, Any]) -> tuple[dict[str, tuple[str, str | None]], list[str]]:
+    """Kenh cu nhap o /admin/alerts ban truoc: {provider: (token / webhook, chat_id)} va ly do bo qua."""
+    found: dict[str, tuple[str, str | None]] = {}
+    skipped: list[str] = []
+    url = str((notify.get("discord") or {}).get("webhook_url") or "").strip()
+    if url:
+        found["discord"] = (url, None)
+    tg = notify.get("telegram") or {}
+    token, chat = str(tg.get("bot_token") or "").strip(), str(tg.get("chat_id") or "").strip()
+    if token and chat:
+        found["telegram"] = (token, chat)
+    elif token or chat:
+        skipped.append("telegram: thieu " + ("chat_id" if token else "bot_token"))
+    return found, skipped
+
+
+def _notify_migrate() -> dict[str, Any]:
+    """Chep kenh Telegram / Discord cu (notify.discord.webhook_url, notify.telegram.bot_token + chat_id) sang
+    notify_channels, gia tri token / webhook sang notify_secrets (volume) - DB chi giu khoa.
+
+    - Chep MOI kenh cu co du thong tin, khong chi kenh dang chon o notify.channel.
+    - Chua dat kenh mac dinh: kenh mac dinh = kenh cu dang dung (notify.channel discord / telegram / both) nen tin
+      van ve dung cho cu; khong khop kenh nao thi lay het kenh vua chep.
+    - off_plan.channel rieng -> route * + OFF_PLAN va * + TRADE_RESULT toi kenh do.
+    - Chay lai an toan: kenh cung webhook / cung token + chat_id da co thi dung lai, khong tao them (ke ca kenh do
+      ban truoc cua migration tao). Co notify.legacy_channels_imported chan cac lan khoi dong sau, de kenh da xoa
+      tay khong bi tao lai.
+    - Khoi notify.discord / notify.telegram cu giu nguyen: rollback ve image cu van gui tin duoc.
     """
     cfg = _alerts_cfg()
     notify = copy.deepcopy(cfg["notify"])
-    if notify.get("channels_migrated"):
+    if notify.get(NOTIFY_IMPORT_FLAG):
         return {"migrated": False}
-    secrets_block = dict(cfg.get("notify_secrets") or {})
-    made: dict[str, dict[str, Any]] = {}
-    existing = NOTIFY_STORE.channels()
+    block = dict(cfg.get("notify_secrets") or {})
+    legacy, skipped = _notify_legacy(notify)
+    channels = NOTIFY_STORE.channels()
 
-    def legacy(provider: str) -> dict[str, Any] | None:
-        if provider in made:
-            return made[provider]
-        if provider == "discord":
-            url = str((notify.get("discord") or {}).get("webhook_url") or "").strip()
-            if not url:
-                return None
-            secrets_block.setdefault("DC_WEBHOOK_MAIN", url)
-            row = NOTIFY_STORE.save_channel({"name": "Discord (kênh cũ)", "provider": "discord",
-                                             "discord_webhook_ref": "DC_WEBHOOK_MAIN", "enabled": True})
-        else:
-            tg = notify.get("telegram") or {}
-            token, chat = str(tg.get("bot_token") or "").strip(), str(tg.get("chat_id") or "").strip()
-            if not token or not chat:
-                return None
-            secrets_block.setdefault("TG_BOT_MAIN", token)
-            row = NOTIFY_STORE.save_channel({"name": "Telegram (kênh cũ)", "provider": "telegram",
-                                             "telegram_bot_token_ref": "TG_BOT_MAIN", "telegram_chat_id": chat,
-                                             "enabled": True})
-        made[provider] = row
-        return row
+    def same(channel: dict[str, Any], provider: str, value: str, chat: str | None) -> bool:
+        ref = channel.get(notify_logic.secret_field(provider))
+        if channel["provider"] != provider or not ref or block.get(ref) != value:
+            return False
+        return provider == "discord" or str(channel.get("telegram_chat_id") or "") == chat
 
-    def providers(value: Any) -> list[str]:
+    rows: dict[str, dict[str, Any]] = {}
+    made: list[str] = []
+    pending: dict[str, dict[str, Any]] = {}
+    for provider, (value, chat) in legacy.items():
+        hit = next((c for c in channels if same(c, provider, value, chat)), None)
+        if hit:
+            rows[provider] = hit
+            continue
+        field = notify_logic.secret_field(provider)
+        ref = notify_logic.new_ref(field)
+        block[ref] = value
+        fields = {"name": f"{provider.capitalize()} (kênh cũ)", "provider": provider, field: ref, "enabled": True}
+        if provider == "telegram":
+            fields["telegram_chat_id"] = chat
+        pending[provider] = fields
+    if pending:
+        _alerts_save("notify_secrets", block)       # gia tri truoc, kenh sau: khong co kenh nao thieu token
+        for provider, fields in pending.items():
+            rows[provider] = NOTIFY_STORE.save_channel(fields)
+            made.append(fields["name"])
+
+    def ids(value: Any) -> list[str]:
         text = str(value or "").strip().lower()
-        return ["discord", "telegram"] if text == "both" else [text] if text in ("discord", "telegram") else []
+        names = ["discord", "telegram"] if text == "both" else [text]
+        return [rows[p]["id"] for p in names if p in rows]
 
-    routes = 0
-    if not existing:
-        defaults = [r["id"] for r in (legacy(p) for p in providers(notify.get("channel") or "discord")) if r]
+    defaults = notify_logic.settings(notify)["default_channel_id"]
+    if not defaults and rows:
+        defaults = ids(notify.get("channel") or "discord") or [r["id"] for r in rows.values()]
         notify["default_channel_id"] = defaults
-        # off_plan.channel rieng: tin off-plan (va tin dong vi the off-plan) di kenh do nhu truoc
-        op_ids = [r["id"] for r in (legacy(p) for p in providers(cfg["off_plan"].get("channel"))) if r]
-        if op_ids and set(op_ids) != set(defaults):
-            for cid in op_ids:
-                for category in ("OFF_PLAN", "TRADE_RESULT"):
+    # off_plan.channel rieng: tin off-plan (va tin dong vi the off-plan) di kenh do nhu truoc
+    routes = 0
+    op_ids = ids(cfg["off_plan"].get("channel"))
+    if op_ids and set(op_ids) != set(defaults):
+        have = {(r["symbol"], r["category"], r["channel_id"]) for r in NOTIFY_STORE.routes()}
+        for cid in op_ids:
+            for category in ("OFF_PLAN", "TRADE_RESULT"):
+                if (notify_logic.WILDCARD, category, cid) not in have:
                     NOTIFY_STORE.add_route(notify_logic.WILDCARD, category, cid)
                     routes += 1
-    notify["channels_migrated"] = True
-    if secrets_block != (cfg.get("notify_secrets") or {}):
-        _alerts_save("notify_secrets", secrets_block)
+    notify[NOTIFY_IMPORT_FLAG] = True
     _alerts_save("notify", notify)
-    return {"migrated": True, "channels": [r["name"] for r in made.values()], "routes": routes,
-            "default_channel_id": notify.get("default_channel_id") or []}
+    return {"migrated": True, "channels": made, "reused": [r["name"] for p, r in rows.items() if p not in pending],
+            "skipped": skipped, "routes": routes, "default_channel_id": notify.get("default_channel_id") or []}
 
 
 def _setup_view(setup: dict[str, Any], last: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -6376,16 +6405,19 @@ def reclassify_position(position_id: str, setup_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------- kenh thong bao: view + tool
 # TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp
 
-def _notify_channel_view(channel: dict[str, Any]) -> dict[str, Any]:
-    """Kenh da che bi mat: chi ten bien, nguon (env / admin / missing) va 4 ky tu cuoi."""
+def _notify_channel_view(channel: dict[str, Any], channels: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Kenh da che bi mat: chi co / chua co token (webhook) va 4 ky tu cuoi. Khong tra gia tri, khong tra khoa."""
     out = {k: channel.get(k) for k in ("id", "name", "provider", "enabled", "telegram_chat_id", "telegram_thread_id",
                                        "discord_username", "discord_avatar_url")}
-    for field in notify_logic.REF_PREFIX:
-        ref = channel.get(field)
-        out[field] = ref
-        if ref:
-            out[field.replace("_ref", "_mask")] = notify_logic.mask(_notify_secret(ref))
-            out[field.replace("_ref", "_source")] = _notify_secret_source(ref)
+    field = notify_logic.secret_field(channel.get("provider") or "")
+    ref = channel.get(field)
+    value = _notify_secret(ref)
+    out["secret_label"] = "bot token" if channel.get("provider") == "telegram" else "webhook URL"
+    out["secret_set"] = bool(value)
+    out["secret_mask"] = notify_logic.mask(value)
+    # Cac kenh Telegram dung chung mot bot thi chung mot token: sua token o kenh nay khong doi kenh kia
+    out["secret_shared_with"] = [c["name"] for c in channels or []
+                                 if ref and c["id"] != channel.get("id") and c.get(field) == ref]
     out["last_ok_at"] = _stamp(channel["last_ok_at"]) if channel.get("last_ok_at") else None
     out["last_error_at"] = _stamp(channel["last_error_at"]) if channel.get("last_error_at") else None
     out["last_error"] = channel.get("last_error")
@@ -6405,7 +6437,7 @@ def _notify_config() -> dict[str, Any]:
     channels = NOTIFY_STORE.channels()
     names = {c["id"]: c["name"] for c in channels}
     return {
-        "channels": [_notify_channel_view(c) for c in channels],
+        "channels": [_notify_channel_view(c, channels) for c in channels],
         "routes": [{**r, "channel_name": names.get(r["channel_id"]),
                     "created_at": _stamp(r["created_at"]), "updated_at": _stamp(r["updated_at"])}
                    for r in NOTIFY_STORE.routes()],
@@ -6419,8 +6451,8 @@ def _notify_config() -> dict[str, Any]:
         "digest_pending": NOTIFY_HUB.pending_digest(),
         "hub_running": NOTIFY_HUB.running,
         "note": ("Tin duoi min_severity cua route bi FILTERED, khong roi xuong cap sau. Tin khong gan duoc cap "
-                 "(loi he thong) dung symbol '*' -> route '* + *' (System). Token/webhook khong bao gio tra ra: "
-                 "chi ten bien va 4 ky tu cuoi."),
+                 "(loi he thong) dung symbol '*' -> route '* + *' (System). Token/webhook nhap o /admin/notify, khong "
+                 "bao gio tra ra: chi secret_set va 4 ky tu cuoi."),
     }
 
 
@@ -7640,37 +7672,46 @@ def _notify_view(log_symbol: str, log_status: str) -> dict[str, Any]:
     missing = [s for s in symbols if s not in routed] if routed - {notify_logic.WILDCARD} else []
     return {**config, "log": [_notify_log_view(r, names) for r in rows], "log_symbol": log_symbol,
             "log_status": log_status, "statuses": list(notify_logic.STATUSES), "suggest_symbols": missing,
-            "alerts_file": str(ALERTS_FILE), "env_example": "DC_WEBHOOK_BTC=https://discord.com/api/webhooks/..."}
+            "alerts_file": str(ALERTS_FILE)}
 
 
 async def _notify_action(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     action = str(payload.get("action") or "").strip().lower()
     try:
         if action == "channel_save":
+            # Moi cai dat kenh nhap o day. Token / webhook luu tren volume (notify_secrets), DB chi giu khoa.
             fields = notify_logic.clean_channel(payload)
+            provider = fields["provider"]
+            field = notify_logic.secret_field(provider)
+            value = notify_logic.clean_secret(provider, payload.get(notify_logic.SECRET_FIELDS[field]))
             channel_id = str(payload.get("id") or "").strip() or None
+            channels = NOTIFY_STORE.channels()
+            current = NOTIFY_STORE.channel(channel_id) if channel_id else None
+            block = dict(_alerts_cfg().get("notify_secrets") or {})
+            ref = current.get(field) if current and current["provider"] == provider else None
+            if value:
+                # Khoa dang dung chung voi kenh khac (cung bot) ma nhap token khac -> khoa rieng, kenh kia giu nguyen
+                shared = any(c["id"] != channel_id and c.get(field) == ref for c in channels) if ref else False
+                if not ref or (shared and block.get(ref) != value):
+                    ref = notify_logic.new_ref(field)
+                block[ref] = value
+            elif not (ref and block.get(ref)):
+                # Kenh Telegram moi de trong token: dung chung bot token cua kenh Telegram da co
+                donor = next((c for c in channels if provider == "telegram" and c["provider"] == "telegram"
+                              and c.get(field) and block.get(c[field])), None)
+                if donor is None:
+                    raise ValueError("can nhap " + ("bot token" if provider == "telegram" else "webhook URL"))
+                ref = donor[field]
+            fields[field] = ref
             row = NOTIFY_STORE.save_channel(fields, channel_id)
-            # Gia tri secret (tuy chon): luu tren volume (alerts/config.json), KHONG vao DB
-            values = payload.get("secret_values") or {}
-            if not isinstance(values, dict):
-                raise ValueError("secret_values phai la object")
-            updates = {}
-            for field in notify_logic.REF_PREFIX:
-                value = str(values.get(field) or "").strip()
-                if value and row.get(field):
-                    if field == "discord_webhook_ref" and not value.startswith(notifier.DISCORD_PREFIXES):
-                        raise ValueError("webhook phai bat dau bang https://discord.com/api/webhooks/")
-                    updates[row[field]] = value
-            if updates:
-                block = dict(_alerts_cfg().get("notify_secrets") or {})
-                block.update(updates)
-                _alerts_save("notify_secrets", block)
-            return 200, {"ok": True, "channel": _notify_channel_view(NOTIFY_STORE.channel(row["id"]))}
+            _notify_save_secrets(block)
+            return 200, {"ok": True, "channel": _notify_channel_view(row, NOTIFY_STORE.channels())}
         if action == "channel_toggle":
             row = NOTIFY_STORE.save_channel({"enabled": bool(payload.get("enabled"))}, str(payload.get("id") or ""))
-            return 200, {"ok": True, "channel": _notify_channel_view(row)}
+            return 200, {"ok": True, "channel": _notify_channel_view(row, NOTIFY_STORE.channels())}
         if action == "channel_delete":
             out = NOTIFY_STORE.delete_channel(str(payload.get("id") or ""))
+            _notify_save_secrets(dict(_alerts_cfg().get("notify_secrets") or {}))
             block = copy.deepcopy(_alerts_cfg()["notify"])
             ids = notify_logic.settings(block)["default_channel_id"]
             if out["channel"]["id"] in ids:
@@ -9267,8 +9308,9 @@ def build_app():
         try:
             moved = _notify_migrate()
             if moved.get("migrated"):
-                print(f"BAMCP: da chuyen kenh thong bao cu -> {moved['channels'] or 'khong co kenh nao'}"
-                      f" (route off-plan: {moved['routes']})", file=sys.stderr)
+                print(f"BAMCP: chep kenh thong bao cu - tao moi {moved['channels'] or 'khong'}, da co {moved['reused'] or 'khong'},"
+                      f" route off-plan {moved['routes']}, kenh mac dinh {len(moved['default_channel_id'])}"
+                      + (f", bo qua: {moved['skipped']}" if moved["skipped"] else ""), file=sys.stderr)
         except Exception as exc:
             print(f"CANH BAO: chuyen kenh thong bao loi ({type(exc).__name__}: {exc})", file=sys.stderr)
         notify_task = asyncio.create_task(NOTIFY_HUB.run_forever())
