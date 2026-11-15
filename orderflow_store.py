@@ -341,6 +341,35 @@ class OrderflowStore:
             conn.execute("INSERT INTO orderflow_gaps (id, symbol, kind, start_ts, end_ts, reason) VALUES (?, ?, ?, ?, ?, ?)",
                          (guid(), symbol, kind, start_ts, end_ts, reason))
 
+    # TM - #OF-GAP - Moc lenh khop cuoi da ghi, va bo phan gap 'trades' da duoc backfill lap
+    def last_trade_ts(self, symbol: str, at_or_before: int) -> int | None:
+        """ts bucket footprint moi nhat <= at_or_before: lenh khop cuoi da ghi (cua collector hay backfill)."""
+        if not self.exists():
+            return None
+        with closing(self.conn()) as conn:
+            return conn.execute("SELECT MAX(ts) FROM trade_footprint WHERE symbol = ? AND ts <= ?",
+                                (symbol, at_or_before)).fetchone()[0]
+
+    @staticmethod
+    def clear_gaps(conn: sqlite3.Connection, symbol: str, kind: str, start: int, end: int) -> int:
+        """Bo phan [start, end] khoi cac gap DA DONG cung loai (vd backfill da ghi lai du lenh khop trong khoang).
+        Gap vat qua mep thi cat, giu phan nam ngoai. Gap dang mo (end_ts NULL) khong dung toi. Tra so gap bi doi."""
+        rows = conn.execute("SELECT id, start_ts, end_ts, reason FROM orderflow_gaps WHERE symbol = ? AND kind = ? "
+                            "AND end_ts IS NOT NULL AND start_ts <= ? AND end_ts >= ?",
+                            (symbol, kind, end, start)).fetchall()
+        changed = 0
+        for row in rows:
+            keep = [(a, b) for a, b in ((row["start_ts"], min(row["end_ts"], start)),
+                                        (max(row["start_ts"], end), row["end_ts"])) if b > a]
+            if keep == [(row["start_ts"], row["end_ts"])]:
+                continue                                # chi cham mep, khong co phan nao bi phu
+            conn.execute("DELETE FROM orderflow_gaps WHERE id = ?", (row["id"],))
+            for a, b in keep:
+                conn.execute("INSERT INTO orderflow_gaps (id, symbol, kind, start_ts, end_ts, reason) "
+                             "VALUES (?, ?, ?, ?, ?, ?)", (guid(), symbol, kind, a, b, row["reason"]))
+            changed += 1
+        return changed
+
     @staticmethod
     def upsert_status(conn: sqlite3.Connection, symbol: str, fields: dict[str, Any]) -> None:
         fields = {**fields, "updated_at": fields.get("updated_at") or now_ms()}

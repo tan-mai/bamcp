@@ -219,6 +219,41 @@ class CollectorTradeTest(TmpConfig):
             collector.db.close()
         asyncio.run(main())
 
+    # TM - #OF-GAP - Gap sau khi collector dung lau phai phu ca khoang thieu, khong phai mot diem
+    def test_gap_after_restart_starts_at_last_written_trade(self):
+        last_ts = 1_763_204_395_000                     # bucket footprint cuoi da ghi (backfill / lan chay truoc)
+        resume_ts = last_ts + 4 * 3_600_000             # lenh dau tien collector nhan sau khi chay lai
+        first_agg = 100 + 300_000                       # thieu 299 999 lenh > 200 trang REST
+        calls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            return httpx.Response(500)
+
+        async def main():
+            collector = orderflow_collector.Collector(self.config)
+            await collector.http.aclose()
+            collector.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            with closing(self.store.conn()) as conn, conn:
+                orderflow_store.OrderflowStore.add_footprint(conn, "BTCUSDT", 5, [(last_ts, 100.0, 1.0, 0.0, 1, 0)])
+            state = orderflow_collector.SymbolState(self.config.symbol("BTCUSDT"), {"last_agg_id": 100})
+            self.assertIsNone(state.last_trade_ts)
+            collector.states["BTCUSDT"] = state
+            task = asyncio.create_task(collector.trade_consumer(state))
+            state.queue.put_nowait({"a": first_agg, "p": "100.5", "q": "1", "T": resume_ts, "m": False})
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if state.last_agg_id == first_agg:
+                    break
+            task.cancel()
+            self.assertEqual(calls, [])                 # qua gioi han trang: ghi gap luon, khong goi REST
+            gaps = self.store.gaps("BTCUSDT", 0, 10 ** 13, kind="trades")
+            self.assertEqual([(g["start_ts"], g["end_ts"]) for g in gaps], [(last_ts, resume_ts)])
+            self.assertEqual(state.trades_since_ts, resume_ts)
+            await collector.http.aclose()
+            collector.db.close()
+        asyncio.run(main())
+
 
 # ---------------------------------------------------------------- nghiem thu 16: bat / tat symbol khong restart
 
@@ -565,6 +600,33 @@ class BackfillTest(TmpConfig):
         with closing(self.store.conn()) as conn:
             self.assertLess(conn.execute("SELECT MAX(ts) FROM trade_footprint").fetchone()[0], d3 + 3_600_000 - 60_000)
         self.assertEqual(self.store.status("BTCUSDT")[0]["last_agg_id"], 999_999)   # collector dang chay: khong dung
+
+    # TM - #OF-GAP - Backfill ghi lai du lenh khop thi gap 'trades' trong khoang khong con dung
+    def test_backfill_clears_trade_gaps_it_covers(self):
+        today = date(2026, 11, 12)
+        d3 = orderflow_backfill.day_ms(today)
+        hour = 3_600_000
+        day3 = self.trades(d3, 40_000, 600)                         # 0h -> ~1h30
+        self.store.add_gap("BTCUSDT", "trades", d3 + hour // 2, d3 + hour, "nam tron trong khoang")
+        self.store.add_gap("BTCUSDT", "trades", d3 + hour, d3 + hour, "mot diem (ban ghi cu)")
+        self.store.add_gap("BTCUSDT", "trades", d3 - hour, d3 + hour // 2, "vat qua dau ngay")
+        self.store.add_gap("BTCUSDT", "depth", d3, d3 + hour, "so lenh: backfill khong lap duoc")
+        self.store.add_gap("ETHUSDT", "trades", d3, d3 + hour, "cap khac")
+        job = self.store.create_job("backfill", "BTCUSDT", "2026-11-12", "2026-11-12")
+        out = orderflow_backfill.run(self.config, job["id"], client=self.client({}, day3), today=today,
+                                     clock=lambda: d3 + 2 * hour)
+        self.assertEqual(out["days"][0]["gaps_cleared"], 3)
+        span = (d3 - DAY, d3 + DAY)
+        self.assertEqual([(g["start_ts"], g["end_ts"], g["reason"]) for g in self.store.gaps("BTCUSDT", *span, kind="trades")],
+                         [(d3 - hour, d3, "vat qua dau ngay")])    # chi con phan truoc khoang backfill
+        self.assertEqual(len(self.store.gaps("BTCUSDT", *span, kind="depth")), 1)
+        self.assertEqual(len(self.store.gaps("ETHUSDT", *span, kind="trades")), 1)
+        # Chay lai: khong con gi de bo, phan con lai giu nguyen
+        job = self.store.create_job("backfill", "BTCUSDT", "2026-11-12", "2026-11-12")
+        out = orderflow_backfill.run(self.config, job["id"], client=self.client({}, day3), today=today,
+                                     clock=lambda: d3 + 2 * hour)
+        self.assertEqual(out["days"][0]["gaps_cleared"], 0)
+        self.assertEqual(len(self.store.gaps("BTCUSDT", *span, kind="trades")), 1)
 
     def test_validation(self):
         with self.assertRaises(ValueError):

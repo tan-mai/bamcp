@@ -546,9 +546,12 @@ class Collector:
             self.trade_gap(state, until_ts, f"REST khong tra du lenh {cursor}..{last}")
 
     def trade_gap(self, state: SymbolState, until_ts: int, reason: str) -> None:
-        start = state.last_trade_ts or until_ts
+        # TM - #OF-GAP - Vua khoi dong (chua xu ly lenh nao) thi last_trade_ts rong: moc dau gap phai la lenh cuoi da
+        # ghi trong DB (lan chay truoc hoac backfill). Lay until_ts thi gap chi la mot diem va data_coverage coi ca
+        # khoang thieu la co du lieu.
+        start = state.last_trade_ts or self.store.last_trade_ts(state.symbol, until_ts) or until_ts
         LOG.warning("%s: thieu lenh khop %s", state.symbol, reason)
-        self.store.add_gap(state.symbol, "trades", start, until_ts, reason)
+        self.store.add_gap(state.symbol, "trades", min(start, until_ts), until_ts, reason)
         state.trades_since_ts = until_ts          # vung lien tuc moi bat dau tu day
         state.last_agg_id = None
 

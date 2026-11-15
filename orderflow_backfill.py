@@ -185,13 +185,15 @@ def aggregate(trades: Iterator[Trade], *, start: int, end: int, res_sec: int | N
 
 def write_range(store: orderflow_store.OrderflowStore, symbol: str, start: int, end: int,
                 result: dict[str, Any], *, write_fp: bool, write_big: bool) -> dict[str, int]:
-    out = {"footprint_rows": 0, "big_trades": 0}
+    out = {"footprint_rows": 0, "big_trades": 0, "gaps_cleared": 0}
     with closing(store.conn()) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         if write_fp:
             conn.execute("DELETE FROM trade_footprint WHERE symbol = ? AND ts >= ? AND ts < ?", (symbol, start, end))
             for res, rows in result["footprint"].items():
                 out["footprint_rows"] += orderflow_store.OrderflowStore.add_footprint(conn, symbol, res, rows)
+            # TM - #OF-GAP - Khoang nay da ghi lai du lenh khop tu Binance: gap 'trades' trong khoang khong con dung
+            out["gaps_cleared"] = orderflow_store.OrderflowStore.clear_gaps(conn, symbol, "trades", start, end)
         if write_big:
             conn.execute("DELETE FROM big_trades WHERE symbol = ? AND ts >= ? AND ts < ?", (symbol, start, end))
             out["big_trades"] = orderflow_store.OrderflowStore.insert_big_trades(conn, symbol, result["big"])
