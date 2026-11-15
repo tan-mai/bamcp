@@ -37,6 +37,7 @@ Thanh trên cùng của mọi trang admin dẫn tới:
 | Gann | `/admin/gann` | [gann.md](gann.md) |
 | Kéo nến | `/admin/schedules` | [data.md](data.md#lịch-kéo-nến) |
 | Vào lệnh | `/admin/alerts` | [setups.md](setups.md) |
+| Thông báo | `/admin/notify` | [notify.md](notify.md) |
 | Dashboard accounts | `/admin/dashboard-accounts` | [dashboard.md](dashboard.md) |
 | Order Flow | `/admin/orderflow` | [orderflow.md](orderflow.md) |
 
@@ -127,8 +128,10 @@ Thiếu credential thì server không dừng mà vào chế độ [setup token](
 | `GET /admin/gann`, `POST /admin/gann/action` | có* | Cặp phân tích, pivot thủ công, sự kiện, config GANN |
 | `GET /admin/schedules` | có* | Lịch kéo nến theo từng khung |
 | `POST /admin/schedules/action` | có* | Thêm / sửa / bật tắt / xoá / chạy ngay / xem trước cron |
-| `GET /admin/alerts` | có* | Thông báo Discord/Telegram, watcher, setups, mục Off-plan ([lệnh ngoài kế hoạch](off-plan.md)) |
-| `POST /admin/alerts/action` | có* | Lưu thông báo / gửi thử / lưu watcher / lưu off-plan / huỷ, tạo setup, timeline |
+| `GET /admin/alerts` | có* | Watcher, setups, mục Off-plan ([lệnh ngoài kế hoạch](off-plan.md)), tóm tắt kênh thông báo |
+| `POST /admin/alerts/action` | có* | Lưu watcher / lưu off-plan / huỷ, tạo setup, timeline |
+| `GET /admin/notify` | có* | [Kênh thông báo](notify.md): kênh, ma trận route, cài đặt chung, nhật ký |
+| `POST /admin/notify/action` | có* | Lưu / bật tắt / xoá / gửi thử kênh, lưu ô route, lưu cài đặt, gửi tin tóm tắt ngay |
 | `GET /admin/dashboard-accounts` | có* | Tài khoản, cấu hình, thang điểm xác suất TR, audit log và lịch sử đăng nhập của dashboard |
 | `POST /admin/dashboard-accounts/action` | có* | Tạo / sửa / bật tắt / xoá tài khoản, lưu cấu hình |
 | `GET, POST /setup-dashboard/login` | không | Form đăng nhập dashboard, khoá theo IP khi sai nhiều lần |

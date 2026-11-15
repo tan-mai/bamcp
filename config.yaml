@@ -278,10 +278,24 @@ account:
 # Gia tri KHOI TAO. Sua o trang /admin/alerts thi ban moi ghi vao paths.alerts_config_file
 # (tren volume) va thang khoi nay - co hieu luc ngay, khong can restart.
 notify:
-  channel: "discord"                 # discord | telegram | both
-  discord: { webhook_url: "" }       # secret: dat o trang /admin/alerts, khong de o day
+  # TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp
+  # Kenh va route nam trong SQLite (notify_channels / notify_routes), sua o trang /admin/notify.
+  # channel / discord / telegram duoi day chi con doc MOT LAN luc migration: kenh cu thanh kenh mac dinh.
+  channel: "discord"                 # (cu) discord | telegram | both
+  discord: { webhook_url: "" }       # (cu) khong de secret o day
   telegram: { bot_token: "", chat_id: "" }
   display_timezone: "Asia/Ho_Chi_Minh"
+  default_channel_id: []             # id kenh mac dinh (migration tu dien); nhan tin khi khong co route + tin FALLBACK
+  dedupe_window_seconds: 300         # cung {symbol}:{category}:{ref} trong 5 phut -> khong gui lai (tru khi severity tang)
+  digest_minutes: 15                 # tin low (va info neu bat) cua route bat digest gom lai moi 15 phut
+  digest_include_info: false
+  digest_default: false              # gom tin o kenh mac dinh (khi khong co route)
+  quiet_hours: ""                    # vd "23:00-05:00" gio display_timezone: chi gui critical, con lai vao tom tat
+  log_retention_days: 30             # notify_log giu 30 ngay
+  symbols:                           # emoji / mau nhan dien cap tren dong dau tin va embed Discord
+    BTCUSDT: { emoji: "🟠", color: "#F7931A" }
+    ETHUSDT: { emoji: "🔷", color: "#627EEA" }
+    XAUUSDT: { emoji: "🟡", color: "#D4AF37" }
 
 watcher:
   enabled: true
@@ -330,7 +344,8 @@ off_plan:
   poll_seconds: 15                   # doc vi the + fill trong ngay moi 15 giay
   no_stop_grace_seconds: 60          # vi the mo qua muc nay ma san khong co lenh SL -> co NO_STOP, gui tin bo sung
   revenge_window_minutes: 30         # mo lenh trong 30 phut sau mot vi the dong lo -> co REVENGE
-  channel: ""                        # "" = dung kenh notify.channel; discord | telegram | both de tach rieng
+  # TM - #NOTIFY-CHANNEL - Kenh cua tin off-plan: route "* + OFF_PLAN" o /admin/notify. off_plan.channel cu
+  # (neu co trong alerts/config.json) duoc migration chuyen thanh route do.
   # Loai gui tin. IN_PLAN = trong ke hoach nhung pham rule / thieu SL. Bo khoi list = van ghi, khong gui.
   notify_classifications: [IN_PLAN, EARLY, CHASE, OUT_OF_ZONE, COUNTER_PLAN, NO_PLAN, PRUNED_SETUP, ADD_OFF_PLAN]
 

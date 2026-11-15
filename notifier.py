@@ -1,9 +1,20 @@
 # TM - #ENTRY-ALERT - Entry setups & alerts
+# TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp
+"""Module thong bao duy nhat.
+
+notifier.send(symbol, category, severity, title, body, dedupe_ref=None, embed_fields=None) la cua duy nhat
+de gui tin. Hub lo: chon route -> loc severity -> chong trung -> gom tin / gio yen lang -> hang doi gui
+(gian cach theo kenh, gioi han nhom Telegram) -> thu lai / fallback -> ghi notify_log.
+Loi gui tin khong bao gio duoc lan ra ngoai: watcher / fetcher goi send() khong bi dung.
+"""
 from __future__ import annotations
 
 import asyncio
 import html
+import sys
+import time
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Awaitable, Callable
@@ -12,11 +23,25 @@ from zoneinfo import ZoneInfo
 import httpx2 as httpx
 
 import entry_logic
+import notify_logic as nl
 
-BACKOFF = (2.0, 10.0, 30.0)
-CHANNELS = ("discord", "telegram", "both")
+BACKOFF = (2.0, 5.0, 15.0)
 DISCORD_LIMIT = 2000
+DISCORD_EMBED_LIMIT = 4096
 TELEGRAM_LIMIT = 4096
+TELEGRAM_BODY = 3600          # cat than tin TRUOC khi escape HTML de khong cat giua the / entity
+DISCORD_PREFIXES = ("https://discord.com/api/webhooks/", "https://discordapp.com/api/webhooks/",
+                    "https://ptb.discord.com/api/webhooks/", "https://canary.discord.com/api/webhooks/")
+CHANNEL_GAP_MS = 1_000        # toi da 1 tin/giay/kenh
+GROUP_LIMIT = 20              # toi da 20 tin/phut/nhom Telegram (cac topic chung mot chat_id)
+GROUP_WINDOW_MS = 60_000
+FAIL_THRESHOLD = 5            # kenh loi lien tuc >= 5 lan trong 10 phut -> mot tin SYSTEM_ERROR
+FAIL_WINDOW_MS = 10 * 60_000
+FAIL_ALERT_EVERY_MS = 3_600_000
+MAX_RATE_WAITS = 5            # 429 lien tiep qua so nay thi coi la loi
+FLUSH_EVERY = 15.0
+PRUNE_EVERY_MS = 3_600_000
+ROUTE_NAMES = {0: "default", 1: "symbol+category", 2: "symbol+*", 3: "*+category"}
 
 
 class NotifyConfigError(ValueError):
@@ -31,35 +56,74 @@ class RetryAfter(Exception):
 
 @dataclass
 class Alert:
+    """Noi dung mot tin + thong tin dinh tuyen. text la than tin (khong doi so voi truoc),
+    title la dong ngan dung trong tin tom tat (label setup, ma OP...)."""
     text: str
     title: str = ""
     meta: dict[str, Any] = field(default_factory=dict)
+    symbol: str = nl.WILDCARD
+    category: str = "SYSTEM_NOTICE"
+    severity: str | None = None
+    label: str | None = None
+    icon: str | None = None
+    dedupe_ref: str | None = None
+    embed_fields: list[dict[str, Any]] | None = None
+
+
+@dataclass
+class Outgoing:
+    """Mot tin da dung xong, san sang dua cho provider."""
+    header: str
+    body: str = ""
+    color: int | None = None
+    prefix: str = ""
+    fields: list[dict[str, Any]] | None = None
+    sender_name: str = "BAMCP"
+
+    def plain(self) -> str:
+        return "\n".join(x for x in (self.prefix, self.header, self.body) if x)
 
 
 class INotifier(ABC):
     name = ""
 
     @abstractmethod
-    async def send(self, alert: Alert) -> None:
+    async def send(self, msg: Outgoing) -> None:
         ...
 
 
 class DiscordWebhookNotifier(INotifier):
     name = "discord"
 
-    def __init__(self, webhook_url: str, *, timeout: float = 15.0, embed: bool = False) -> None:
+    def __init__(self, webhook_url: str, *, username: str | None = None, avatar_url: str | None = None,
+                 timeout: float = 15.0) -> None:
         if not webhook_url:
             raise NotifyConfigError("discord: chua dat webhook_url")
         self.url = webhook_url
+        self.username = username
+        self.avatar_url = avatar_url
         self.timeout = timeout
-        self.embed = embed
 
-    async def send(self, alert: Alert) -> None:
-        text = alert.text[:DISCORD_LIMIT]
-        body: dict[str, Any] = ({"embeds": [{"title": alert.title[:256], "description": text}]}
-                                if self.embed and alert.title else {"content": text})
+    def payload(self, msg: Outgoing) -> dict[str, Any]:
+        # Dong dau nam o content de thong bao day tren dien thoai hien dung cap / loai tin;
+        # than tin nam trong embed mang mau rieng cua cap.
+        body: dict[str, Any] = {"content": "\n".join(x for x in (msg.prefix, msg.header) if x)[:DISCORD_LIMIT],
+                                "username": (self.username or msg.sender_name)[:80]}
+        if self.avatar_url:
+            body["avatar_url"] = self.avatar_url
+        if msg.body or msg.fields:
+            embed: dict[str, Any] = {"description": msg.body[:DISCORD_EMBED_LIMIT]}
+            if msg.color is not None:
+                embed["color"] = msg.color
+            if msg.fields:
+                embed["fields"] = [{"name": str(f.get("name") or "—")[:256], "value": str(f.get("value") or "—")[:1024],
+                                    "inline": bool(f.get("inline", True))} for f in msg.fields[:25]]
+            body["embeds"] = [embed]
+        return body
+
+    async def send(self, msg: Outgoing) -> None:
         async with httpx.AsyncClient() as client:
-            resp = await client.post(self.url, json=body, timeout=self.timeout)
+            resp = await client.post(self.url, json=self.payload(msg), timeout=self.timeout)
         if resp.status_code == 429:
             try:
                 wait = float(resp.json().get("retry_after") or 1.0)
@@ -74,21 +138,33 @@ class TelegramBotNotifier(INotifier):
     name = "telegram"
     base_url = "https://api.telegram.org"
 
-    def __init__(self, bot_token: str, chat_id: str, *, timeout: float = 15.0) -> None:
+    def __init__(self, bot_token: str, chat_id: str, *, thread_id: int | None = None,
+                 timeout: float = 15.0) -> None:
         if not bot_token or not chat_id:
             raise NotifyConfigError("telegram: chua dat bot_token hoac chat_id")
         self.token = bot_token
         self.chat_id = chat_id
+        self.thread_id = thread_id
         self.timeout = timeout
 
-    async def send(self, alert: Alert) -> None:
-        text = html.escape(alert.text)[:TELEGRAM_LIMIT]
-        if alert.title:
-            text = f"<b>{html.escape(alert.title)}</b>\n{text}"[:TELEGRAM_LIMIT]
+    def payload(self, msg: Outgoing) -> dict[str, Any]:
+        body = msg.body if len(msg.body) <= TELEGRAM_BODY else msg.body[:TELEGRAM_BODY] + "…"
+        parts = [html.escape(msg.prefix)] if msg.prefix else []
+        parts.append(f"<b>{html.escape(msg.header)}</b>")
+        if body:
+            parts.append(html.escape(body))
+        for f in (msg.fields or [])[:25]:
+            parts.append(f"<b>{html.escape(str(f.get('name') or '—'))}</b>: {html.escape(str(f.get('value') or '—'))}")
+        out: dict[str, Any] = {"chat_id": self.chat_id, "text": "\n".join(parts)[:TELEGRAM_LIMIT],
+                               "parse_mode": "HTML"}
+        if self.thread_id:
+            out["message_thread_id"] = int(self.thread_id)
+        return out
+
+    async def send(self, msg: Outgoing) -> None:
         async with httpx.AsyncClient() as client:
-            resp = await client.post(f"{self.base_url}/bot{self.token}/sendMessage",
-                                     json={"chat_id": self.chat_id, "text": text,
-                                           "parse_mode": "HTML"}, timeout=self.timeout)
+            resp = await client.post(f"{self.base_url}/bot{self.token}/sendMessage", json=self.payload(msg),
+                                     timeout=self.timeout)
         if resp.status_code == 429:
             try:
                 wait = float((resp.json().get("parameters") or {}).get("retry_after") or 1.0)
@@ -99,32 +175,37 @@ class TelegramBotNotifier(INotifier):
             raise RuntimeError(f"telegram HTTP {resp.status_code}: {resp.text[:200]}")
 
 
-def _channels(cfg: dict[str, Any]) -> list[str]:
-    channel = str(cfg.get("channel") or "discord").strip().lower()
-    if channel not in CHANNELS:
-        raise NotifyConfigError(f"notify.channel phai la mot trong {list(CHANNELS)}")
-    return ["discord", "telegram"] if channel == "both" else [channel]
+def make_sender(channel: dict[str, Any], secret: Callable[[str], str | None]) -> INotifier:
+    """Dung provider tu mot dong notify_channels. Token / webhook doc qua ten bien, khong nam trong DB."""
+    provider = channel.get("provider")
+    if provider == "telegram":
+        ref = channel.get("telegram_bot_token_ref")
+        token = secret(ref) if ref else None
+        if not token:
+            raise NotifyConfigError(f"telegram: bien {ref or '(trong)'} chua co gia tri")
+        if not channel.get("telegram_chat_id"):
+            raise NotifyConfigError("telegram: chua dat telegram_chat_id")
+        return TelegramBotNotifier(token, str(channel["telegram_chat_id"]), thread_id=channel.get("telegram_thread_id"))
+    if provider == "discord":
+        ref = channel.get("discord_webhook_ref")
+        url = secret(ref) if ref else None
+        if not url:
+            raise NotifyConfigError(f"discord: bien {ref or '(trong)'} chua co gia tri")
+        if not url.startswith(DISCORD_PREFIXES):
+            raise NotifyConfigError(f"discord: gia tri bien {ref} khong phai webhook Discord")
+        return DiscordWebhookNotifier(url, username=channel.get("discord_username"),
+                                      avatar_url=channel.get("discord_avatar_url"))
+    raise NotifyConfigError(f"provider khong ho tro: {provider!r}")
 
 
-def _make(name: str, cfg: dict[str, Any]) -> INotifier:
-    if name == "discord":
-        d = cfg.get("discord") or {}
-        return DiscordWebhookNotifier(str(d.get("webhook_url") or ""), embed=bool(d.get("embed")))
-    t = cfg.get("telegram") or {}
-    return TelegramBotNotifier(str(t.get("bot_token") or ""), str(t.get("chat_id") or ""))
-
-
-def build(cfg: dict[str, Any]) -> list[INotifier]:
-    return [_make(name, cfg) for name in _channels(cfg)]
-
-
-async def send_with_retry(notifier: INotifier, alert: Alert, *,
+async def send_with_retry(notifier: INotifier, msg: Outgoing, *,
                           backoff: tuple[float, ...] = BACKOFF,
                           sleep: Callable[[float], Awaitable[None]] = asyncio.sleep) -> None:
+    """Gui mot tin, thu lai theo backoff. 429 thi cho dung retry_after."""
     attempt = 0
     while True:
         try:
-            await notifier.send(alert)
+            await notifier.send(msg)
             return
         except NotifyConfigError:
             raise
@@ -139,25 +220,440 @@ async def send_with_retry(notifier: INotifier, alert: Alert, *,
         attempt += 1
 
 
-async def deliver(cfg: dict[str, Any], alert: Alert, **kwargs: Any) -> str | None:
-    try:
-        names = _channels(cfg)
-    except NotifyConfigError as exc:
-        return str(exc)
-    # channel = both ma mot kenh chua cau hinh: van gui kenh con lai, chi ghi loi kenh thieu
-    targets: list[INotifier] = []
-    errors: list[str] = []
-    for name in names:
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+@dataclass
+class _Msg:
+    symbol: str
+    category: str
+    severity: str
+    label: str
+    icon: str
+    title: str
+    body: str
+    at: int
+    header: str
+    color: int | None = None
+    fields: list[dict[str, Any]] | None = None
+    dedupe_key: str | None = None
+
+
+class Hub:
+    """Bo dieu phoi gui tin. Trang thai chong trung / tom tat / gian cach nam trong bo nho:
+    khoi dong lai thi mat (toi da them mot tin trung, tin tom tat chua gui bi bo)."""
+
+    def __init__(self, store, *, settings: Callable[[], dict[str, Any]], secret: Callable[[str], str | None],
+                 tz: ZoneInfo, now_ms: Callable[[], int] | None = None,
+                 sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+                 sender: Callable[[dict[str, Any], Callable[[str], str | None]], INotifier] = make_sender) -> None:
+        self.store = store
+        self.settings = settings
+        self.secret = secret
+        self.tz = tz
+        self.now_ms = now_ms or _now_ms
+        self.sleep = sleep
+        self.sender = sender
+        self.running = False
+        self._dedupe: dict[str, tuple[int, int]] = {}
+        self._digest: dict[tuple[str, str], dict[str, Any]] = {}
+        self._last_sent: dict[str, int] = {}
+        self._group_sent: dict[str, deque[int]] = {}
+        self._blocked: dict[str, int] = {}
+        self._failures: dict[str, deque[int]] = {}
+        self._alerted: dict[str, int] = {}
+        self._tasks: set[asyncio.Task] = set()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    # ---------------------------------------------------------- tien ich
+
+    def cfg(self) -> dict[str, Any]:
+        return nl.settings(self.settings())
+
+    def display_tz(self, cfg: dict[str, Any] | None = None) -> ZoneInfo:
+        return nl.display_tz(cfg or self.cfg(), self.tz)
+
+    def _lock(self, key: str) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        if loop is not self._loop:
+            self._loop, self._locks = loop, {}
+        return self._locks.setdefault(key, asyncio.Lock())
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.ensure_future(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def _secrets(self, channel: dict[str, Any]) -> list[str]:
+        out = []
+        for ref in nl.secret_refs(channel):
+            try:
+                value = self.secret(ref)
+            except Exception:
+                value = None
+            if value:
+                out.append(value)
+        return out
+
+    def _log(self, msg: _Msg, status: str, channel: dict[str, Any] | None, error: str | None) -> None:
         try:
-            targets.append(_make(name, cfg))
+            self.store.log(symbol=msg.symbol, category=msg.category, severity=msg.severity, status=status,
+                           channel_id=channel["id"] if channel else None, dedupe_key=msg.dedupe_key, error=error,
+                           preview=f"{msg.header}\n{msg.body}")
+        except Exception as exc:
+            print(f"BAMCP notify: khong ghi duoc notify_log - {type(exc).__name__}: {exc}", file=sys.stderr)
+
+    @staticmethod
+    def _row(channel: dict[str, Any] | None, status: str, error: str | None = None, **extra: Any) -> dict[str, Any]:
+        return {"channel_id": channel["id"] if channel else None, "name": channel["name"] if channel else None,
+                "provider": channel["provider"] if channel else None, "status": status, "error": error, **extra}
+
+    @staticmethod
+    def _result(level: int, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        statuses = [r["status"] for r in rows]
+        status = next((s for s in ("SENT", "FALLBACK", "DIGESTED", "DEDUPED", "FILTERED", "FAILED")
+                       if s in statuses), "FAILED")
+        errors = [f"{r['name'] or 'notify'}: {r['error']}" for r in rows if r["status"] == "FAILED" and r["error"]]
+        return {"status": status, "error": "; ".join(errors) or None, "route_level": level,
+                "route": ROUTE_NAMES.get(level, "default"), "channels": rows}
+
+    def _message(self, cfg: dict[str, Any], symbol: Any, category: Any, severity: Any, title: Any, body: Any,
+                 dedupe_ref: Any, embed_fields: list[dict[str, Any]] | None, label: str | None,
+                 icon: str | None) -> _Msg:
+        sym = nl.norm_symbol(symbol)
+        cat = nl.norm_category(category)
+        sev = nl.norm_severity(severity, cat)
+        _, d_icon, d_label, _ = nl.info(cat)
+        now = self.now_ms()
+        icon, label = icon or d_icon, label or d_label
+        return _Msg(symbol=sym, category=cat, severity=sev, label=label, icon=icon, title=str(title or ""),
+                    body=str(body or ""), at=now, fields=embed_fields,
+                    header=nl.header(cfg, sym, icon, label, now, self.display_tz(cfg)),
+                    color=nl.color_int(nl.style(cfg, sym)["color"]), dedupe_key=nl.dedupe_key(sym, cat, dedupe_ref))
+
+    # ---------------------------------------------------------- gui
+
+    async def send(self, symbol: str, category: str, severity: str | None = None, title: str = "", body: str = "",
+                   dedupe_ref: Any = None, embed_fields: list[dict[str, Any]] | None = None, *,
+                   label: str | None = None, icon: str | None = None, retry: bool = True,
+                   fallback: bool = True) -> dict[str, Any]:
+        """Khong bao gio raise. Tra {status, error, route_level, route, channels: [...]}."""
+        try:
+            return await self._send(symbol, category, severity, title, body, dedupe_ref, embed_fields,
+                                    label=label, icon=icon, retry=retry, fallback=fallback)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            print(f"BAMCP notify loi ({symbol} {category}): {error}", file=sys.stderr)
+            return {"status": "FAILED", "error": error, "route_level": None, "route": None, "channels": []}
+
+    async def _send(self, symbol, category, severity, title, body, dedupe_ref, embed_fields, *, label, icon,
+                    retry, fallback) -> dict[str, Any]:
+        cfg = self.cfg()
+        msg = self._message(cfg, symbol, category, severity, title, body, dedupe_ref, embed_fields, label, icon)
+        channels = {c["id"]: c for c in self.store.channels()}
+        level, routes = nl.select_routes(self.store.routes(), msg.symbol, msg.category)
+        rows: list[dict[str, Any]] = []
+        targets: list[tuple[dict[str, Any], bool]] = []
+        if level:
+            for route in routes:
+                channel = channels.get(route["channel_id"])
+                if channel is None:
+                    continue
+                # Duoi nguong cua route thi bo qua, KHONG roi xuong cap sau
+                if nl.rank(msg.severity) < nl.rank(route["min_severity"]):
+                    error = f"severity {msg.severity} < min_severity {route['min_severity']}"
+                    self._log(msg, "FILTERED", channel, error)
+                    rows.append(self._row(channel, "FILTERED", error))
+                elif not channel["enabled"]:
+                    self._log(msg, "FILTERED", channel, "kenh dang tat")
+                    rows.append(self._row(channel, "FILTERED", "kenh dang tat"))
+                else:
+                    targets.append((channel, bool(route["digest"])))
+        else:
+            for cid in cfg["default_channel_id"]:
+                channel = channels.get(cid)
+                if channel and channel["enabled"]:
+                    targets.append((channel, cfg["digest_default"]))
+            if not targets:
+                error = "chua co route khop va chua dat kenh mac dinh dang bat (notify.default_channel_id)"
+                self._log(msg, "FAILED", None, error)
+                return self._result(level, [self._row(None, "FAILED", error)])
+        if not targets:
+            return self._result(level, rows)
+        # Chong trung: cung dedupe_key trong cua so thi khong gui lai, tru khi severity tang
+        if msg.dedupe_key:
+            previous = self._dedupe.get(msg.dedupe_key)
+            window = cfg["dedupe_window_seconds"] * 1000
+            if previous and msg.at - previous[0] < window and nl.rank(msg.severity) <= previous[1]:
+                for channel, _ in targets:
+                    self._log(msg, "DEDUPED", channel, None)
+                    rows.append(self._row(channel, "DEDUPED"))
+                return self._result(level, rows)
+            self._dedupe[msg.dedupe_key] = (msg.at, nl.rank(msg.severity))
+        tz = self.display_tz(cfg)
+        quiet = None if msg.severity == "critical" else nl.quiet_end(cfg["quiet_hours"], msg.at, tz)
+        lowish = msg.severity == "low" or (msg.severity == "info" and cfg["digest_include_info"])
+        now_targets = []
+        for channel, digest in targets:
+            if quiet is not None or (digest and lowish):
+                due = quiet if quiet is not None else nl.digest_due(msg.at, cfg["digest_minutes"])
+                self._queue_digest(channel, msg, due)
+                self._log(msg, "DIGESTED", channel, None)
+                rows.append(self._row(channel, "DIGESTED", due_at=due))
+            else:
+                now_targets.append(channel)
+        rows += await asyncio.gather(*[self._deliver(c, msg, retry=retry, fallback=fallback) for c in now_targets])
+        return self._result(level, rows)
+
+    async def _deliver(self, channel: dict[str, Any], msg: _Msg, *, retry: bool = True,
+                       fallback: bool = True) -> dict[str, Any]:
+        error = await self._attempt(channel, msg, retry=retry)
+        if error is None:
+            self._log(msg, "SENT", channel, None)
+            return self._row(channel, "SENT")
+        defaults = []
+        if fallback:
+            ids = self.cfg()["default_channel_id"]
+            defaults = [c for c in self.store.channels()
+                        if c["id"] in ids and c["enabled"] and c["id"] != channel["id"]]
+        if defaults:
+            done, failed = [], []
+            for target in defaults:
+                err = await self._attempt(target, msg, prefix=nl.fallback_line(channel["name"]), retry=retry)
+                (failed if err else done).append((target, err))
+            if done:
+                self._log(msg, "FALLBACK", channel, error)
+                return self._row(channel, "FALLBACK", error, fallback_to=[t["name"] for t, _ in done])
+            error += "; fallback loi: " + "; ".join(f"{t['name']}: {e}" for t, e in failed)
+        self._log(msg, "FAILED", channel, error)
+        return self._row(channel, "FAILED", error)
+
+    async def _attempt(self, channel: dict[str, Any], msg: _Msg, *, prefix: str = "",
+                       retry: bool = True) -> str | None:
+        """Gui mot tin vao mot kenh (co thu lai). None = thanh cong, chuoi = loi (da xoa secret)."""
+        secrets = self._secrets(channel)
+        try:
+            sender = self.sender(channel, self.secret)
         except NotifyConfigError as exc:
-            errors.append(str(exc))
-    results = await asyncio.gather(*[send_with_retry(n, alert, **kwargs) for n in targets],
-                                   return_exceptions=True)
-    for notifier, result in zip(targets, results):
-        if isinstance(result, BaseException):
-            errors.append(f"{notifier.name}: {type(result).__name__}: {result}")
-    return "; ".join(errors) or None
+            error = nl.scrub(str(exc), secrets)
+            self._failed(channel, error)
+            return error
+        out = Outgoing(header=msg.header, body=msg.body, color=msg.color, prefix=prefix, fields=msg.fields,
+                       sender_name=f"BAMCP · {nl.short_symbol(msg.symbol)}")
+        delays = BACKOFF if retry else ()
+        attempt = rate_waits = 0
+        async with self._lock(f"ch:{channel['id']}"):
+            while True:
+                await self._pace(channel)
+                try:
+                    await sender.send(out)
+                except NotifyConfigError as exc:
+                    error = nl.scrub(str(exc), secrets)
+                    self._failed(channel, error)
+                    return error
+                except RetryAfter as exc:
+                    # 429: chan ca nhom toi het retry_after roi gui lai, khong tinh la mot lan loi
+                    self._blocked[self._group(channel)] = self.now_ms() + int(float(exc.seconds) * 1000)
+                    rate_waits += 1
+                    if rate_waits > MAX_RATE_WAITS:
+                        error = nl.scrub(str(exc), secrets)
+                        self._failed(channel, error)
+                        return error
+                    continue
+                except Exception as exc:
+                    error = nl.scrub(f"{type(exc).__name__}: {exc}", secrets)
+                    self._failed(channel, error)
+                    if attempt >= len(delays):
+                        return error
+                    await self.sleep(delays[attempt])
+                    attempt += 1
+                    continue
+                self._ok(channel)
+                return None
+
+    @staticmethod
+    def _group(channel: dict[str, Any]) -> str:
+        if channel["provider"] == "telegram":
+            return f"tg:{channel.get('telegram_chat_id')}"
+        return f"dc:{channel['id']}"
+
+    async def _pace(self, channel: dict[str, Any]) -> None:
+        group = self._group(channel)
+        while True:
+            wait = self._blocked.get(group, 0) - self.now_ms()
+            if wait <= 0:
+                break
+            await self.sleep(wait / 1000)
+        wait = self._last_sent.get(channel["id"], -CHANNEL_GAP_MS) + CHANNEL_GAP_MS - self.now_ms()
+        if wait > 0:
+            await self.sleep(wait / 1000)
+        if channel["provider"] == "telegram":
+            async with self._lock(group):
+                sent = self._group_sent.setdefault(group, deque())
+                while True:
+                    now = self.now_ms()
+                    while sent and now - sent[0] >= GROUP_WINDOW_MS:
+                        sent.popleft()
+                    if len(sent) < GROUP_LIMIT:
+                        sent.append(now)
+                        break
+                    await self.sleep((GROUP_WINDOW_MS - (now - sent[0])) / 1000)
+        self._last_sent[channel["id"]] = self.now_ms()
+
+    def _ok(self, channel: dict[str, Any]) -> None:
+        self._failures.pop(channel["id"], None)
+        try:
+            self.store.mark_ok(channel["id"])
+        except Exception:
+            pass
+
+    def _failed(self, channel: dict[str, Any], error: str) -> None:
+        try:
+            self.store.mark_error(channel["id"], error)
+        except Exception:
+            pass
+        now = self.now_ms()
+        fails = self._failures.setdefault(channel["id"], deque())
+        fails.append(now)
+        while fails and now - fails[0] > FAIL_WINDOW_MS:
+            fails.popleft()
+        if len(fails) >= FAIL_THRESHOLD and now - self._alerted.get(channel["id"], -FAIL_ALERT_EVERY_MS) >= FAIL_ALERT_EVERY_MS:
+            self._alerted[channel["id"]] = now
+            body = (f"Kênh {channel['name']} ({channel['provider']}) lỗi {len(fails)} lần trong 10 phút.\n"
+                    f"Lỗi gần nhất: {error}\nKiểm tra ở trang admin › Thông báo.")
+            # Task rieng: khong cho trong lock cua kenh dang loi
+            self._spawn(self.send(nl.WILDCARD, "SYSTEM_ERROR", "high", f"Kênh {channel['name']} lỗi", body,
+                                  label="NOTIFY ERROR"))
+
+    # ---------------------------------------------------------- tom tat
+
+    def _queue_digest(self, channel: dict[str, Any], msg: _Msg, due: int) -> None:
+        key = (channel["id"], msg.symbol)
+        bucket = self._digest.setdefault(key, {"channel_id": channel["id"], "symbol": msg.symbol, "items": [],
+                                               "due": due, "since": msg.at})
+        bucket["due"] = min(bucket["due"], due)
+        first = msg.body.split("\n", 1)[0] if msg.body else ""
+        bucket["items"].append({"label": msg.label, "title": msg.title or first, "at": msg.at,
+                                "severity": msg.severity})
+
+    def pending_digest(self) -> list[dict[str, Any]]:
+        return [{"channel_id": b["channel_id"], "symbol": b["symbol"], "items": len(b["items"]), "due_at": b["due"]}
+                for b in self._digest.values()]
+
+    async def flush_digests(self, *, force: bool = False) -> int:
+        """Gui cac tin tom tat da den han. Trong gio yen lang thi giu lai toi het gio."""
+        cfg = self.cfg()
+        tz = self.display_tz(cfg)
+        now = self.now_ms()
+        if not force and nl.quiet_end(cfg["quiet_hours"], now, tz) is not None:
+            return 0
+        channels = {c["id"]: c for c in self.store.channels()}
+        span = cfg["digest_minutes"] * 60_000
+        sent = 0
+        for key, bucket in list(self._digest.items()):
+            if not force and bucket["due"] > now:
+                continue
+            self._digest.pop(key, None)
+            channel = channels.get(bucket["channel_id"])
+            if channel is None or not channel["enabled"] or not bucket["items"]:
+                continue
+            end = now if force else bucket["due"]
+            head, body = nl.digest_text(cfg, bucket["symbol"], bucket["items"], bucket["since"] // span * span,
+                                        end, tz)
+            top = max(bucket["items"], key=lambda i: nl.rank(i["severity"]))["severity"]
+            msg = _Msg(symbol=bucket["symbol"], category=nl.DIGEST, severity=top, label=nl.EXTRA[nl.DIGEST][2],
+                       icon=nl.EXTRA[nl.DIGEST][1], title="", body=body, at=now, header=head,
+                       color=nl.color_int(nl.style(cfg, bucket["symbol"])["color"]))
+            await self._deliver(channel, msg)
+            sent += 1
+        return sent
+
+    # ---------------------------------------------------------- tin thu
+
+    async def test_channel(self, channel_id: str) -> dict[str, Any]:
+        """Nut Gui thu: gui thang vao mot kenh, khong retry, khong fallback."""
+        channel = self.store.channel(channel_id)
+        cfg = self.cfg()
+        now = self.now_ms()
+        hm = datetime.fromtimestamp(now / 1000, self.display_tz(cfg)).strftime("%H:%M")
+        msg = _Msg(symbol=nl.WILDCARD, category=nl.TEST, severity="critical", label="TEST", icon="🧪",
+                   title=channel["name"], body="Tin thử từ BAMCP — kênh này nhận được tin.", at=now,
+                   header=f"🧪 TEST · {channel['name']} · {hm}")
+        error = await self._attempt(channel, msg, retry=False)
+        self._log(msg, "FAILED" if error else "SENT", channel, error)
+        return {"ok": error is None, "error": error, "channel": {"id": channel["id"], "name": channel["name"],
+                                                                 "provider": channel["provider"]}}
+
+    async def test_route(self, symbol: str, category: str = nl.TEST) -> dict[str, Any]:
+        """test_notification: gui tin thu qua dung duong route se chon (khong retry, khong fallback)."""
+        cat = nl.norm_category(category)
+        sym = nl.norm_symbol(symbol)
+        label = "TEST" if cat == nl.TEST else f"TEST {nl.info(cat)[2]}"
+        return await self.send(sym, cat, None, f"Tin thử route {sym} + {cat}",
+                               "Tin thử từ test_notification — kiểm tra đường route.", label=label, icon="🧪",
+                               retry=False, fallback=False)
+
+    # ---------------------------------------------------------- vong doi
+
+    def prune(self) -> int:
+        cfg = self.cfg()
+        now = self.now_ms()
+        window = cfg["dedupe_window_seconds"] * 1000
+        for key in [k for k, (at, _) in self._dedupe.items() if now - at >= window]:
+            self._dedupe.pop(key, None)
+        return self.store.prune(now - cfg["log_retention_days"] * 86_400_000)
+
+    async def run_forever(self, every: float = FLUSH_EVERY) -> None:
+        self.running = True
+        last_prune = None
+        try:
+            while True:
+                try:
+                    await self.flush_digests()
+                    now = self.now_ms()
+                    if last_prune is None or now - last_prune >= PRUNE_EVERY_MS:
+                        last_prune = now
+                        self.prune()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    print(f"BAMCP notify hub loi: {type(exc).__name__}: {exc}", file=sys.stderr)
+                await self.sleep(every)
+        finally:
+            self.running = False
+            for task in list(self._tasks):
+                task.cancel()
+
+
+_HUB: Hub | None = None
+
+
+def configure(hub: Hub | None) -> None:
+    global _HUB
+    _HUB = hub
+
+
+def hub() -> Hub | None:
+    return _HUB
+
+
+async def send(symbol: str, category: str, severity: str | None = None, title: str = "", body: str = "",
+               dedupe_ref: Any = None, embed_fields: list[dict[str, Any]] | None = None,
+               **kwargs: Any) -> dict[str, Any]:
+    """Cua duy nhat de gui tin. Khong bao gio raise."""
+    if _HUB is None:
+        return {"status": "FAILED", "error": "notifier chua duoc cau hinh", "route_level": None, "route": None,
+                "channels": []}
+    return await _HUB.send(symbol, category, severity, title, body, dedupe_ref, embed_fields, **kwargs)
+
+
+async def dispatch(alert: Alert) -> str | None:
+    """Gui mot Alert qua notifier.send. Tra loi (str) neu co kenh khong nhan duoc tin, None neu on."""
+    result = await send(alert.symbol, alert.category, alert.severity, alert.title, alert.text, alert.dedupe_ref,
+                        alert.embed_fields, label=alert.label, icon=alert.icon)
+    return result.get("error")
 
 
 def _num(value: Any) -> str:
@@ -213,6 +709,24 @@ def _head(icon: str, setup: dict[str, Any], label: str, candle_ms: int | None,
 
 # TM - #ENTRY-HTF - Tin can ra quyet dinh thi kem huong khung lon va nhan setup nguoc
 HTF_EVENTS = ("IN_ZONE", "TRIGGERED", "ENTRY_VALID", "MISSED", "BLOCKED")
+
+# TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp
+# event setup -> (category, severity rieng hoac None = mac dinh cua category, nhan dong dau, emoji)
+SETUP_ROUTES: dict[str, tuple[str, str | None, str, str]] = {
+    "IN_ZONE": ("ENTRY_IN_ZONE", None, "IN ZONE", "📍"),
+    "TRIGGERED": ("ENTRY_TRIGGERED", None, "ENTRY TRIGGERED", "🎯"),
+    "ENTRY_VALID": ("ENTRY_CONFIRMED", None, "ENTRY CONFIRMED", "✅"),
+    "BLOCKED": ("ENTRY_CONFIRMED", None, "ENTRY BLOCKED", "🚫"),
+    "MISSED": ("ENTRY_MISSED", None, "MISSED", "⛔"),
+    "ENTRY_WINDOW_EXPIRED": ("ENTRY_MISSED", None, "ENTRY WINDOW EXPIRED", "⌛"),
+    "TRIGGER_FAILED": ("ZONE_EXIT", None, "TRIGGER FAILED", "↩️"),
+    "FILLED": ("ENTRY_FILLED", None, "FILLED", "✅"),
+    "INVALIDATED": ("SETUP_INVALIDATED", None, "SETUP INVALIDATED", "❌"),
+    "EXPIRED": ("SETUP_INVALIDATED", None, "SETUP EXPIRED", "⏱"),
+    "CANCELLED": ("SETUP_INVALIDATED", None, "SETUP CANCELLED", "🗑"),
+    "PRUNED": ("SETUP_INVALIDATED", None, "SETUP PRUNED", "✂️"),
+    "BRANCH_CONFLICT": ("SETUP_INVALIDATED", "high", "BRANCH CONFLICT", "⚠️"),
+}
 
 
 def _htf_lines(setup: dict[str, Any]) -> list[str]:
@@ -315,27 +829,40 @@ def setup_alert(setup: dict[str, Any], event: dict[str, Any], tz: ZoneInfo,
     # TM - #DASHBOARD - Setup dashboard
     if link:
         lines.append(f"📊 Dashboard: {link}")
-    return Alert("\n".join(lines), title=f"{setup['code']} {name}",
-                 meta={"setup_id": setup["id"], "event": name})
+    # TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp
+    category, severity, tag, icon = SETUP_ROUTES.get(name, ("SETUP_INVALIDATED", None, name.replace("_", " "), None))
+    return Alert("\n".join(lines), title=setup.get("label") or setup["code"],
+                 meta={"setup_id": setup["id"], "event": name}, symbol=setup["symbol"], category=category,
+                 severity=severity, label=tag, icon=icon, dedupe_ref=f"{setup['id']}:{name}")
 
 
 def system_alert(event: str, details: dict[str, Any], tz: ZoneInfo) -> Alert:
+    # TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp: tin khong gan duoc cap thi symbol '*' (route System)
+    route: dict[str, Any] = {"symbol": nl.WILDCARD, "category": "SYSTEM_NOTICE", "label": event.replace("_", " ")}
     if event == "PLAN_MISSING":
         text = (f"⚠️ PLAN_MISSING — {', '.join(details.get('symbols') or [])} chưa có setup nào "
                 f"cho {details.get('bias_date')} (hạn {details.get('deadline')})")
+        route.update(label="PLAN MISSING", icon="⚠️",
+                     title=f"Chưa có setup: {', '.join(details.get('symbols') or [])}")
     elif event == "FETCHER_STALE":
         rows = [f"- {s}: nến 5m mới nhất {_when(v.get('last_open_time'), tz)}"
                 f" ({v.get('minutes')} phút trước)" if v.get("last_open_time") else f"- {s}: chưa có nến 5m"
                 for s, v in (details.get("symbols") or {}).items()]
         text = "\n".join(["⚠️ FETCHER_STALE — quá 15 phút không có nến 5m mới"] + rows)
+        route.update(category="SYSTEM_ERROR", label="FETCHER ERROR",
+                     title=f"Không có nến 5m mới: {', '.join(details.get('symbols') or {})}")
     elif event == "UNPLANNED_POSITION":
         pos = details.get("position") or {}
         text = (f"⚠️ Lệnh mở ngoài kế hoạch — {details.get('symbol')} {pos.get('side')} "
                 f"{_num(pos.get('size'))} @ {_num(pos.get('entry_price'))} "
                 f"(mở {_when(pos.get('opened_ms'), tz)})")
+        route.update(symbol=details.get("symbol") or nl.WILDCARD, category="OFF_PLAN", label="OFF-PLAN",
+                     dedupe_ref=details.get("position_key"),
+                     title=f"{pos.get('side')} {_num(pos.get('size'))} @ {_num(pos.get('entry_price'))}")
     elif event == "TEST":
         text = (f"✅ BAMCP test — kênh {details.get('channel') or 'thông báo'} hoạt động "
                 f"({_when(details.get('at'), tz)})")
+        route.update(category=nl.TEST, label="TEST", icon="🧪")
     # TM - #TR-BRANCH - Mot tin tong hop cho mot lan TR xac dinh nhanh
     elif event == "TR_BRANCH":
         pruned = details.get("pruned") or []
@@ -350,6 +877,8 @@ def system_alert(event: str, details: dict[str, Any], tz: ZoneInfo) -> Alert:
         if details.get("link"):
             rows.append(f"📊 Dashboard: {details['link']}")
         text = "\n".join(rows)
+        route.update(symbol=details.get("symbol") or nl.WILDCARD, category="SETUP_INVALIDATED", label="TR BRANCH",
+                     icon="🔀", severity="high" if conflicts else None, title=str(details.get("reason") or ""))
     else:
         text = f"{event}: {details}"
-    return Alert(text, title=event, meta={"event": event})
+    return Alert(text, title=route.pop("title", event), meta={"event": event}, **route)

@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 import entry_logic
 import notifier
+import notify_logic  # TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp
 import tr_logic
 
 IN_PLAN = "IN_PLAN"
@@ -374,6 +375,13 @@ def _stop_line(row: dict[str, Any]) -> str | None:
     return f"🛑 Lệnh ngoài kế hoạch thứ {nth} hôm nay — cân nhắc dừng giao dịch"
 
 
+# TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp
+def _route(row: dict[str, Any], label: str, ref: str) -> dict[str, Any]:
+    """Dinh tuyen tin off-plan: category OFF_PLAN, COUNTER_PLAN / REVENGE la critical."""
+    return {"symbol": row["symbol"], "category": "OFF_PLAN", "label": label, "icon": "⚠️", "dedupe_ref": ref,
+            "severity": notify_logic.off_plan_severity(row["classification"], row.get("flags"))}
+
+
 def open_alert(row: dict[str, Any], tz: ZoneInfo, *, link: str | None = None) -> notifier.Alert:
     explain = row.get("explain") or {}
     kind = row["classification"]
@@ -403,8 +411,9 @@ def open_alert(row: dict[str, Any], tz: ZoneInfo, *, link: str | None = None) ->
     if line:
         lines.append(line)
     lines += _footer(row, link)
-    return notifier.Alert("\n".join(lines), title=f"{row['code']} {kind}",
-                          meta={"off_plan_id": row["id"], "event": "OPENED"})
+    return notifier.Alert("\n".join(lines), title=f"{row['code']} · {row['side'].upper()} · {kind}",
+                          meta={"off_plan_id": row["id"], "event": "OPENED"},
+                          **_route(row, "RULE BREACH" if kind == IN_PLAN else "OFF-PLAN", f"{row['id']}:OPENED"))
 
 
 def add_alert(row: dict[str, Any], add: dict[str, Any], tz: ZoneInfo, *, link: str | None = None) -> notifier.Alert:
@@ -414,8 +423,9 @@ def add_alert(row: dict[str, Any], add: dict[str, Any], tz: ZoneInfo, *, link: s
              f"Phân loại: {ADD_OFF_PLAN} — {add.get('reason') or '—'}",
              f"Lệnh gốc: {row['classification']}"]
     lines += _footer(row, link)
-    return notifier.Alert("\n".join(lines), title=f"{row['code']} {ADD_OFF_PLAN}",
-                          meta={"off_plan_id": row["id"], "event": "ADDED"})
+    return notifier.Alert("\n".join(lines), title=f"{row['code']} · thêm {price(add.get('qty'))} @ {price(add.get('price'))}",
+                          meta={"off_plan_id": row["id"], "event": "ADDED"},
+                          **_route(row, "ADD OFF-PLAN", f"{row['id']}:ADD:{add.get('order_id')}"))
 
 
 def no_stop_alert(row: dict[str, Any], tz: ZoneInfo, grace_seconds: int, *,
@@ -425,8 +435,9 @@ def no_stop_alert(row: dict[str, Any], tz: ZoneInfo, grace_seconds: int, *,
              f"{hms(row['opened_at'], tz)} — sau {grace_seconds} giây vẫn không có lệnh SL",
              f"Phân loại: {row['classification']}"]
     lines += _footer(row, link)
-    return notifier.Alert("\n".join(lines), title=f"{row['code']} NO_STOP",
-                          meta={"off_plan_id": row["id"], "event": "NO_STOP"})
+    return notifier.Alert("\n".join(lines), title=f"{row['code']} · chưa có SL",
+                          meta={"off_plan_id": row["id"], "event": "NO_STOP"},
+                          **_route(row, "NO STOP", f"{row['id']}:NO_STOP"))
 
 
 def close_alert(row: dict[str, Any]) -> notifier.Alert:
@@ -438,4 +449,7 @@ def close_alert(row: dict[str, Any]) -> notifier.Alert:
               else "chưa đánh giá")
     text = (f"{row['code']} đã đóng · PnL thật {money(row.get('realized_pnl'))} (phí {money(row.get('fee'))}) · "
             f"{r_text} · {review}")
-    return notifier.Alert(text, title=f"{row['code']} CLOSED", meta={"off_plan_id": row["id"], "event": "CLOSED"})
+    # TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp
+    return notifier.Alert(text, title=f"{row['code']} · PnL {money(row.get('realized_pnl'))}",
+                          meta={"off_plan_id": row["id"], "event": "CLOSED"}, symbol=row["symbol"],
+                          category="TRADE_RESULT", label="TRADE RESULT", icon="🏁", dedupe_ref=f"{row['id']}:CLOSED")

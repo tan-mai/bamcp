@@ -172,12 +172,14 @@ class Base(unittest.TestCase):
                 raise RuntimeError("okx: HTTP 503")
             return self.stops
 
-        async def deliver(cfg, alert):
+        async def deliver(alert):
             self.sent.append(alert.text)
+            self.alerts.append(alert)
             return None
 
+        self.alerts: list = []
         self.watcher = off_plan_watcher.OffPlanWatcher(
-            server.OP_STORE, cfg=server._op_cfg, notify_cfg=lambda: {"channel": "discord"}, active=lambda: True,
+            server.OP_STORE, cfg=server._op_cfg, active=lambda: True,
             symbols=lambda: [self.symbol], read=read, stops=stops, classify=server._op_classify,
             check_add=server._op_check_add, tz=server.TZ, display_tz=lambda: VN, now_ms=lambda: self.now,
             deliver=deliver)
@@ -689,7 +691,9 @@ class WiringTest(unittest.TestCase):
         good = {"enabled": True, "poll_seconds": "15", "no_stop_grace_seconds": 60, "revenge_window_minutes": 30,
                 "channel": "", "notify_classifications": ["COUNTER_PLAN", "IN_PLAN"]}
         self.assertEqual(server._off_plan_clean(good)["notify_classifications"], ["IN_PLAN", "COUNTER_PLAN"])
-        for bad in ({"poll_seconds": 2}, {"channel": "email"}, {"notify_classifications": ["X"]},
+        # TM - #NOTIFY-CHANNEL - kenh off-plan do route * + OFF_PLAN quyet dinh, off_plan.channel khong con ghi
+        self.assertNotIn("channel", server._off_plan_clean({**good, "channel": "telegram"}))
+        for bad in ({"poll_seconds": 2}, {"notify_classifications": ["X"]},
                     {"no_stop_grace_seconds": "a"}):
             with self.assertRaises(ValueError, msg=bad):
                 server._off_plan_clean({**good, **bad})

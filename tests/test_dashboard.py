@@ -1949,7 +1949,7 @@ class NotifyLinkTest(Base):
     def test_watcher_sends_link(self):
         sent = []
 
-        async def deliver(cfg, alert, **kw):
+        async def deliver(alert):
             sent.append(alert)
 
         self.klines.upsert(self.symbol, "1h", real_h1_rows())

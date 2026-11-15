@@ -31,6 +31,7 @@ Binance (sổ lệnh, lệnh khớp) ─▶ bamcp-orderflow (process riêng) ─
 | Dashboard | Vẽ bias, setup, kịch bản lên biểu đồ nến và review theo ngày | [dashboard.md](docs/dashboard.md) |
 | Order flow (Bookmap) | Heatmap thanh khoản, bong bóng lệnh lớn, CVD, volume profile, sổ lệnh trên chart. Collector chạy process riêng | [orderflow.md](docs/orderflow.md) |
 | Lệnh ngoài kế hoạch | Đối chiếu vị thế thật với setup trong ngày, báo lệnh lệch kế hoạch kèm mã OP để đánh giá cùng Claude | [off-plan.md](docs/off-plan.md) |
+| Kênh thông báo | Mỗi cặp một topic Telegram / channel Discord, lọc theo mức độ, chống trùng, gom tin, giờ yên lặng, fallback | [notify.md](docs/notify.md) |
 | ORB | Tín hiệu và backtest Opening Range Breakout theo phiên | [orb.md](docs/orb.md) |
 | GANN | Pivot, cửa sổ thời gian, mốc giá Square of 9 | [gann.md](docs/gann.md) |
 | Tài khoản thật (tuỳ chọn) | Đọc vị thế và PnL từ Binance, Bybit, OKX bằng key chỉ đọc | [account.md](docs/account.md) |
@@ -135,7 +136,8 @@ Test không gọi mạng và không đụng `data/` thật. Chúng dùng thư m�
 | `exchanges.py` | Đọc tài khoản sàn, không có hàm đặt lệnh |
 | `orb*.py` | ORB |
 | `gann_*.py` | GANN |
-| `entry_*.py`, `notifier.py` | Setup, watcher, thông báo |
+| `entry_*.py` | Setup, watcher |
+| `notifier.py`, `notify_*.py`, `admin_notify.py` | Kênh thông báo: gửi, route, chống trùng, gom tin, trang admin |
 | `dashboard_*.py`, `static/` | Setup dashboard |
 | `orderflow_*.py`, `admin_orderflow.py`, `static/dashboard/orderflow.js` | Order flow: collector, backfill, DB, logic, trang admin, lớp trên chart |
 | `probe.py`, `bamcp_cli.py` | Gọi thử tool và lệnh quản trị từ dòng lệnh |

@@ -109,40 +109,20 @@ __CFG_WARNING__
       <div><label for="op_poll">poll_seconds</label><input type="number" id="op_poll" min="5" max="300" value="__OP_POLL__"></div>
       <div><label for="op_grace">no_stop_grace_seconds</label><input type="number" id="op_grace" min="0" max="3600" value="__OP_GRACE__"></div>
       <div><label for="op_revenge">revenge_window_minutes</label><input type="number" id="op_revenge" min="0" max="1440" value="__OP_REVENGE__"></div>
-      <div><label for="op_channel">Kênh</label><select id="op_channel">__OP_CHANNEL_OPTIONS__</select></div>
       <div class="end pad"><label class="check"><input type="checkbox" id="op_enabled"__OP_ENABLED__> Bật</label></div>
     </div>
+    <p class="hint">Kênh nhận tin off-plan: route <code>* + OFF_PLAN</code> ở trang Thông báo (không có thì theo route của cặp / kênh mặc định).</p>
     <label>Gửi tin cho loại <span class="small">· IN_PLAN = trong kế hoạch nhưng vi phạm rule / thiếu SL</span></label>
     <div class="row">__OP_KIND_BOXES__</div>
     <div class="actions"><button type="button" class="primary" id="b_off_plan">Lưu off-plan</button></div>
   </div>
 
+  <!-- TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp: kenh, route, gui thu o trang rieng -->
   <div class="card">
     <h2>Thông báo</h2>
-    <p class="hint">Secret hiển thị dạng che; để trống ô thì giữ giá trị cũ. Lưu ở <code>__ALERTS_FILE__</code>,
-      có hiệu lực ngay.</p>
-    <div class="row">
-      <div><label for="n_channel">Kênh</label><select id="n_channel">__CHANNEL_OPTIONS__</select></div>
-      <div><label for="n_tz">Giờ hiển thị trong tin</label>
-        <input type="text" id="n_tz" value="__DISPLAY_TZ__"></div>
-    </div>
-    <label for="n_webhook">Discord webhook URL <span class="small">__WEBHOOK_MASK__</span></label>
-    <input type="password" id="n_webhook" autocomplete="off" placeholder="https://discord.com/api/webhooks/...">
-    <div class="row">
-      <div><label for="n_token">Telegram bot token <span class="small">__TOKEN_MASK__</span></label>
-        <input type="password" id="n_token" autocomplete="off"></div>
-      <div><label for="n_chat">Telegram chat id <span class="small">__CHAT_MASK__</span></label>
-        <input type="password" id="n_chat" autocomplete="off"></div>
-    </div>
-    <div class="actions"><button type="button" class="primary" id="b_notify">Lưu thông báo</button></div>
-    <h3>Gửi tin thử</h3>
-    <div class="hint">Gửi bằng cấu hình <b>đã lưu</b>, từng kênh riêng (không phụ thuộc ô Kênh).
-      Vừa sửa ô nào thì bấm Lưu thông báo trước.</div>
-    <div class="actions" style="margin-top:10px">
-      <button type="button" data-test="discord">Gửi thử Discord</button>
-      <button type="button" data-test="telegram">Gửi thử Telegram</button>
-    </div>
-    <div id="n_msg" data-msg="inline"></div>
+    <p class="hint">Kênh Telegram / Discord theo từng cặp, route, giờ yên lặng và gửi thử nằm ở trang
+      <a href="__NOTIFY_PATH__">Thông báo</a>.</p>
+    <div class="small">__NOTIFY_SUMMARY__</div>
   </div>
   __SETUP_FIELD__
 <script>
@@ -170,27 +150,6 @@ async function act(body, button, box) {
 function cell(v) { return v === null || v === undefined || v === "" ? "" : String(v); }
 function num(id) { const v = $(id).value.trim(); return v === "" ? null : Number(v); }
 
-$("b_notify").addEventListener("click", async (e) => {
-  const data = await act({action: "notify_save", channel: $("n_channel").value,
-    display_timezone: $("n_tz").value.trim(), discord_webhook_url: $("n_webhook").value.trim(),
-    telegram_bot_token: $("n_token").value.trim(), telegram_chat_id: $("n_chat").value.trim()}, e.target);
-  if (data) { say("Đã lưu thông báo — giờ có thể Gửi thử", true); setTimeout(() => location.reload(), 900); }
-});
-
-const NOTIFY_SAVED = {channel: $("n_channel").value, tz: $("n_tz").value.trim()};
-const CHANNEL_NAMES = {discord: "Discord", telegram: "Telegram"};
-
-document.querySelectorAll("button[data-test]").forEach((b) => b.addEventListener("click", async () => {
-  const name = CHANNEL_NAMES[b.dataset.test];
-  const dirty = ["n_webhook", "n_token", "n_chat"].some((id) => $(id).value.trim())
-    || $("n_channel").value !== NOTIFY_SAVED.channel || $("n_tz").value.trim() !== NOTIFY_SAVED.tz;
-  if (dirty) { say("Có thay đổi chưa lưu — bấm \\"Lưu thông báo\\" trước, tin thử dùng cấu hình đã lưu.", false, "n_msg"); return; }
-  say("Đang gửi qua " + name + "…", true, "n_msg");
-  const data = await act({action: "notify_test", target: b.dataset.test}, b, "n_msg");
-  if (data) say(data.error ? name + " lỗi: " + data.error
-                           : "Đã gửi tin thử qua " + name + " — kiểm tra kênh / chat.", !data.error, "n_msg");
-}));
-
 $("b_watcher").addEventListener("click", async (e) => {
   const defaults = {}, overrides = {};
   OVERRIDE_SYMBOLS.forEach((s) => { overrides[s] = {}; });
@@ -214,7 +173,7 @@ $("b_off_plan").addEventListener("click", async (e) => {
   const kinds = Array.from(document.querySelectorAll("input[data-op-kind]")).filter((b) => b.checked).map((b) => b.dataset.opKind);
   const data = await act({action: "off_plan_save", enabled: $("op_enabled").checked, poll_seconds: num("op_poll"),
     no_stop_grace_seconds: num("op_grace"), revenge_window_minutes: num("op_revenge"),
-    channel: $("op_channel").value, notify_classifications: kinds}, e.target);
+    notify_classifications: kinds}, e.target);
   if (data) { say("Đã lưu off-plan", true); setTimeout(() => location.reload(), 700); }
 });
 
@@ -389,9 +348,6 @@ def _off_plan_parts(op: dict[str, Any]) -> dict[str, str]:
         "__OP_LAST__": _e(last), "__OP_WARNING__": warning,
         "__OP_POLL__": _e(op.get("poll_seconds")), "__OP_GRACE__": _e(op.get("no_stop_grace_seconds")),
         "__OP_REVENGE__": _e(op.get("revenge_window_minutes")),
-        "__OP_CHANNEL_OPTIONS__": _options([""] + list(op.get("channels") or []), op.get("channel") or "",
-                                           {"": "kênh chung (notify)", "discord": "Discord", "telegram": "Telegram",
-                                            "both": "Cả hai"}),
         "__OP_ENABLED__": " checked" if op.get("enabled") else "",
         "__OP_KIND_BOXES__": boxes,
     }
@@ -410,13 +366,10 @@ def render(view: dict[str, Any], *, action_path: str, admin_path: str, schedules
         "__SETUP_BANNER__": SETUP_BANNER if setup_required else "",
         "__SETUP_FIELD__": SETUP_FIELD if setup_required else "",
         "__CFG_WARNING__": "".join(f'<div class="warn">{_e(w)}</div>' for w in view.get("warnings") or []),
-        "__ALERTS_FILE__": _e(view.get("alerts_file")),
-        "__CHANNEL_OPTIONS__": _options(["discord", "telegram", "both"], notify.get("channel"),
-                                        {"discord": "Discord", "telegram": "Telegram", "both": "Cả hai"}),
-        "__DISPLAY_TZ__": _e(notify.get("display_timezone")),
-        "__WEBHOOK_MASK__": _e(notify.get("webhook_mask")),
-        "__TOKEN_MASK__": _e(notify.get("token_mask")),
-        "__CHAT_MASK__": _e(notify.get("chat_mask")),
+        # TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp
+        "__NOTIFY_PATH__": _e(notify.get("path")),
+        "__NOTIFY_SUMMARY__": _e(f"{notify.get('channels', 0)} kênh · {notify.get('routes', 0)} route · "
+                                 f"kênh mặc định: {', '.join(notify.get('default') or []) or 'chưa đặt'}"),
         "__LAST_SCAN__": _e(scan_text),
         "__W_ENABLED__": " checked" if watcher.get("enabled") else "",
         "__W_DEADLINE__": _e(watcher.get("plan_deadline_utc")),

@@ -32,7 +32,7 @@ def _now_ms() -> int:
 
 
 class OffPlanWatcher:
-    def __init__(self, store, *, cfg: Callable[[], dict[str, Any]], notify_cfg: Callable[[], dict[str, Any]],
+    def __init__(self, store, *, cfg: Callable[[], dict[str, Any]],
                  active: Callable[[], bool], symbols: Callable[[], list[str]],
                  read: Callable[[str, int, int], Awaitable[dict[str, Any]]],
                  stops: Callable[[str], Awaitable[list[dict[str, Any]] | None]],
@@ -41,11 +41,11 @@ class OffPlanWatcher:
                  tz: ZoneInfo, display_tz: Callable[[], ZoneInfo],
                  now_ms: Callable[[], int] | None = None,
                  sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-                 deliver: Callable[..., Awaitable[str | None]] = notifier.deliver,
+                 # TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp: kenh do route * + OFF_PLAN quyet dinh
+                 deliver: Callable[[notifier.Alert], Awaitable[str | None]] = notifier.dispatch,
                  link: Callable[[dict[str, Any]], str | None] | None = None) -> None:
         self.store = store
         self.cfg = cfg
-        self.notify_cfg = notify_cfg
         self.active = active
         self.symbols = symbols
         self.read = read
@@ -92,11 +92,10 @@ class OffPlanWatcher:
 
     async def _send(self, alert: notifier.Alert, *, row_id: str | None = None,
                     event_id: str | None = None) -> str | None:
-        cfg = dict(self.notify_cfg() or {})
-        channel = str(self.cfg().get("channel") or "").strip().lower()
-        if channel:
-            cfg["channel"] = channel
-        error = await self.deliver(cfg, alert)
+        try:
+            error = await self.deliver(alert)
+        except Exception as exc:          # loi gui tin khong duoc lam dung position_watcher
+            error = f"{type(exc).__name__}: {exc}"
         if row_id:
             self.store.update(row_id, notified=not error, notify_error=error)
         if event_id:

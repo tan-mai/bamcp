@@ -101,7 +101,8 @@ Thay đổi ở tool cũ:
 ## Dashboard và admin
 
 - Dashboard (chỉ tài khoản owner): bảng "Lệnh ngoài kế hoạch" theo ngày và marker cam ở điểm vào lệnh trên chart.
-- `/admin/alerts`, mục **Off-plan**: bật/tắt, `poll_seconds`, `no_stop_grace_seconds`, `revenge_window_minutes`, kênh riêng (trống = kênh chung), bật/tắt gửi tin cho từng loại phân loại. Lưu vào cùng file với cấu hình thông báo, có hiệu lực ngay.
+- `/admin/alerts`, mục **Off-plan**: bật/tắt, `poll_seconds`, `no_stop_grace_seconds`, `revenge_window_minutes`, bật/tắt gửi tin cho từng loại phân loại. Lưu vào cùng file với cấu hình thông báo, có hiệu lực ngay.
+- Kênh nhận tin: tin off-plan có loại `OFF_PLAN` (critical khi `COUNTER_PLAN` hoặc có cờ `REVENGE`), tin đóng vị thế có loại `TRADE_RESULT`. Muốn tách kênh riêng thì đặt route `* + OFF_PLAN` ở [`/admin/notify`](notify.md). `off_plan.channel` cũ được chuyển thành route này lúc nâng cấp.
 
 ## Lưu trữ
 

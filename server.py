@@ -58,6 +58,10 @@ import gann_windows  # TM - #GANN-TW - Gann Time Windows: chieu thoi gian & cua 
 import klines_coverage  # TM - #GANN-TW - Gann Time Windows: do phu & loc theo thoi gian
 import kline_store  # TM - #KL-SQL - Kline storage SQLite
 import notifier  # TM - #ENTRY-ALERT - Entry setups & alerts
+# TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp
+import admin_notify
+import notify_logic
+import notify_store
 import off_plan_logic  # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
 import off_plan_store  # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
 import off_plan_watcher  # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
@@ -2736,6 +2740,9 @@ async def get_today_status(date: str = "", symbol: str = "", strategy: str = "",
     TM - #OFF-PLAN: khoi 'off_plan' {count, codes, pending_review, pending_codes, pnl, open,
     by_classification, in_plan_breach} - lenh ngoai ke hoach hom nay. count >= 2 thi noi ro va
     nhac Tan can nhac dung giao dich.
+
+    TM - #NOTIFY-CHANNEL: khoi 'notifications' {by_symbol: {cap: {sent, filtered, deduped, digested,
+    fallback, failed}}, totals} - so tin thong bao trong ngay. failed > 0 thi nhac kiem tra kenh.
     """
     day = date or _today()
     sym = _resolve_symbol(symbol) if symbol else ""
@@ -2845,6 +2852,8 @@ async def get_today_status(date: str = "", symbol: str = "", strategy: str = "",
         "trades": trades,
         # TM - #OFF-PLAN - Lenh ngoai ke hoach hom nay (vi the that do position_watcher ghi)
         "off_plan": _op_summary(day),
+        # TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp: so tin trong ngay theo tung cap
+        "notifications": _notify_today(day),
         **extra,
     }
 
@@ -4269,11 +4278,15 @@ def get_sq9_levels(symbol: str = "", as_of: str = "", anchors: str = "auto",
 
 ALERTS_YAML: dict[str, Any] = {"notify": CFG.get("notify") or {}, "watcher": CFG.get("watcher") or {},
                                # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
-                               "off_plan": CFG.get("off_plan") or {}}
-# TM - #OFF-PLAN - Mac dinh cua khoi off_plan. channel "" = dung kenh notify.channel.
+                               "off_plan": CFG.get("off_plan") or {},
+                               # TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp: gia tri secret nhap tu
+                               # trang admin (deploy khong co .env). Khong bao gio doc tu config.yaml.
+                               "notify_secrets": {}}
+# TM - #OFF-PLAN - Mac dinh cua khoi off_plan.
+# TM - #NOTIFY-CHANNEL - off_plan.channel cu chi con doc mot lan luc migration (tao route * + OFF_PLAN).
 OFF_PLAN_DEFAULTS: dict[str, Any] = {
     "enabled": True, "poll_seconds": 15, "no_stop_grace_seconds": 60, "revenge_window_minutes": 30,
-    "channel": "", "notify_classifications": list(off_plan_logic.NOTIFY_KINDS),
+    "notify_classifications": list(off_plan_logic.NOTIFY_KINDS),
 }
 ALERTS_FILE = DATA_ROOT / str(PATHS.get("alerts_config_file") or "alerts/config.json")
 ALERT_PARAM_DEFAULTS: dict[str, Any] = {
@@ -4301,7 +4314,8 @@ def _alerts_cfg() -> dict[str, Any]:
             override = {}
             print(f"CANH BAO: {ALERTS_FILE.name} loi ({type(exc).__name__}) - dang dung config.yaml",
                   file=sys.stderr)
-        for block in ("notify", "watcher", "off_plan"):  # TM - #OFF-PLAN
+        # TM - #OFF-PLAN, #NOTIFY-CHANNEL
+        for block in ("notify", "watcher", "off_plan", "notify_secrets"):
             if isinstance(override, dict) and isinstance(override.get(block), dict):
                 cfg[block] = override[block]
     # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
@@ -4396,6 +4410,96 @@ WATCHER = entry_watcher.EntryWatcher(
     link=lambda setup: _dash_url(setup["symbol"], setup["bias_date"]),
     # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach thay cho UNPLANNED_POSITION khi dang bat
     unplanned=lambda: not _op_active())
+
+
+# ---------------------------------------------------------------- kenh thong bao
+# TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp
+
+NOTIFY_STORE = notify_store.NotifyStore(SQLITE_PATH)
+
+
+def _notify_secret(ref: str | None) -> str | None:
+    """Gia tri cua mot ten bien: bien moi truong (.env) truoc, roi secret nhap tu trang admin (volume)."""
+    name = str(ref or "").strip()
+    if not name:
+        return None
+    value = os.environ.get(name)
+    if value:
+        return value
+    return str((_alerts_cfg().get("notify_secrets") or {}).get(name) or "") or None
+
+
+def _notify_secret_source(ref: str | None) -> str:
+    name = str(ref or "").strip()
+    if not name:
+        return "missing"
+    if os.environ.get(name):
+        return "env"
+    return "admin" if (_alerts_cfg().get("notify_secrets") or {}).get(name) else "missing"
+
+
+NOTIFY_HUB = notifier.Hub(NOTIFY_STORE, settings=lambda: _alerts_cfg()["notify"], secret=_notify_secret, tz=TZ)
+notifier.configure(NOTIFY_HUB)
+
+
+def _notify_migrate() -> dict[str, Any]:
+    """Chuyen cau hinh kenh cu (notify.channel + webhook/token, off_plan.channel) sang notify_channels.
+
+    Chay mot lan (co notify.channels_migrated). Kenh cu thanh kenh mac dinh nen chua tao route nao thi moi tin
+    van vao kenh cu nhu truoc, chi them dong dau co ten cap. Token / webhook cu chuyen sang notify_secrets
+    (TG_BOT_MAIN, DC_WEBHOOK_MAIN) - DB chi giu ten bien.
+    """
+    cfg = _alerts_cfg()
+    notify = copy.deepcopy(cfg["notify"])
+    if notify.get("channels_migrated"):
+        return {"migrated": False}
+    secrets_block = dict(cfg.get("notify_secrets") or {})
+    made: dict[str, dict[str, Any]] = {}
+    existing = NOTIFY_STORE.channels()
+
+    def legacy(provider: str) -> dict[str, Any] | None:
+        if provider in made:
+            return made[provider]
+        if provider == "discord":
+            url = str((notify.get("discord") or {}).get("webhook_url") or "").strip()
+            if not url:
+                return None
+            secrets_block.setdefault("DC_WEBHOOK_MAIN", url)
+            row = NOTIFY_STORE.save_channel({"name": "Discord (kênh cũ)", "provider": "discord",
+                                             "discord_webhook_ref": "DC_WEBHOOK_MAIN", "enabled": True})
+        else:
+            tg = notify.get("telegram") or {}
+            token, chat = str(tg.get("bot_token") or "").strip(), str(tg.get("chat_id") or "").strip()
+            if not token or not chat:
+                return None
+            secrets_block.setdefault("TG_BOT_MAIN", token)
+            row = NOTIFY_STORE.save_channel({"name": "Telegram (kênh cũ)", "provider": "telegram",
+                                             "telegram_bot_token_ref": "TG_BOT_MAIN", "telegram_chat_id": chat,
+                                             "enabled": True})
+        made[provider] = row
+        return row
+
+    def providers(value: Any) -> list[str]:
+        text = str(value or "").strip().lower()
+        return ["discord", "telegram"] if text == "both" else [text] if text in ("discord", "telegram") else []
+
+    routes = 0
+    if not existing:
+        defaults = [r["id"] for r in (legacy(p) for p in providers(notify.get("channel") or "discord")) if r]
+        notify["default_channel_id"] = defaults
+        # off_plan.channel rieng: tin off-plan (va tin dong vi the off-plan) di kenh do nhu truoc
+        op_ids = [r["id"] for r in (legacy(p) for p in providers(cfg["off_plan"].get("channel"))) if r]
+        if op_ids and set(op_ids) != set(defaults):
+            for cid in op_ids:
+                for category in ("OFF_PLAN", "TRADE_RESULT"):
+                    NOTIFY_STORE.add_route(notify_logic.WILDCARD, category, cid)
+                    routes += 1
+    notify["channels_migrated"] = True
+    if secrets_block != (cfg.get("notify_secrets") or {}):
+        _alerts_save("notify_secrets", secrets_block)
+    _alerts_save("notify", notify)
+    return {"migrated": True, "channels": [r["name"] for r in made.values()], "routes": routes,
+            "default_channel_id": notify.get("default_channel_id") or []}
 
 
 def _setup_view(setup: dict[str, Any], last: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -6169,7 +6273,7 @@ def _op_link(row: dict[str, Any]) -> str | None:
 
 
 OP_WATCHER = off_plan_watcher.OffPlanWatcher(
-    OP_STORE, cfg=_op_cfg, notify_cfg=lambda: _alerts_cfg()["notify"], active=_op_active, symbols=_symbols,
+    OP_STORE, cfg=_op_cfg, active=_op_active, symbols=_symbols,
     read=_op_read, stops=_op_stops, classify=_op_classify, check_add=_op_check_add, tz=TZ,
     display_tz=lambda: WATCHER.display_tz(), link=_op_link)
 
@@ -6269,6 +6373,119 @@ def reclassify_position(position_id: str, setup_id: str) -> dict[str, Any]:
             "classification": row["classification"], "trade": _op_view(row)}
 
 
+# ---------------------------------------------------------------- kenh thong bao: view + tool
+# TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp
+
+def _notify_channel_view(channel: dict[str, Any]) -> dict[str, Any]:
+    """Kenh da che bi mat: chi ten bien, nguon (env / admin / missing) va 4 ky tu cuoi."""
+    out = {k: channel.get(k) for k in ("id", "name", "provider", "enabled", "telegram_chat_id", "telegram_thread_id",
+                                       "discord_username", "discord_avatar_url")}
+    for field in notify_logic.REF_PREFIX:
+        ref = channel.get(field)
+        out[field] = ref
+        if ref:
+            out[field.replace("_ref", "_mask")] = notify_logic.mask(_notify_secret(ref))
+            out[field.replace("_ref", "_source")] = _notify_secret_source(ref)
+    out["last_ok_at"] = _stamp(channel["last_ok_at"]) if channel.get("last_ok_at") else None
+    out["last_error_at"] = _stamp(channel["last_error_at"]) if channel.get("last_error_at") else None
+    out["last_error"] = channel.get("last_error")
+    ok, err = channel.get("last_ok_at") or 0, channel.get("last_error_at") or 0
+    out["last_status"] = None if not (ok or err) else "ok" if ok >= err else "error"
+    return out
+
+
+def _notify_symbols() -> list[str]:
+    tracked = [r["symbol"] for r in STORE.symbols(DEFAULT_SYMBOL)]
+    watch = _alerts_cfg()["watcher"].get("watch_symbols") or []
+    return tracked + [s for s in watch if s not in tracked]
+
+
+def _notify_config() -> dict[str, Any]:
+    settings_block = notify_logic.settings(_alerts_cfg()["notify"])
+    channels = NOTIFY_STORE.channels()
+    names = {c["id"]: c["name"] for c in channels}
+    return {
+        "channels": [_notify_channel_view(c) for c in channels],
+        "routes": [{**r, "channel_name": names.get(r["channel_id"]),
+                    "created_at": _stamp(r["created_at"]), "updated_at": _stamp(r["updated_at"])}
+                   for r in NOTIFY_STORE.routes()],
+        "settings": {**{k: settings_block[k] for k in notify_logic.SETTINGS_DEFAULTS},
+                     "default_channel_names": [names.get(i, i) for i in settings_block["default_channel_id"]]},
+        "categories": {k: {"severity": v[0], "label": f"{v[1]} {v[2]}", "source": v[3]}
+                       for k, v in notify_logic.CATEGORIES.items()},
+        "severities": list(notify_logic.SEVERITIES),
+        "route_order": ["symbol + category", "symbol + *", "* + category", "kênh mặc định (default_channel_id)"],
+        "symbols": _notify_symbols(),
+        "digest_pending": NOTIFY_HUB.pending_digest(),
+        "hub_running": NOTIFY_HUB.running,
+        "note": ("Tin duoi min_severity cua route bi FILTERED, khong roi xuong cap sau. Tin khong gan duoc cap "
+                 "(loi he thong) dung symbol '*' -> route '* + *' (System). Token/webhook khong bao gio tra ra: "
+                 "chi ten bien va 4 ky tu cuoi."),
+    }
+
+
+def _notify_log_view(row: dict[str, Any], names: dict[str, str]) -> dict[str, Any]:
+    return {**row, "channel_name": names.get(row["channel_id"]) if row.get("channel_id") else None,
+            "at": _stamp(row["created_at"])}
+
+
+def _notify_today(day: str) -> dict[str, Any]:
+    try:
+        start = int(datetime.combine(date.fromisoformat(day), datetime.min.time(), TZ).timestamp() * 1000)
+        counts = NOTIFY_STORE.counts(start, start + 86_400_000)
+    except Exception as exc:          # khoi phu: khong duoc lam hong buoc kiem tra truoc khi vao lenh
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    keys = ("sent", "filtered", "deduped", "digested", "fallback", "failed")
+    by_symbol = {sym: {k: c.get(k.upper(), 0) for k in keys} for sym, c in sorted(counts.items())}
+    totals = {k: sum(v[k] for v in by_symbol.values()) for k in keys}
+    return {"by_symbol": by_symbol, "totals": totals,
+            "note": "Dem dong notify_log trong ngay theo cap ('*' = tin he thong). Tin tom tat khong tinh vao sent."}
+
+
+@_tool_with_reasons()
+def get_notify_config() -> dict[str, Any]:
+    """Cau hinh kenh thong bao: danh sach kenh (da che bi mat), route theo cap x loai tin, cai dat chung.
+
+    Thu tu chon route cho tin (symbol, category, severity): symbol+category -> symbol+* -> *+category ->
+    kenh mac dinh. Dung o cap dau tien co route bat. Tin severity < min_severity cua route thi FILTERED,
+    khong roi xuong cap sau. severity: low < info < high < critical.
+    """
+    return _notify_config()
+
+
+@_tool_with_reasons()
+async def test_notification(symbol: str = "", category: str = "TEST") -> dict[str, Any]:
+    """Gui mot tin thu qua DUNG duong route se chon cho (symbol, category), tra ve kenh da dung.
+
+    symbol: BTCUSDT / ETHUSDT / ... bo trong = '*' (tin he thong). category: TEST (mac dinh) hoac mot loai tin
+    (ENTRY_TRIGGERED, OFF_PLAN, ...) de thu dung route va min_severity cua loai do. Khong retry, khong fallback:
+    ket qua phan anh dung kenh duoc chon. Token/webhook khong lo trong ket qua.
+    """
+    sym = _resolve_symbol(symbol) if str(symbol or "").strip() not in ("", notify_logic.WILDCARD) else "*"
+    result = await NOTIFY_HUB.test_route(sym, category)
+    return {"symbol": sym, "category": notify_logic.norm_category(category), **result,
+            "channels_used": [c["name"] for c in result.get("channels") or [] if c["status"] in ("SENT", "FALLBACK")]}
+
+
+@_tool_with_reasons()
+def get_notify_log(symbol: str = "", status: str = "", limit: int = 50) -> dict[str, Any]:
+    """Tra cuu tin da gui / loc / gom / loi trong notify_log (giu notify.log_retention_days ngay).
+
+    symbol: loc theo cap ('*' = tin he thong). status: SENT | FILTERED | DEDUPED | DIGESTED | FAILED | FALLBACK.
+    limit: toi da 500. payload_preview la 200 ky tu dau cua tin (dong dau + than).
+    """
+    sym = str(symbol or "").strip().upper()
+    if sym and sym != notify_logic.WILDCARD:
+        sym = _resolve_symbol(sym)
+    st = str(status or "").strip().upper()
+    if st and st not in notify_logic.STATUSES:
+        raise ValueError(f"status phai la mot trong {list(notify_logic.STATUSES)}")
+    names = {c["id"]: c["name"] for c in NOTIFY_STORE.channels()}
+    rows = NOTIFY_STORE.logs(symbol=sym, status=st, limit=max(1, min(int(limit or 50), 500)))
+    return {"symbol": sym or None, "status": st or None, "count": len(rows),
+            "rows": [_notify_log_view(r, names) for r in rows]}
+
+
 # ---------------------------------------------------------------- admin
 
 ADMIN_PATH = SRV.get("admin_path", "/admin")
@@ -6289,6 +6506,8 @@ def _admin_nav() -> list[tuple[str, str, str]]:
         items.append(("gann", "Gann", ADMIN_GANN_PATH))
     items.append(("schedules", "Kéo nến", ADMIN_SCHEDULES_PATH))
     items.append(("alerts", "Vào lệnh", ADMIN_ALERTS_PATH))
+    # TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp
+    items.append(("notify", "Thông báo", ADMIN_NOTIFY_PATH))
     # TM - #DASHBOARD - Setup dashboard
     items.append(("dashboard", "Dashboard accounts", ADMIN_DASH_PATH))
     # TM - #BOOKMAP - Order flow Bookmap
@@ -7238,13 +7457,6 @@ ADMIN_ALERTS_PATH = ADMIN_PATH.rstrip("/") + "/alerts"
 ADMIN_ALERTS_ACTION_PATH = ADMIN_ALERTS_PATH + "/action"
 
 
-def _mask(value: Any) -> str:
-    text = str(value or "")
-    if not text:
-        return "(chưa đặt)"
-    return f"(đã đặt …{text[-4:]})" if len(text) > 8 else "(đã đặt)"
-
-
 def _alerts_view(date_text: str, status: str) -> dict[str, Any]:
     cfg = _alerts_cfg()
     notify, watcher = cfg["notify"], cfg["watcher"]
@@ -7265,12 +7477,12 @@ def _alerts_view(date_text: str, status: str) -> dict[str, Any]:
         warnings.append("Watcher chưa chạy (server chưa khởi động xong).")
     if "5m" not in {s["timeframe"] for s in SCHEDULES.list() if s["enabled"]} and watcher.get("enabled"):
         warnings.append("Không có schedule 5m nào đang bật — watcher sẽ không có nến mới.")
+    # TM - #NOTIFY-CHANNEL - Kenh thong bao chuyen sang trang /admin/notify; o day chi tom tat
+    channels = NOTIFY_STORE.channels()
+    defaults = notify_logic.settings(notify)["default_channel_id"]
     return {
-        "notify": {"channel": notify.get("channel") or "discord",
-                   "display_timezone": notify.get("display_timezone") or str(TZ),
-                   "webhook_mask": _mask((notify.get("discord") or {}).get("webhook_url")),
-                   "token_mask": _mask((notify.get("telegram") or {}).get("bot_token")),
-                   "chat_mask": _mask((notify.get("telegram") or {}).get("chat_id"))},
+        "notify": {"channels": len(channels), "routes": len(NOTIFY_STORE.routes()),
+                   "default": [c["name"] for c in channels if c["id"] in defaults], "path": ADMIN_NOTIFY_PATH},
         "watcher": watcher, "symbols": symbols,
         "override_symbols": sorted(set(watcher["watch_symbols"]) | set(watcher["symbol_overrides"])),
         "param_keys": list(entry_logic.PARAM_KEYS), "statuses": list(entry_logic.STATUSES),
@@ -7279,7 +7491,7 @@ def _alerts_view(date_text: str, status: str) -> dict[str, Any]:
         "last_scan": scan, "alerts_file": str(ALERTS_FILE), "warnings": warnings,
         # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
         "off_plan": {**cfg["off_plan"], "account_enabled": _account_enabled(), "running": OP_WATCHER.running,
-                     "kinds": list(off_plan_logic.NOTIFY_KINDS), "channels": list(notifier.CHANNELS),
+                     "kinds": list(off_plan_logic.NOTIFY_KINDS),
                      "last_poll": {**OP_WATCHER.last_poll, "at_text": _stamp(OP_WATCHER.last_poll["at"])}
                      if OP_WATCHER.last_poll.get("at") else {}},
     }
@@ -7323,9 +7535,6 @@ def _off_plan_clean(payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"{name} phai la so nguyen tu {low} den {high}")
         return int(value)
 
-    channel = str(payload.get("channel") or "").strip().lower()
-    if channel and channel not in notifier.CHANNELS:
-        raise ValueError(f"channel phai de trong (dung kenh chung) hoac mot trong {list(notifier.CHANNELS)}")
     kinds = payload.get("notify_classifications")
     if not isinstance(kinds, list):
         raise ValueError("notify_classifications phai la list")
@@ -7336,7 +7545,7 @@ def _off_plan_clean(payload: dict[str, Any]) -> dict[str, Any]:
             "poll_seconds": whole("poll_seconds", 5, 300),
             "no_stop_grace_seconds": whole("no_stop_grace_seconds", 0, 3600),
             "revenge_window_minutes": whole("revenge_window_minutes", 0, 1440),
-            "channel": channel,
+            # TM - #NOTIFY-CHANNEL - kenh cua tin off-plan do route * + OFF_PLAN o trang Thong bao quyet dinh
             "notify_classifications": [k for k in off_plan_logic.NOTIFY_KINDS if k in set(map(str, kinds))]}
 
 
@@ -7344,37 +7553,9 @@ async def _alerts_action(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     action = str(payload.get("action") or "").strip().lower()
     cfg = _alerts_cfg()
     try:
-        if action == "notify_save":
-            channel = str(payload.get("channel") or "").strip().lower()
-            if channel not in notifier.CHANNELS:
-                raise ValueError(f"channel phai la mot trong {list(notifier.CHANNELS)}")
-            tz_name = str(payload.get("display_timezone") or "").strip() or str(TZ)
-            try:
-                ZoneInfo(tz_name)
-            except Exception:
-                raise ValueError(f"display_timezone khong hop le: {tz_name}") from None
-            block = copy.deepcopy(cfg["notify"])
-            block.update(channel=channel, display_timezone=tz_name)
-            discord, telegram = dict(block.get("discord") or {}), dict(block.get("telegram") or {})
-            if _optional(payload, "discord_webhook_url"):
-                discord["webhook_url"] = _optional(payload, "discord_webhook_url")
-            if _optional(payload, "telegram_bot_token"):
-                telegram["bot_token"] = _optional(payload, "telegram_bot_token")
-            if _optional(payload, "telegram_chat_id"):
-                telegram["chat_id"] = _optional(payload, "telegram_chat_id")
-            block.update(discord=discord, telegram=telegram)
-            _alerts_save("notify", block)
-            return 200, {"ok": True}
-        if action == "notify_test":
-            # target = discord / telegram: thu rieng mot kenh bat ke notify.channel dang chon
-            target = str(payload.get("target") or cfg["notify"].get("channel") or "discord").strip().lower()
-            if target not in notifier.CHANNELS:
-                raise ValueError(f"target phai la mot trong {list(notifier.CHANNELS)}")
-            alert = notifier.system_alert("TEST", {"at": int(time.time() * 1000), "channel": target},
-                                          WATCHER.display_tz())
-            # Khong retry: sai webhook / token thi bao ngay, khong treo nut ~40s
-            error = await notifier.deliver({**cfg["notify"], "channel": target}, alert, backoff=())
-            return 200, {"ok": not error, "error": error, "channel": target}
+        # TM - #NOTIFY-CHANNEL - notify_save / notify_test cu da chuyen sang /admin/notify
+        if action in ("notify_save", "notify_test"):
+            raise ValueError(f"cau hinh kenh thong bao da chuyen sang trang {ADMIN_NOTIFY_PATH}")
         if action == "watcher_save":
             block = copy.deepcopy(cfg["watcher"])
             deadline = str(payload.get("plan_deadline_utc") or "00:30").strip()
@@ -7441,6 +7622,114 @@ async def http_admin_alerts_action(request):
     if not _setup_ok(payload):
         return JSONResponse({"error": "Setup token sai"}, status_code=403)
     status, body = await _alerts_action(payload)
+    return JSONResponse(body, status_code=status)
+
+
+# TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp: trang admin "Thông báo"
+ADMIN_NOTIFY_PATH = ADMIN_PATH.rstrip("/") + "/notify"
+ADMIN_NOTIFY_ACTION_PATH = ADMIN_NOTIFY_PATH + "/action"
+
+
+def _notify_view(log_symbol: str, log_status: str) -> dict[str, Any]:
+    config = _notify_config()
+    names = {c["id"]: c["name"] for c in config["channels"]}
+    rows = NOTIFY_STORE.logs(symbol=log_symbol, status=log_status, limit=200)
+    routed = {r["symbol"] for r in config["routes"]}
+    symbols = config["symbols"]
+    # Da bat dau tach kenh theo cap ma co cap chua co route rieng -> goi y tao kenh/route cho cap do
+    missing = [s for s in symbols if s not in routed] if routed - {notify_logic.WILDCARD} else []
+    return {**config, "log": [_notify_log_view(r, names) for r in rows], "log_symbol": log_symbol,
+            "log_status": log_status, "statuses": list(notify_logic.STATUSES), "suggest_symbols": missing,
+            "alerts_file": str(ALERTS_FILE), "env_example": "DC_WEBHOOK_BTC=https://discord.com/api/webhooks/..."}
+
+
+async def _notify_action(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    action = str(payload.get("action") or "").strip().lower()
+    try:
+        if action == "channel_save":
+            fields = notify_logic.clean_channel(payload)
+            channel_id = str(payload.get("id") or "").strip() or None
+            row = NOTIFY_STORE.save_channel(fields, channel_id)
+            # Gia tri secret (tuy chon): luu tren volume (alerts/config.json), KHONG vao DB
+            values = payload.get("secret_values") or {}
+            if not isinstance(values, dict):
+                raise ValueError("secret_values phai la object")
+            updates = {}
+            for field in notify_logic.REF_PREFIX:
+                value = str(values.get(field) or "").strip()
+                if value and row.get(field):
+                    if field == "discord_webhook_ref" and not value.startswith(notifier.DISCORD_PREFIXES):
+                        raise ValueError("webhook phai bat dau bang https://discord.com/api/webhooks/")
+                    updates[row[field]] = value
+            if updates:
+                block = dict(_alerts_cfg().get("notify_secrets") or {})
+                block.update(updates)
+                _alerts_save("notify_secrets", block)
+            return 200, {"ok": True, "channel": _notify_channel_view(NOTIFY_STORE.channel(row["id"]))}
+        if action == "channel_toggle":
+            row = NOTIFY_STORE.save_channel({"enabled": bool(payload.get("enabled"))}, str(payload.get("id") or ""))
+            return 200, {"ok": True, "channel": _notify_channel_view(row)}
+        if action == "channel_delete":
+            out = NOTIFY_STORE.delete_channel(str(payload.get("id") or ""))
+            block = copy.deepcopy(_alerts_cfg()["notify"])
+            ids = notify_logic.settings(block)["default_channel_id"]
+            if out["channel"]["id"] in ids:
+                block["default_channel_id"] = [i for i in ids if i != out["channel"]["id"]]
+                _alerts_save("notify", block)
+            return 200, {"ok": True, "routes_removed": out["routes_removed"]}
+        if action == "channel_test":
+            return 200, await NOTIFY_HUB.test_channel(str(payload.get("id") or ""))
+        if action == "route_save":
+            symbol = str(payload.get("symbol") or "").strip().upper() or notify_logic.WILDCARD
+            if symbol != notify_logic.WILDCARD:
+                symbol = _resolve_symbol(symbol)
+            category = str(payload.get("category") or "").strip().upper() or notify_logic.WILDCARD
+            if category != notify_logic.WILDCARD and category not in notify_logic.CATEGORIES:
+                raise ValueError(f"category phai la '*' hoac mot trong {notify_logic.route_categories()}")
+            ids = payload.get("channel_ids") or []
+            if not isinstance(ids, list):
+                raise ValueError("channel_ids phai la list")
+            rows = NOTIFY_STORE.set_cell(symbol, category, [str(i) for i in ids],
+                                         min_severity=str(payload.get("min_severity") or "low").strip().lower(),
+                                         digest=bool(payload.get("digest")),
+                                         enabled=payload.get("enabled") not in (False, 0, "0", "false"))
+            return 200, {"ok": True, "routes": rows}
+        if action == "settings_save":
+            clean = notify_logic.clean_settings(payload, {c["id"] for c in NOTIFY_STORE.channels()})
+            block = copy.deepcopy(_alerts_cfg()["notify"])
+            block.update(clean)
+            _alerts_save("notify", block)
+            return 200, {"ok": True}
+        if action == "digest_flush":
+            return 200, {"ok": True, "sent": await NOTIFY_HUB.flush_digests(force=True)}
+        return 400, {"error": f"action khong ho tro: {action!r}"}
+    except ValueError as exc:
+        return 400, {"error": str(exc)}
+
+
+@mcp.custom_route(ADMIN_NOTIFY_PATH, methods=["GET"])
+async def http_admin_notify(request):
+    from starlette.responses import HTMLResponse
+    log_symbol = str(request.query_params.get("symbol") or "").strip().upper()
+    log_status = str(request.query_params.get("status") or "").strip().upper()
+    if log_status not in notify_logic.STATUSES:
+        log_status = ""
+    page = admin_notify.render(_notify_view(log_symbol, log_status), action_path=ADMIN_NOTIFY_ACTION_PATH,
+                               admin_path=ADMIN_PATH, setup_required=not STORE.has_auth(), nav=_admin_nav())
+    return HTMLResponse(page, headers={"Cache-Control": "no-store"})
+
+
+@mcp.custom_route(ADMIN_NOTIFY_ACTION_PATH, methods=["POST"])
+async def http_admin_notify_action(request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "body khong phai JSON"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "body phai la object"}, status_code=400)
+    if not _setup_ok(payload):
+        return JSONResponse({"error": "Setup token sai"}, status_code=403)
+    status, body = await _notify_action(payload)
     return JSONResponse(body, status_code=status)
 
 
@@ -8944,6 +9233,8 @@ def build_app():
                          ADMIN_SCHEDULES_PATH, ADMIN_SCHEDULES_ACTION_PATH,
                          # TM - #ENTRY-ALERT - Entry setups & alerts
                          ADMIN_ALERTS_PATH, ADMIN_ALERTS_ACTION_PATH,
+                         # TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp
+                         ADMIN_NOTIFY_PATH, ADMIN_NOTIFY_ACTION_PATH,
                          # TM - #DASHBOARD - Setup dashboard
                          ADMIN_DASH_PATH, ADMIN_DASH_ACTION_PATH,
                          # TM - #BOOKMAP - Order flow Bookmap
@@ -8972,6 +9263,15 @@ def build_app():
                 print(f"BAMCP: da chuyen {moved} event TR sang tr_events", file=sys.stderr)
         except Exception as exc:
             print(f"CANH BAO: chuyen event TR loi ({type(exc).__name__}: {exc})", file=sys.stderr)
+        # TM - #NOTIFY-CHANNEL - Kenh cu thanh kenh mac dinh truoc khi watcher gui tin dau tien
+        try:
+            moved = _notify_migrate()
+            if moved.get("migrated"):
+                print(f"BAMCP: da chuyen kenh thong bao cu -> {moved['channels'] or 'khong co kenh nao'}"
+                      f" (route off-plan: {moved['routes']})", file=sys.stderr)
+        except Exception as exc:
+            print(f"CANH BAO: chuyen kenh thong bao loi ({type(exc).__name__}: {exc})", file=sys.stderr)
+        notify_task = asyncio.create_task(NOTIFY_HUB.run_forever())
         task = (asyncio.create_task(FETCH_SCHEDULER.run_forever() if FETCH_MODE == "schedules"
                                     else _fetcher_loop()) if FETCH.get("enabled") else None)
         # TM - #ORB - ORB Enhancement: scheduler ORB song cung vong doi app nhu fetcher
@@ -8985,7 +9285,7 @@ def build_app():
             async with inner(scope):
                 yield
         finally:
-            for running in (task, orb_task, watch_task, op_task):
+            for running in (task, orb_task, watch_task, op_task, notify_task):
                 if running:
                     running.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
@@ -9035,8 +9335,10 @@ if __name__ == "__main__":
     # TM - #M5-FETCH - Per-timeframe schedules + M5
     print(f"BAMCP fetcher mode={FETCH_MODE} admin={ADMIN_SCHEDULES_PATH}", file=sys.stderr)
     # TM - #ENTRY-ALERT - Entry setups & alerts
-    print(f"BAMCP watcher enabled={_watcher_active()} channel={_alerts_cfg()['notify'].get('channel')} "
-          f"admin={ADMIN_ALERTS_PATH}", file=sys.stderr)
+    print(f"BAMCP watcher enabled={_watcher_active()} admin={ADMIN_ALERTS_PATH}", file=sys.stderr)
+    # TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp
+    print(f"BAMCP notify channels={len(NOTIFY_STORE.channels())} routes={len(NOTIFY_STORE.routes())} "
+          f"admin={ADMIN_NOTIFY_PATH}", file=sys.stderr)
     # TM - #OFF-PLAN - Canh bao lenh ngoai ke hoach
     print(f"BAMCP off-plan enabled={_op_active()} poll={_op_cfg().get('poll_seconds')}s", file=sys.stderr)
     # TM - #ORB - ORB Enhancement

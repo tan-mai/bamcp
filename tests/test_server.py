@@ -37,6 +37,8 @@ ORB_TODAY_KEYS = {"orb_trades_taken", "orb_trades_remaining", "orb_realized_pnl"
                   "orb_daily_stop_hit", "can_trade_orb", "orb_status"}
 # TM - #OFF-PLAN - Khoi lenh ngoai ke hoach hom nay
 OFF_PLAN_TODAY_KEYS = {"off_plan"}
+# TM - #NOTIFY-CHANNEL - So tin thong bao trong ngay theo cap
+NOTIFY_TODAY_KEYS = {"notifications"}
 OLD_CHECK_KEYS = {"date", "would_pass", "logged", "symbol", "side", "trade_type",
                   "demoted_to_scalp", "entry", "stop", "target",
                   "stop_points", "target_points", "rr", "margin_usd", "limits_applied",
@@ -68,7 +70,7 @@ class RegressionTest(unittest.TestCase):
 
     def test_get_today_status_unchanged(self):
         out = run(server.get_today_status())
-        self.assertEqual(set(out), OLD_TODAY_KEYS | ORB_TODAY_KEYS | OFF_PLAN_TODAY_KEYS)
+        self.assertEqual(set(out), OLD_TODAY_KEYS | ORB_TODAY_KEYS | OFF_PLAN_TODAY_KEYS | NOTIFY_TODAY_KEYS)
         self.assertEqual(out["counted_from"], "journal")
         self.assertIsNone(out["exchange"])
 

@@ -339,6 +339,54 @@ CREATE TABLE IF NOT EXISTS off_plan_events (
 );
 CREATE INDEX IF NOT EXISTS ix_off_plan_events ON off_plan_events(off_plan_id, at);
 """,
+    # TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp
+    # Token / webhook KHONG luu o day: *_ref la ten bien moi truong (hoac ten secret luu tren volume).
+    # Mot (symbol, category) co the co nhieu dong route -> gui nhieu kenh. '*' = moi cap / moi loai.
+    """
+CREATE TABLE IF NOT EXISTS notify_channels (
+  id                     TEXT NOT NULL PRIMARY KEY,
+  name                   TEXT NOT NULL,
+  provider               TEXT NOT NULL,
+  telegram_bot_token_ref TEXT,
+  telegram_chat_id       TEXT,
+  telegram_thread_id     INTEGER,
+  discord_webhook_ref    TEXT,
+  discord_username       TEXT,
+  discord_avatar_url     TEXT,
+  enabled                INTEGER NOT NULL DEFAULT 1,
+  last_ok_at             INTEGER,
+  last_error             TEXT,
+  last_error_at          INTEGER,
+  created_at             INTEGER NOT NULL,
+  updated_at             INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notify_routes (
+  id           TEXT NOT NULL PRIMARY KEY,
+  symbol       TEXT NOT NULL,
+  category     TEXT NOT NULL,
+  channel_id   TEXT NOT NULL REFERENCES notify_channels(id),
+  min_severity TEXT NOT NULL DEFAULT 'low',
+  digest       INTEGER NOT NULL DEFAULT 0,
+  enabled      INTEGER NOT NULL DEFAULT 1,
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL,
+  UNIQUE (symbol, category, channel_id)
+);
+CREATE TABLE IF NOT EXISTS notify_log (
+  id              TEXT NOT NULL PRIMARY KEY,
+  symbol          TEXT NOT NULL,
+  category        TEXT NOT NULL,
+  severity        TEXT NOT NULL,
+  channel_id      TEXT,
+  dedupe_key      TEXT,
+  status          TEXT NOT NULL,
+  error           TEXT,
+  payload_preview TEXT,
+  created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_notify_log_at ON notify_log(created_at);
+CREATE INDEX IF NOT EXISTS ix_notify_log_symbol ON notify_log(symbol, created_at);
+""",
 ]
 
 _MIGRATED: set[str] = set()

@@ -342,33 +342,28 @@ class NotifierTest(unittest.TestCase):
         async def sleep(s):
             waits.append(s)
 
+        msg = notifier.Outgoing("x")
         n = FakeNotifier(2)
-        asyncio.run(notifier.send_with_retry(n, notifier.Alert("x"), sleep=sleep))
-        self.assertEqual((n.sent, waits), (1, [2.0, 10.0]))
+        asyncio.run(notifier.send_with_retry(n, msg, sleep=sleep))
+        # TM - #NOTIFY-CHANNEL - thu lai 2s, 5s, 15s
+        self.assertEqual((n.sent, waits), (1, [2.0, 5.0]))
         waits.clear()
         n = FakeNotifier(1, notifier.RetryAfter(1.5, "429"))
-        asyncio.run(notifier.send_with_retry(n, notifier.Alert("x"), sleep=sleep))
+        asyncio.run(notifier.send_with_retry(n, msg, sleep=sleep))
         self.assertEqual(waits, [1.5])
         waits.clear()
         with self.assertRaises(RuntimeError):
-            asyncio.run(notifier.send_with_retry(FakeNotifier(9), notifier.Alert("x"), sleep=sleep))
-        self.assertEqual(waits, [2.0, 10.0, 30.0])
+            asyncio.run(notifier.send_with_retry(FakeNotifier(9), msg, sleep=sleep))
+        self.assertEqual(waits, [2.0, 5.0, 15.0])
 
-    def test_both_with_one_channel_missing(self):
-        sent = []
-
-        async def send(self, alert):
-            sent.append((self.chat_id, alert.text))
-
-        cfg = {"channel": "both", "telegram": {"bot_token": "1:x", "chat_id": "42"}}
-        with mock.patch.object(notifier.TelegramBotNotifier, "send", send):
-            err = asyncio.run(notifier.deliver(cfg, notifier.Alert("x")))
-        self.assertEqual(sent, [("42", "x")])
-        self.assertEqual(err, "discord: chua dat webhook_url")
-
+    # TM - #NOTIFY-CHANNEL - kenh thieu gia tri bien thi bao loi cau hinh, khong gui
     def test_config_error_and_message(self):
-        err = asyncio.run(notifier.deliver({"channel": "telegram"}, notifier.Alert("x")))
-        self.assertIn("telegram", err)
+        with self.assertRaisesRegex(notifier.NotifyConfigError, "TG_BOT_X"):
+            notifier.make_sender({"provider": "telegram", "telegram_bot_token_ref": "TG_BOT_X",
+                                  "telegram_chat_id": "42"}, lambda ref: None)
+        with self.assertRaisesRegex(notifier.NotifyConfigError, "khong phai webhook Discord"):
+            notifier.make_sender({"provider": "discord", "discord_webhook_ref": "DC_X"},
+                                 lambda ref: "https://evil.example/hook")
         s, events = run(setup(), [bar(0, 67600, 67620, 67400, 67450),
                                   bar(1, 67450, 67480, 67150, 67520, 25)])
         alert = notifier.setup_alert(s, events[-1], VN, PARAMS)
@@ -422,12 +417,12 @@ class WatcherTest(unittest.TestCase):
         self.store = entry_store.SetupStore(self.dir / "db.sqlite", now_ms=lambda: T0 - 30 * M5)
         self.sent = []
         self.positions = []
-        self.cfg = {"notify": {"channel": "discord"},
+        self.cfg = {"notify": {},
                     "watcher": {"enabled": True, "trigger_tf": "5m", "watch_symbols": [],
                                 "plan_deadline_utc": "00:30", "defaults": PARAMS,
                                 "symbol_overrides": {}}}
 
-        async def deliver(cfg, alert):
+        async def deliver(alert):
             self.sent.append(alert.text)
             return None
 
@@ -885,14 +880,14 @@ class ServerToolsTest(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "chua co nen"):
             asyncio.run(server._watcher_refresh("BTCUSDT", "5m"))
 
-    def test_notify_test_per_channel(self):
+    # TM - #NOTIFY-CHANNEL - gui thu chuyen sang /admin/notify
+    def test_notify_test_moved(self):
         code, out = asyncio.run(server._alerts_action({"action": "notify_test", "target": "telegram"}))
-        self.assertEqual((code, out["ok"], out["channel"]), (200, False, "telegram"))
-        self.assertIn("telegram: chua dat bot_token", out["error"])
-        code, out = asyncio.run(server._alerts_action({"action": "notify_test", "target": "sms"}))
         self.assertEqual(code, 400)
+        self.assertIn("/admin/notify", out["error"])
         alert = notifier.system_alert("TEST", {"at": T0, "channel": "discord"}, VN)
         self.assertTrue(alert.text.startswith("✅ BAMCP test — kênh discord hoạt động"))
+        self.assertEqual((alert.symbol, alert.category), ("*", "TEST"))
 
 
 if __name__ == "__main__":

@@ -120,7 +120,7 @@ Cần chạy ở nơi có lệnh `sqlite3` và thấy được file DB. Ví dụ
 ├── bias/<SYMBOL>/        # 2026-09-12.json
 ├── journal/              # 2026-09-12.json, dùng chung mọi cặp
 │   └── orb_skips/        # 2026-09-12.json: phiên ORB đã skip, kèm lý do
-├── alerts/config.json    # notify và watcher do /admin/alerts ghi (webhook, bot token)
+├── alerts/config.json    # notify, watcher, off_plan; notify_secrets = giá trị token/webhook nhập ở /admin/notify
 ├── dashboard/config.json # khối dashboard do /admin/dashboard-accounts ghi
 ├── time_windows/         # GANN: pivots/<SYMBOL>.json, manual_pivots.json, events.json, backtests/
 └── orb/

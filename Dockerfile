@@ -44,6 +44,8 @@ COPY sqlite_db.py kline_store.py kline_migrate.py ./
 COPY cron_utc.py fetch_schedules.py admin_schedules.py ./
 # TM - #ENTRY-ALERT - Entry setups & alerts
 COPY entry_logic.py entry_store.py entry_watcher.py notifier.py admin_entry.py ./
+# TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp
+COPY notify_logic.py notify_store.py admin_notify.py ./
 # TM - #DASHBOARD - Setup dashboard
 COPY dashboard_logic.py dashboard_store.py dashboard_auth.py dashboard_ui.py admin_dashboard.py bamcp_cli.py ./
 # TM - #ADMIN-LOGIN - Form dang nhap admin

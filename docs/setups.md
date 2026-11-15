@@ -115,10 +115,10 @@ Thẻ setup trên dashboard hiện thêm một dòng, ví dụ "Pha C · giao d�
 
 ## Thông báo
 
-`notify.channel` = `discord` (webhook), `telegram` (bot, `parse_mode=HTML`) hoặc `both`.
+Kênh, route theo cặp, lọc mức độ, chống trùng, gom tin, giờ yên lặng và fallback: xem [notify.md](notify.md). Mỗi event có loại tin riêng (`IN_ZONE` → `ENTRY_IN_ZONE`, `TRIGGERED` → `ENTRY_TRIGGERED`, `ENTRY_VALID` → `ENTRY_CONFIRMED`...).
 
-- Gửi lỗi thì thử lại sau 2s, 10s, 30s. Discord 429 thì chờ đúng `retry_after`. Vẫn lỗi thì ghi `notify_error`, không chặn watcher.
-- Cảnh báo hệ thống, mỗi loại tối đa 1 lần/giờ: `PLAN_MISSING` (tới `plan_deadline_utc` mà cặp trong `watch_symbols` chưa có setup hôm nay) và `FETCHER_STALE` (quá 15 phút không có nến 5m mới).
+- Gửi lỗi thì thử lại sau 2s, 5s, 15s, rồi chuyển sang kênh mặc định (fallback). Vẫn lỗi thì ghi `notify_error`, không chặn watcher.
+- Cảnh báo hệ thống, mỗi loại tối đa 1 lần/giờ: `PLAN_MISSING` (tới `plan_deadline_utc` mà cặp trong `watch_symbols` chưa có setup hôm nay) và `FETCHER_STALE` (quá 15 phút không có nến 5m mới). Hai tin này dùng `symbol = "*"`, nên vào kênh System nếu có route `* + *`.
 
 ## Khớp lệnh OKX
 
@@ -126,7 +126,7 @@ Mỗi lượt quét, cặp có setup từ TRIGGERED trở đi thì đọc vị t
 
 ## Trang `/admin/alerts`
 
-- Kênh, webhook, bot token, chat id (che, chỉ ghi đè khi nhập mới). Nút Gửi thử Discord / Gửi thử Telegram dùng cấu hình đã lưu, thử riêng từng kênh, không retry.
+- Ô tóm tắt kênh thông báo kèm link sang [`/admin/notify`](notify.md#trang-adminnotify): kênh, route, gửi thử nằm ở trang đó.
 - Watcher bật/tắt, `watch_symbols`, `plan_deadline_utc`, bảng tham số mặc định và override theo cặp.
 - Danh sách setup theo ngày/trạng thái, timeline event, huỷ, form tạo setup tay.
 

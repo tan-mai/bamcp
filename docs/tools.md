@@ -76,6 +76,18 @@ Chi tiết ở [off-plan.md](off-plan.md).
 | `review_off_plan_trade` | Lưu lý do, đánh giá, `verdict`, bài học. Chỉ ghi đè trường có truyền |
 | `reclassify_position` | Hệ thống phân loại sai: gắn vị thế vào setup và phân loại lại |
 
+## Thông báo
+
+Chi tiết ở [notify.md](notify.md).
+
+| Tool | Việc |
+|---|---|
+| `get_notify_config` | Kênh (đã che token/webhook), route theo cặp × loại tin, cài đặt chung |
+| `test_notification` | Gửi tin thử qua đúng route sẽ chọn cho `(symbol, category)`, trả về kênh đã dùng |
+| `get_notify_log` | Tra `notify_log` theo cặp và trạng thái (`SENT`, `FILTERED`, `DEDUPED`, `DIGESTED`, `FAILED`, `FALLBACK`) |
+
+`get_today_status` có thêm khối `notifications`: số tin trong ngày theo từng cặp.
+
 ## Setup và kế hoạch
 
 Chi tiết ở [setups.md](setups.md).

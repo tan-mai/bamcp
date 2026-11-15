@@ -34,7 +34,8 @@ class EntryWatcher:
                  tz: ZoneInfo, span_ms: Callable[[str], int],
                  now_ms: Callable[[], int] | None = None,
                  sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-                 deliver: Callable[..., Awaitable[str | None]] = notifier.deliver,
+                 # TM - #NOTIFY-CHANNEL - Tách kênh thông báo theo cặp: moi tin di qua notifier.send
+                 deliver: Callable[[notifier.Alert], Awaitable[str | None]] = notifier.dispatch,
                  refresh: Callable[[str, str], Awaitable[None]] | None = None,
                  link: Callable[[dict[str, Any]], str | None] | None = None,
                  unplanned: Callable[[], bool] | None = None) -> None:
@@ -98,7 +99,10 @@ class EntryWatcher:
                                          link=self.link(setup) if self.link else None)
         else:
             alert = notifier.system_alert(event["event"], event["details"], self.display_tz())
-        error = await self.deliver(self.cfg().get("notify") or {}, alert)
+        try:
+            error = await self.deliver(alert)
+        except Exception as exc:          # loi gui tin khong duoc lam dung watcher
+            error = f"{type(exc).__name__}: {exc}"
         self.store.mark_notified(event_id, error)
         if error:
             print(f"BAMCP notify loi ({event['event']}): {error}", file=sys.stderr)
